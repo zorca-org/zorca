@@ -2217,6 +2217,66 @@ fn kill_removes_the_session_and_unknown_ids_error() {
     });
 }
 
+/// Kill means dead, not "asked politely".
+///
+/// A `Kill` that only sends SIGHUP leaves a child that ignores it running with
+/// no row to reach it by — the orphan behind the reported collision, where a
+/// second agent could not resume a thread a forgotten first one still held. The
+/// command here ignores SIGHUP and never reads its pty, so neither the signal
+/// nor the pty hangup that follows the master's close can end it: only the
+/// escalation can. It records its own pid, which is also its process-group id,
+/// because the wire carries no pid.
+#[test]
+fn kill_reaches_a_child_that_ignores_sighup() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("survivor.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c 'trap \"\" HUP; echo $$ > {}; while :; do sleep 1; done'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        kill(&mut connection, &session.id).await;
+
+        // Generous against the daemon's own grace period: the assertion is
+        // that the process eventually goes, not how fast.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while running(pid) && Instant::now() < deadline {
+            pause(Duration::from_millis(100)).await;
+        }
+        if running(pid) {
+            // SAFETY: a plain `kill(2)` on a process group this test caused to
+            // exist. The whole group, so the failing test leaks nothing.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            panic!("the killed session's child {pid} ignored SIGHUP and survived");
+        }
+    });
+}
+
+/// The pid the command under test wrote, once it has written it.
+async fn wait_for_pid(path: &Path) -> libc::pid_t {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the command never wrote its pid");
+        pause(Duration::from_millis(50)).await;
+    }
+}
+
+/// Does this pid still exist? A zombie counts as gone: the daemon's reaper
+/// waits on the child, so an unreaped pid means the process is genuinely there.
+fn running(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 checks for the process without sending anything.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
 /// The point of the daemon: an agent that dies stays visible instead of
 /// vanishing from the sidebar.
 #[test]

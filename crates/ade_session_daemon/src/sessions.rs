@@ -14,6 +14,10 @@
 //!   row. When the child process exits the row *stays* and its status becomes
 //!   [`SessionStatus::Exited`], which is what makes a crashed agent visible in
 //!   the sidebar instead of vanishing from it.
+//! - **A kill is not a request.** The row goes at once, and the child's whole
+//!   process group is hung up and then, if it is still there, killed; see
+//!   [`terminate_group`]. Removing a row the daemon could not reach again is
+//!   what leaves an agent holding its locks forever.
 //! - **The child process is the agent process.** Commands are run as
 //!   `sh -lc 'exec <command>'`, so the pid the daemon waits on is the agent
 //!   itself and not an intermediate shell. An *empty* command means "the
@@ -65,6 +69,15 @@ pub const DEFAULT_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
 /// Bytes read from the pty in one go, and therefore the largest raw payload of
 /// a single [`Frame::Output`].
 const DRAIN_CHUNK_BYTES: usize = 8192;
+
+/// How long a killed session's process group has to leave on its own before
+/// [`terminate_group`] stops asking and sends `SIGKILL`.
+///
+/// A second is a shell's or an agent's whole `SIGHUP` cleanup window, and the
+/// user never waits on it: `Kill` answers `Removed` immediately and the
+/// escalation runs on a thread of its own.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// The byte an agent sends when it wants a human: `BEL`, 0x07.
 const BELL: u8 = 0x07;
@@ -566,6 +579,9 @@ struct Live {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's pid, which on unix is also its process-group id — see
+    /// [`signal_group`]. `None` only if the platform would not report one.
+    pid: Option<u32>,
 }
 
 struct Session {
@@ -920,11 +936,28 @@ impl SessionTable {
         drop(pty.slave);
 
         let killer = child.clone_killer();
-        let writer = pty.master.take_writer().context("taking pty writer")?;
-        let reader = pty
+        let pid = child.process_id();
+        let handles = pty
             .master
-            .try_clone_reader()
-            .context("cloning pty reader")?;
+            .take_writer()
+            .context("taking pty writer")
+            .and_then(|writer| {
+                let reader = pty
+                    .master
+                    .try_clone_reader()
+                    .context("cloning pty reader")?;
+                Ok((writer, reader))
+            });
+        let (writer, reader) = match handles {
+            Ok(handles) => handles,
+            Err(err) => {
+                // Nothing holds this child yet — no row, no reaper — so
+                // returning here would leave a process the daemon can never
+                // name again. Signal and reap it before the error goes out.
+                abandon(child);
+                return Err(err.into());
+            }
+        };
 
         let scrollback = request
             .scrollback_bytes
@@ -967,6 +1000,7 @@ impl SessionTable {
                         master: pty.master,
                         writer: Arc::new(Mutex::new(writer)),
                         killer,
+                        pid,
                     }),
                     hub: hub.clone(),
                     activity: activity.clone(),
@@ -1524,6 +1558,7 @@ impl SessionTable {
             self.scrub_layout(&session.info.workspace_id, id);
             session
         };
+        let pid = session.live.as_ref().and_then(|live| live.pid);
         if let Some(live) = session.live.as_mut()
             && let Err(err) = live.killer.kill()
         {
@@ -1531,6 +1566,10 @@ impl SessionTable {
             log::debug!("killing {id}: {err}");
         }
         drop(session);
+        // The killer above reaches the direct child only, and dropping the pty
+        // reaches whatever happens to be in the foreground. Neither is enough
+        // on its own — see [`terminate_group`].
+        terminate_group(id, pid);
         if let Err(err) = self.persist() {
             log::warn!("could not persist session state: {err:#}");
         }
@@ -1785,6 +1824,91 @@ fn spawn_sweeper(table: Weak<SessionTable>, interval: Duration) {
             }
         })
         .expect("spawning status sweeper thread");
+}
+
+/// End a killed session's whole process group, and make sure it ended.
+///
+/// Three things push at a killed session, and only the last is unconditional.
+/// The killer's `SIGHUP` reaches the direct child; closing the pty makes the
+/// kernel `SIGHUP` whatever is in the *foreground* of it. An agent that traps
+/// `SIGHUP`, or a descendant sitting in the background, survives both — and
+/// once the row is gone nothing can name that process again, so it keeps its
+/// files and its locks for good. That is the shape of the reported failure: a
+/// killed Codex kept its per-thread writer lock, and the next `codex resume`
+/// was refused because the thread "already has an active writer".
+///
+/// So the group gets a `SIGHUP` of its own, and after [`KILL_GRACE`] a
+/// `SIGKILL`, which nothing can trap. The wait runs on a detached thread —
+/// `Kill` still answers `Removed` at once.
+///
+/// The child is a session leader (`portable-pty` calls `setsid` before `exec`),
+/// so its pid *is* its process-group id, that group holds every descendant that
+/// did not deliberately leave it, and the daemon — in another session entirely
+/// — can never be caught by this. A descendant that called `setsid` itself is
+/// beyond any signal we could send; only a cgroup would follow it there.
+fn terminate_group(label: &dyn std::fmt::Display, pid: Option<u32>) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = pid
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return;
+        };
+        signal_group(pid, libc::SIGHUP);
+        let label = label.to_string();
+        let escalate = std::thread::Builder::new()
+            .name(format!("ade-kill-{pid}"))
+            .spawn(move || {
+                std::thread::sleep(KILL_GRACE);
+                if signal_group(pid, libc::SIGKILL) {
+                    log::warn!("{label} outlived SIGHUP; killed its process group {pid}");
+                }
+            });
+        if let Err(err) = escalate {
+            log::warn!("could not spawn the kill escalation for {pid}: {err}");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no process groups to signal and no daemon to signal them
+        // from; the killer's `TerminateProcess` is the whole story there.
+        let _ = (label, pid);
+    }
+}
+
+/// Send `signal` to the process group led by `pid`; `true` if anything was
+/// there to receive it.
+///
+/// `pid` must be positive. `kill(0, ...)` would signal the daemon's own group
+/// and `kill(-1, ...)` every process it can reach.
+#[cfg(unix)]
+fn signal_group(pid: libc::pid_t, signal: libc::c_int) -> bool {
+    debug_assert!(pid > 0, "a process group id is a positive pid");
+    // SAFETY: `kill(2)` against a group this daemon created, never 0 or -1.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+/// End a child that never reached the table.
+///
+/// Between the spawn and the insert there is no row and no reaper, so returning
+/// an error from in there would drop the [`portable_pty::Child`] — which on
+/// unix neither signals nor waits — and leave a live process nothing in the
+/// daemon knows about. Reaping happens on its own thread because the
+/// `SIGKILL` that guarantees the child goes is on a timer, and `create` must
+/// not block on it.
+fn abandon(mut child: Box<dyn portable_pty::Child + Send + Sync>) {
+    let pid = child.process_id();
+    let _ = child.kill();
+    terminate_group(&"an abandoned session", pid);
+    if let Err(err) = std::thread::Builder::new()
+        .name("ade-reap-abandoned".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        })
+    {
+        log::warn!("could not spawn a reaper for an abandoned child: {err}");
+    }
 }
 
 /// Wait for the child and hand its exit status to the PTY drain. One blocking
