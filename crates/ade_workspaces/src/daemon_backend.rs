@@ -2144,6 +2144,19 @@ impl HostLink {
                     self.host.destination
                 ),
             }
+
+            //
+            // Said out loud, and at `info` like the deploy lines below, because
+            // the silent version of this is indistinguishable from a broken
+            // cross-compile: no build is attempted, so the log shows *nothing*
+            // for the host, and the operator concludes the toolchain failed
+            // rather than that the daemon declined. Once per host per connect.
+            log::info!(
+                "{}: daemon runs build {}… and holds sessions with work in them; \
+                 leaving it alone — \"upgrade host daemon\" forces it",
+                self.host.destination,
+                &remote_hash[..remote_hash.len().min(12)],
+            );
             return false;
         }
         match self.upgrade_to_local_binary(paths, &remote_hash, false) {
