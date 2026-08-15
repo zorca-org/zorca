@@ -1,5 +1,5 @@
 use crate::{
-    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
+    FocusWorkspaceSidebar, ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
     sidebar_side_context_menu,
 };
 use gpui::{
@@ -9,7 +9,10 @@ use gpui::{
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
-use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
+use ui::{
+    ContextMenu, Divider, IconPosition, Indicator, KeyBinding, Tooltip, prelude::*,
+    right_click_menu,
+};
 
 /// Describes how a status-bar item can be hidden by the user.
 ///
@@ -197,7 +200,7 @@ impl StatusBar {
             .min_w_0()
             .overflow_x_hidden()
             .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Left,
+                sidebar.show_toggle && sidebar.side == SidebarSide::Left,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
             .children(self.left_items.iter().enumerate().map(|(index, item)| {
@@ -224,7 +227,7 @@ impl StatusBar {
                     }),
             )
             .when(
-                sidebar.show_toggle && !sidebar.open && sidebar.side == SidebarSide::Right,
+                sidebar.show_toggle && sidebar.side == SidebarSide::Right,
                 |this| this.child(self.render_sidebar_toggle(sidebar, cx)),
             )
     }
@@ -235,6 +238,7 @@ impl StatusBar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let on_right = sidebar.side == SidebarSide::Right;
+        let is_open = sidebar.open;
         let has_notifications = sidebar.has_notifications;
         let indicator_border = cx.theme().colors().status_bar_background;
 
@@ -252,22 +256,46 @@ impl StatusBar {
             .trigger(move |_is_active, _window, _cx| {
                 IconButton::new(
                     "toggle-workspace-sidebar",
-                    if on_right {
-                        IconName::ThreadsSidebarRightClosed
-                    } else {
-                        IconName::ThreadsSidebarLeftClosed
+                    match (on_right, is_open) {
+                        (true, true) => IconName::ThreadsSidebarRightOpen,
+                        (true, false) => IconName::ThreadsSidebarRightClosed,
+                        (false, true) => IconName::ThreadsSidebarLeftOpen,
+                        (false, false) => IconName::ThreadsSidebarLeftClosed,
                     },
                 )
                 .icon_size(IconSize::Small)
                 .tab_index(0isize)
-                .aria_label("Open threads sidebar")
+                .aria_label(if is_open {
+                    "Close sidebar"
+                } else {
+                    "Open sidebar"
+                })
                 .when(has_notifications, |this| {
                     this.indicator(Indicator::dot().color(Color::Accent))
                         .indicator_border_color(Some(indicator_border))
                 })
-                .tooltip(move |_, cx| {
-                    Tooltip::for_action("Open Threads Sidebar", &ToggleWorkspaceSidebar, cx)
-                })
+                .tooltip(Tooltip::element(move |_window, cx| {
+                    v_flex()
+                        .gap_1()
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .justify_between()
+                                .child(Label::new("Toggle Sidebar"))
+                                .child(KeyBinding::for_action(&ToggleWorkspaceSidebar, cx)),
+                        )
+                        .child(
+                            h_flex()
+                                .pt_1()
+                                .gap_2()
+                                .border_t_1()
+                                .border_color(cx.theme().colors().border_variant)
+                                .justify_between()
+                                .child(Label::new("Focus Sidebar"))
+                                .child(KeyBinding::for_action(&FocusWorkspaceSidebar, cx)),
+                        )
+                        .into_any_element()
+                }))
                 .on_click(move |_, window, cx| {
                     if let Some(multi_workspace) = window.root::<MultiWorkspace>().flatten() {
                         multi_workspace.update(cx, |multi_workspace, cx| {

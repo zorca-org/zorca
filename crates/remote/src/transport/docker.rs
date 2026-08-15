@@ -243,6 +243,9 @@ impl DockerExecConnection {
             &remote_platform,
             delegate.as_ref(),
             binary_exists_on_server,
+            // The docker server binary name is not source-versioned, so a
+            // binary already there says nothing about which build it is.
+            false,
             cx,
         )
         .await?

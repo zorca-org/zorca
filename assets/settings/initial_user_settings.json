@@ -9,8 +9,13 @@
 {
   "ui_font_size": 16,
   "buffer_font_size": 15,
+  // GitHub Copilot provides optional edit predictions; coding agents run as terminals.
+  "disable_ai": false,
+  "edit_predictions": {
+    "provider": "copilot",
+  },
   "theme": {
-    "mode": "system",
+    "mode": "dark",
     "light": "One Light",
     "dark": "One Dark",
   },

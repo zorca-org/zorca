@@ -75,6 +75,7 @@ pub struct FakeGitRepositoryState {
     pub simulated_graph_error: Option<String>,
     pub branches_requiring_force_delete: HashSet<String>,
     pub worktrees_requiring_force_delete: HashSet<PathBuf>,
+    pub locked_worktrees: HashSet<PathBuf>,
     pub refs: HashMap<String, String>,
     pub graph_commits: Vec<Arc<InitialGraphCommitData>>,
     pub commit_data: HashMap<Oid, FakeCommitDataEntry>,
@@ -97,6 +98,7 @@ impl FakeGitRepositoryState {
             simulated_graph_error: None,
             branches_requiring_force_delete: Default::default(),
             worktrees_requiring_force_delete: Default::default(),
+            locked_worktrees: Default::default(),
             refs: HashMap::from_iter([("HEAD".into(), "abc".into())]),
             merge_base_contents: Default::default(),
             oids: Default::default(),
@@ -776,6 +778,13 @@ impl GitRepository for FakeGitRepository {
         async move {
             executor.simulate_random_delay().await;
 
+            fs.with_git_state(&common_dir_path, false, |state| {
+                if state.locked_worktrees.contains(&path) {
+                    bail!("fatal: cannot remove a locked working tree");
+                }
+                Ok::<(), anyhow::Error>(())
+            })??;
+
             if !force {
                 fs.with_git_state(&common_dir_path, false, |state| {
                     if state.worktrees_requiring_force_delete.contains(&path) {
@@ -801,20 +810,29 @@ impl GitRepository for FakeGitRepository {
                     .trim();
                 PathBuf::from(gitdir)
             } else {
+                if fs.is_dir(&path).await {
+                    bail!(
+                        "fatal: validation failed, cannot remove working tree: '{}' does not exist",
+                        dot_git_file.display()
+                    );
+                }
                 self.find_worktree_entry_dir_by_path(&path)
                     .await
                     .with_context(|| format!("no worktree found at path: {}", path.display()))?
             };
 
-            // Remove the worktree checkout directory if it still exists.
-            fs.remove_dir(
-                &path,
-                RemoveOptions {
-                    recursive: true,
-                    ignore_if_not_exists: true,
-                },
-            )
-            .await?;
+            // Git can remove the admin entry even when deleting the checkout
+            // directory fails, then report the directory error to the caller.
+            let checkout_removal_error = fs
+                .remove_dir(
+                    &path,
+                    RemoveOptions {
+                        recursive: true,
+                        ignore_if_not_exists: true,
+                    },
+                )
+                .await
+                .err();
 
             // Remove the .git/worktrees/<name>/ directory.
             fs.remove_dir(
@@ -833,6 +851,10 @@ impl GitRepository for FakeGitRepository {
                 Ok::<(), anyhow::Error>(())
             })??;
 
+            if let Some(error) = checkout_removal_error {
+                return Err(error);
+            }
+
             Ok(())
         }
         .boxed()
@@ -845,6 +867,13 @@ impl GitRepository for FakeGitRepository {
         async move {
             executor.simulate_random_delay().await;
 
+            fs.with_git_state(&common_dir_path, false, |state| {
+                if state.locked_worktrees.contains(&old_path) {
+                    bail!("fatal: cannot move a locked working tree");
+                }
+                Ok::<(), anyhow::Error>(())
+            })??;
+
             // Read the worktree's .git file to find its entry directory.
             let dot_git_file = old_path.join(".git");
             let content = fs
@@ -856,6 +885,13 @@ impl GitRepository for FakeGitRepository {
                 .context("invalid .git file in worktree")?
                 .trim();
             let worktree_entry_dir = PathBuf::from(gitdir);
+            let registered_dot_git = fs
+                .load(&worktree_entry_dir.join("gitdir"))
+                .await
+                .context("worktree admin metadata is missing")?;
+            if Path::new(registered_dot_git.trim()) != dot_git_file {
+                bail!("worktree admin metadata points to a different checkout");
+            }
 
             // Move the worktree checkout directory.
             fs.rename(
@@ -864,7 +900,7 @@ impl GitRepository for FakeGitRepository {
                 RenameOptions {
                     overwrite: false,
                     ignore_if_exists: false,
-                    create_parents: true,
+                    create_parents: false,
                 },
             )
             .await?;
@@ -887,7 +923,13 @@ impl GitRepository for FakeGitRepository {
 
             // Emit a git event on the main .git directory so the scanner
             // notices the change.
-            fs.with_git_state(&common_dir_path, true, |_| {})?;
+            fs.with_git_state(&common_dir_path, true, |state| {
+                if state.worktrees_requiring_force_delete.remove(&old_path) {
+                    state
+                        .worktrees_requiring_force_delete
+                        .insert(new_path.clone());
+                }
+            })?;
 
             Ok(())
         }

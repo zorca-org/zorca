@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ZOrca — one native workspace for your coding agents</title>
+<meta name="description" content="Run coding agents across local and SSH-connected projects with isolated Git worktrees and persistent sessions in one native Agent Development Environment.">
+<link rel="preload" as="image" href="zorca-hero.webp" media="(min-width:561px)" fetchpriority="high">
+<link rel="preload" as="image" href="zorca-hero-mobile.webp" media="(max-width:560px)" fetchpriority="high">
+<link rel="icon" type="image/png" sizes="128x128" href="zorca-logo-m1-128.png">
+<style>
+@font-face{font-family:Archivo;src:url("fonts/archivo-latin.woff2") format("woff2");font-weight:400 700;font-display:swap}
+:root{
+  --navy:#071833;--navy-2:#0d2852;--ink:#11151b;--muted:#59616d;
+  --paper:#f7f7f4;--white:#fff;--line:#dfe2e6;--blue:#304cff;
+  --violet:#713cff;--coral:#ff654b;--green:#a9d83f;--warning:#ffca5c;
+  --planned-surface:#e7eff9;--planned-line:#bfd0e5;--planned-text:#43546b;
+  --focus-inner:#fff;--focus-outer:#11151b;
+  --sans:Archivo,"Helvetica Neue",Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  --content:min(1320px,calc(100% - 3rem));
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
+img,svg{display:block;max-width:100%}
+a{color:inherit}
+:focus-visible{outline:3px solid var(--focus-inner);outline-offset:3px;box-shadow:0 0 0 6px var(--focus-outer)}
+.sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.skip-link{position:fixed;z-index:10;inset-block-start:1rem;inset-inline-start:1rem;padding:.75rem 1rem;border-radius:.5rem;background:var(--white);color:var(--ink);font-weight:700;text-decoration:none;transform:translateY(calc(-100% - 2rem))}
+.skip-link:focus{transform:none}
+.wrap{width:var(--content);margin-inline:auto}
+
+.hero{position:relative;color:var(--white)}
+.hero::before,.hero::after{content:"";position:absolute;inset:0 0 65px;border-radius:0 0 50% 50% / 0 0 8% 8%;pointer-events:none}
+.hero::before{background-color:var(--navy);background-image:url("zorca-hero.webp"),radial-gradient(circle at 10% 54%,rgba(255,101,75,.62),transparent 24%),radial-gradient(circle at 78% 28%,rgba(113,60,255,.42),transparent 34%),linear-gradient(180deg,#0d2852 0%,#173f7a 48%,#071833 100%);background-position:center;background-size:cover;background-repeat:no-repeat}
+.hero::after{background:linear-gradient(180deg,rgba(3,16,41,.32),rgba(3,16,41,.04) 55%,rgba(3,16,41,.46))}
+.nav,.hero-copy,.hero-shot{position:relative;z-index:1}
+.nav{width:var(--content);height:5.2rem;margin:auto;display:flex;align-items:center;gap:2rem}
+.brand{display:inline-flex;align-items:center;gap:.75rem;text-decoration:none;font-size:1.35rem;font-weight:700;letter-spacing:-.025em}
+.brand img{width:2.35rem;height:2.35rem;border-radius:.62rem}
+.nav-links{margin-left:auto;display:flex;align-items:center;gap:2rem;font-size:.88rem}
+.nav-links a{text-decoration:none;color:rgba(255,255,255,.84)}
+.nav-links a{background:linear-gradient(90deg,var(--blue),var(--violet),var(--coral)) left bottom/0 2px no-repeat;transition:color .2s ease,background-size .25s ease}
+.nav-links a:hover{color:#fff;background-size:100% 2px}
+.source{display:inline-flex;align-items:center;gap:.45rem}
+.hero-copy{width:min(1120px,calc(100% - 2rem));margin:.5rem auto 0;text-align:center}
+h1{max-width:1050px;margin:0 auto;font-size:clamp(2.6rem,4vw,4rem);line-height:.96;letter-spacing:-.04em;font-weight:700;text-wrap:balance}
+.lead{max-width:730px;margin:1rem auto 0;font-size:clamp(1.05rem,1.4vw,1.2rem);font-weight:500;line-height:1.48;letter-spacing:.006em;color:rgba(255,255,255,.86);text-wrap:balance}
+.cta{display:inline-flex;align-items:center;justify-content:center;min-width:12rem;margin-top:1.8rem;padding:.9rem 1.4rem;border-radius:.65rem;background:linear-gradient(110deg,var(--blue),var(--violet));color:#fff;text-decoration:none;font-weight:700;box-shadow:0 12px 32px rgba(0,0,0,.28);transition:transform .2s ease,filter .2s ease}
+.cta:hover{transform:translateY(-2px);filter:brightness(1.08)}
+.status{margin:.8rem 0 0;font-size:.8rem;letter-spacing:.01em;color:rgba(255,255,255,.78)}
+.hero-shot{width:min(800px,calc(100% - 2rem));margin:1.5rem auto 0;transition:transform .35s cubic-bezier(.2,.8,.2,1)}
+.hero-shot::before{content:"";position:absolute;z-index:-1;inset:-3px;border-radius:1rem;background:linear-gradient(115deg,var(--blue),var(--violet) 55%,var(--coral));filter:blur(20px);opacity:0;transition:opacity .35s ease,filter .35s ease}
+.hero-shot.loaded::before{opacity:.22}
+.hero-shot img{width:100%;height:auto;border-radius:.85rem;box-shadow:0 24px 70px rgba(0,0,0,.42);opacity:0;transition:opacity .2s ease}
+.hero-shot.loaded img{opacity:1}
+
+.section{padding:clamp(5rem,9vw,8.5rem) 0}
+#features{padding-top:2.5rem}
+.intro{text-align:center;max-width:840px;margin:0 auto 4rem}
+h2{margin:0;font-size:clamp(2.2rem,3.5vw,3.6rem);line-height:1;letter-spacing:-.04em;text-wrap:balance}
+.intro p{max-width:680px;margin:1.25rem auto 0;color:var(--muted);font-size:1.08rem}
+.feature{display:grid;grid-template-columns:minmax(15rem,.72fr) minmax(0,1.28fr);gap:clamp(2.5rem,7vw,7rem);align-items:center;padding:3.5rem 0;border-top:1px solid var(--line)}
+.feature:first-of-type{border-top:0;padding-top:0}
+h3{margin:.8rem 0 0;line-height:1.08;letter-spacing:-.025em;text-wrap:balance}
+.feature h3{font-size:clamp(1.9rem,2.8vw,2.75rem);line-height:1.02;letter-spacing:-.035em}
+.copy p{max-width:36rem;margin:1.2rem 0 0;color:var(--muted)}
+.proof{margin-top:1.4rem;padding:0;list-style:none;display:grid;gap:.55rem;font-size:.9rem}
+.proof li::before{content:"—";margin-right:.65rem;color:var(--blue)}
+.product-view{margin:0;overflow:hidden;border-radius:1rem;background:#202631;box-shadow:0 24px 60px rgba(20,28,45,.18);transition:transform .3s cubic-bezier(.2,.8,.2,1),box-shadow .3s ease}
+.product-view .frame{aspect-ratio:16/9;overflow:hidden}
+.product-view img,.product-view video{display:block;width:100%;height:100%;object-fit:cover;object-position:center;transition:transform .45s cubic-bezier(.2,.8,.2,1),filter .3s ease}
+.product-view.left :is(img,video){object-position:20% center}
+.product-view.right :is(img,video){object-position:78% center}
+.product-view figcaption{padding:.75rem 1rem;background:#171c25;color:#b8bec8;font:.75rem/1.45 var(--mono);letter-spacing:.01em}
+
+.zed{position:relative;overflow:hidden;background:var(--navy);color:#fff}
+.zed::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 10% 110%,rgba(48,76,255,.2),transparent 28rem),radial-gradient(circle at 92% -20%,rgba(113,60,255,.15),transparent 25rem);pointer-events:none}
+.zed-grid{position:relative;display:grid;grid-template-columns:1fr 1fr;gap:clamp(3rem,8vw,8rem);align-items:start}
+.zed p{color:#bac5d6;max-width:42rem;font-size:1.08rem;line-height:1.55}
+.zed-list{display:grid;grid-template-columns:1fr 1fr;border-top:1px solid rgba(255,255,255,.18)}
+.zed-list div{padding:1.15rem 0;border-bottom:1px solid rgba(255,255,255,.18);font-size:.92rem;transition:color .2s ease,transform .2s ease}
+.zed-list div:nth-child(odd){padding-right:1rem}
+
+.roadmap{position:relative;overflow:hidden;background:#edf2f8}
+.roadmap::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 88% 8%,rgba(113,60,255,.08),transparent 30rem),radial-gradient(circle at 8% 100%,rgba(48,76,255,.07),transparent 26rem);pointer-events:none}
+.roadmap .wrap{position:relative}
+.roadmap-head{display:grid;grid-template-columns:1fr 1fr;gap:3rem;align-items:end;margin-bottom:3rem}
+.roadmap h2{font-size:clamp(2.5rem,4vw,3.75rem);line-height:1}
+.roadmap-head p{margin:0;color:var(--planned-text);max-width:38rem;font-size:1.08rem;line-height:1.55}
+.roadmap-row{display:grid;grid-template-columns:8rem minmax(16rem,.85fr) 1.5fr;gap:2rem;padding:1.75rem 0;border-top:1px solid var(--planned-line);align-items:start}
+.planned{font:.75rem/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--planned-text)}
+.roadmap-row h3{margin:0;font-size:1.45rem;line-height:1.12;letter-spacing:-.02em}
+.roadmap-row p{margin:0;color:var(--planned-text)}
+
+.compare{background:#fff}
+.scroll{overflow-x:auto;margin-top:3rem;border-radius:1rem;background:#fff;box-shadow:0 24px 60px rgba(20,28,45,.12)}
+.scroll-hint{display:none;margin:0 0 .75rem;color:var(--muted);font-size:.85rem}
+table{width:100%;min-width:48rem;border-collapse:collapse;font-size:.9rem}
+th,td{text-align:left;padding:1rem;vertical-align:top;border-bottom:1px solid var(--line)}
+thead th{padding-block:1.2rem;background:#edf2f8;color:var(--planned-text);font:.75rem/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase}
+.us-head{background:linear-gradient(110deg,var(--blue),var(--violet));color:#fff}
+.us-head span{display:inline-flex;align-items:center;gap:.6rem}
+.us-head img{width:1.4rem;height:1.4rem;border-radius:.35rem}
+tbody th{width:24%;font-weight:500;color:var(--muted)}
+td.us{background:#e8eefb;color:var(--navy-2);font-weight:600}
+tbody tr:last-child>*{border-bottom:0}
+
+code{font-family:var(--mono);font-size:.9em}
+
+.install{position:relative;overflow:hidden;background:#0b1220;color:#fff}
+.install::before{content:"";position:absolute;inset:0;background:radial-gradient(circle at 16% 22%,rgba(48,76,255,.14),transparent 25rem),radial-gradient(circle at 92% 78%,rgba(113,60,255,.1),transparent 28rem);pointer-events:none}
+.install-grid{position:relative;display:grid;grid-template-columns:.85fr 1.15fr;gap:clamp(3rem,8vw,8rem);align-items:start}
+.install-grid>*{min-width:0}
+.install p{color:#b8c1cf}
+.terminal{margin-top:1.8rem;padding:1.2rem 1.3rem;border:1px solid #30394a;border-radius:.75rem;background:#05090f;color:#dbe4f0;font:.82rem/1.9 var(--mono);overflow-x:auto;box-shadow:inset 0 2px 0 var(--blue),0 18px 44px rgba(0,0,0,.18)}
+.terminal span{display:block;white-space:nowrap}
+.terminal span:not(.dim)::before{content:"›";display:inline-block;width:1rem;color:var(--green)}
+.terminal .dim{color:#758095}
+.more{display:inline-block;margin-top:1.2rem;color:#fff;text-underline-offset:4px}
+.facts{display:grid;gap:1rem}
+.fact{padding:1.2rem 0;border-top:1px solid #30394a;color:#b8c1cf}
+.fact strong{display:block;color:#fff;margin-bottom:.3rem}
+
+footer{background:#05090f;color:#aab2bf;padding:2rem 0}
+.foot{display:flex;align-items:center;gap:1.5rem;font-size:.8rem}
+.foot .brand{color:#fff;font-size:1rem}
+.foot .brand img{width:1.8rem;height:1.8rem;border-radius:.45rem}
+.foot span{margin-left:auto}
+
+@media(max-width:850px){
+  :root{--content:min(100% - 2rem,1320px)}
+  .nav-links a:not(.source){display:none}
+  .hero::before,.hero::after{inset:0;border-radius:0}
+  .hero-shot{margin:1.5rem auto 0}
+  .hero-copy{margin-top:2.8rem}
+  .feature,.zed-grid,.roadmap-head,.install-grid{grid-template-columns:1fr}
+  .roadmap-row{grid-template-columns:1fr;gap:.65rem}
+  .zed-list{grid-template-columns:1fr}
+  .scroll{margin-top:1rem;scrollbar-color:var(--blue) var(--planned-line);scrollbar-width:thin}
+  .scroll-hint{display:block}
+}
+@media(max-width:560px){
+  .nav{height:4.5rem}.nav-links{gap:.8rem}.source span{display:none}
+  .hero-copy{margin-top:2rem}.hero-shot{margin-top:1.5rem}
+  .section{padding:4rem 0}.feature{padding:3.5rem 0}
+  .product-view .frame{height:auto;aspect-ratio:4/3}
+  .product-view video{max-width:none}
+  .focus-projects video{transform:scale(1.28);transform-origin:0 50%}
+  .focus-worktree video{transform:scale(1.32);transform-origin:16% 48%}
+  .focus-review video{transform:scale(1.5);transform-origin:72% 52%}
+  .compare .intro{margin-bottom:2.5rem}
+  .scroll-hint{display:none}
+  .scroll{overflow:visible;margin-top:0;border-radius:0;background:transparent;box-shadow:none}
+  table,thead,tbody,tr,th,td{display:block;min-width:0;width:auto}
+  thead{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  tbody{display:grid;gap:0}
+  tbody tr{padding:1.5rem 0;border-top:1px solid var(--line)}
+  tbody tr:last-child{border-bottom:1px solid var(--line)}
+  tbody th{width:auto;padding:0 0 1rem;border:0;color:var(--ink);font-size:1.12rem;font-weight:700}
+  tbody td{display:grid;grid-template-columns:4.75rem minmax(0,1fr);gap:1rem;padding:.55rem 0;border:0;background:transparent;color:var(--ink);font-weight:400}
+  tbody td::before{content:attr(data-product);font:.7rem/1.4 var(--mono);letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+  tbody td.us{padding:.75rem;border-radius:.55rem;background:#e8eefb;color:var(--navy-2);font-weight:600}
+  tbody td.us::before{color:var(--blue);font-weight:700}
+  .terminal{scrollbar-color:var(--violet) #30394a;scrollbar-width:thin}
+  .foot{flex-wrap:wrap}.foot span{margin-left:0;width:100%}
+}
+@media(pointer:coarse){.nav .brand,.source,.foot .brand,.more{min-height:44px}.source{min-width:44px;justify-content:center}.more{display:inline-flex;align-items:center}}
+@media(max-width:560px){.hero::before{background-image:url("zorca-hero-mobile.webp"),radial-gradient(circle at 10% 54%,rgba(255,101,75,.62),transparent 24%),radial-gradient(circle at 78% 28%,rgba(113,60,255,.42),transparent 34%),linear-gradient(180deg,#0d2852 0%,#173f7a 48%,#071833 100%)}}
+@media(hover:hover){
+  .hero:has(.cta:hover) .hero-shot{transform:translateY(-6px)}
+  .hero:has(.cta:hover) .hero-shot.loaded::before{opacity:.62;filter:blur(24px)}
+  .product-view:hover{transform:translateY(-4px);box-shadow:0 30px 72px rgba(20,28,45,.24)}
+  .product-view:hover :is(img,video){transform:scale(1.012);filter:brightness(1.04)}
+  tbody tr:hover>*{background:#f2f5f8}
+  tbody tr:hover td.us{background:#dce6fb}
+  .zed-list div:hover{color:#fff;transform:translateX(.2rem)}
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}.cta,.nav-links a,.hero-shot,.hero-shot::before,.hero-shot img,.product-view,.product-view :is(img,video),.zed-list div{transition:none}.hero:has(.cta:hover) .hero-shot,.product-view:hover,.product-view:hover :is(img,video),.zed-list div:hover{transform:none}}
+@media(forced-colors:active){:focus-visible{outline-color:CanvasText;box-shadow:none}.skip-link{border:1px solid CanvasText}}
+</style>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+<!--
+THESIS: ZOrca turns scattered agent sessions into one controlled native workspace; the page proves it through the product, not feature cards.
+OWN-WORLD: Saturated illustrated landscapes frame exact dark product captures; M1 cobalt-violet-coral identity, white editorial sections, compact square-minded controls.
+STORY: Understand the ADE, see each current workflow, distinguish present from planned, then install with pre-alpha expectations intact.
+FIRST VIEWPORT: Transparent nav and centered proposition over an original canyon, one install action, status, and an oversized real app capture crossing into the next section.
+FORM: Multica-inspired product storytelling with ZOrca content and identity; approved E2A + E3A fusion.
+-->
+<header class="hero" id="top">
+  <nav class="nav" aria-label="Primary">
+    <a class="brand" href="#top"><img src="zorca-logo-m1-128.png" width="38" height="38" alt="">ZOrca</a>
+    <div class="nav-links">
+      <a href="#features">Features</a><a href="#compare">Compare</a><a href="#roadmap">Coming soon</a><a href="#install">Install</a>
+      <a class="source" href="https://github.com/zorca-org/zorca" aria-label="ZOrca source on GitHub">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.56v-2.24c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.41-1.27.74-1.56-2.57-.29-5.27-1.28-5.27-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.47.11-3.05 0 0 .97-.31 3.16 1.18a10.98 10.98 0 0 1 5.76 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.71 5.39-5.29 5.68.42.36.78 1.06.78 2.14v3.18c0 .31.21.68.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg><span>Source</span>
+      </a>
+    </div>
+  </nav>
+  <div class="hero-copy">
+    <h1>All your agents. All your projects. One native workspace.</h1>
+    <p class="lead">ZOrca is an Agent Development Environment built on Zed. Give every coding agent its own Git worktree, terminal, and diff, then restore its project and session context when you return.</p>
+    <a class="cta" href="#install">Install now</a>
+    <p class="status">Pre-alpha · Available from source · Homebrew coming</p>
+  </div>
+  <figure class="hero-shot">
+    <img src="zorca-workspace-800.webp" srcset="zorca-workspace-800.webp 800w, zorca-workspace.webp 1600w" sizes="(max-width:850px) calc(100vw - 2rem), 800px" width="1600" height="1041" alt="ZOrca showing project worktrees, an agent terminal, and repository files" fetchpriority="high" onload="this.parentElement.classList.add('loaded')">
+  </figure>
+</header>
+
+<main id="main">
+  <section class="section" id="features">
+    <div class="wrap">
+      <h2 class="sr">Current capabilities</h2>
+      <article class="feature">
+        <div class="copy"><h3>Resume every project and session.</h3><p>Keep local and SSH-connected repositories in one sidebar. ZOrca saves the project tree, active workspace, and agent terminal sessions, then restores that context when the app or connection returns.</p><ul class="proof"><li>Projects and worktrees return to the sidebar</li><li>Persistent sessions reconnect or can be recreated</li><li>Active workspace and terminal tabs reopen together</li></ul></div>
+        <figure class="product-view focus-projects"><div class="frame"><video autoplay muted loop playsinline preload="auto" aria-label="ZOrca switching between restored Claude Code and OpenAI Codex project sessions"><source src="zorca-projects.mp4?v=3" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · persistent projects and sessions</figcaption></figure>
+      </article>
+
+      <article class="feature">
+        <div class="copy"><h3>Give every agent its own worktree.</h3><p>Agents work in separate Git worktrees instead of colliding in one checkout. Their terminal context and working files stay attributable to one workspace.</p><ul class="proof"><li>Worktree-backed isolation</li><li>Parallel branches without checkout churn</li><li>Project context stays visible</li></ul></div>
+        <figure class="product-view focus-worktree"><div class="frame"><video autoplay muted loop playsinline preload="metadata" aria-label="ZOrca opening an isolated storefront worktree and its source context"><source src="zorca-worktree.mp4" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · worktree and terminal context</figcaption></figure>
+      </article>
+
+      <article class="feature">
+        <div class="copy"><h3>Review terminals and changes together.</h3><p>The Git cockpit follows the active workspace: inspect diffs, stage changes, commit, and browse history without losing the agent terminal that produced them.</p><ul class="proof"><li>Diff and staging controls</li><li>Commit and history browsing</li><li>Agent activity remains in context</li></ul></div>
+        <figure class="product-view focus-review"><div class="frame"><video autoplay muted loop playsinline preload="metadata" aria-label="ZOrca opening tracked and untracked Payments API changes in the Git cockpit"><source src="zorca-git-review.mp4" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · terminal and Git review context</figcaption></figure>
+      </article>
+    </div>
+  </section>
+
+  <section class="section zed">
+    <div class="wrap zed-grid">
+      <div><h2>Zed’s editor foundation, already built in.</h2><p>ZOrca reorganizes Zed around agent workspaces instead of rebuilding the editor underneath them.</p></div>
+      <div class="zed-list"><div>LSP and tree-sitter</div><div>Debugger and multibuffers</div><div>Native Vim keybindings</div><div>Beautiful themes</div><div>Zed Extensions</div><div><code>zed://</code> URLs</div></div>
+    </div>
+  </section>
+
+  <section class="section compare" id="compare">
+    <div class="wrap">
+      <div class="intro"><h2>Where ZOrca fits.</h2><p>ZOrca combines Zed’s mature editor with agent-first workspaces. Zed is the polished upstream editor; Orca is the broader ADE today.</p></div>
+      <p class="scroll-hint" id="comparison-hint">Swipe or use arrow keys to compare all columns.</p>
+      <div class="scroll" role="region" aria-label="ZOrca, Zed, and Orca feature comparison" aria-describedby="comparison-hint" tabindex="0"><table><thead><tr><th><span class="sr">Capability</span></th><th class="us-head"><span><img src="zorca-logo-m1-128.png" width="22" height="22" alt="">ZOrca</span></th><th>Zed</th><th>Orca</th></tr></thead><tbody>
+        <tr><th>Workspace model</th><td class="us" data-product="ZOrca">Agent workspaces with Git worktrees</td><td data-product="Zed">Project folders</td><td data-product="Orca">Agent workspaces</td></tr>
+        <tr><th>Remote projects</th><td class="us" data-product="ZOrca">SSH workspaces</td><td data-product="Zed">SSH projects</td><td data-product="Orca">Remote workspaces</td></tr>
+        <tr><th>Agent terminals</th><td class="us" data-product="ZOrca">As many as needed per project worktree</td><td data-product="Zed">Terminal dock</td><td data-product="Orca">First-class</td></tr>
+        <tr><th>Automation and orchestration</th><td class="us" data-product="ZOrca">No; hands-on control only</td><td data-product="Zed">No</td><td data-product="Orca">Yes</td></tr>
+        <tr><th>Built-in AI</th><td class="us" data-product="ZOrca">None hosted; Copilot optional</td><td data-product="Zed">Zed AI, hosted</td><td data-product="Orca">Bring your own</td></tr>
+        <tr><th>Availability</th><td class="us" data-product="ZOrca">Desktop from source; mobile planned</td><td data-product="Zed">Desktop app</td><td data-product="Orca">Desktop and mobile apps</td></tr>
+      </tbody></table></div>
+    </div>
+  </section>
+
+  <section class="section roadmap" id="roadmap">
+    <div class="wrap">
+      <div class="roadmap-head"><h2>Coming soon.</h2><p>These are planned directions, not first-version capabilities. There are no promised dates.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>Agent communication bus</h3><p>Workspace-scoped messaging so agents can exchange context and coordinate work.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>Deeper agent integration</h3><p>Better monitoring and direct interaction with running coding agents.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>Mobile companion</h3><p>Monitor and interact with workspaces away from the desktop after the first desktop version.</p></div>
+    </div>
+  </section>
+
+  <section class="section install" id="install">
+    <div class="wrap install-grid">
+      <div><h2>Install ZOrca.</h2><p>For now, ZOrca is available as a source build for macOS and Linux. A Homebrew installation is coming.</p><div class="terminal" aria-label="Source installation commands"><span class="dim"># macOS and Linux</span><span>git clone https://github.com/zorca-org/zorca.git</span><span>cd zorca</span><span class="dim"># Linux only</span><span>./script/linux</span><span>./script/download-wasi-sdk</span><span class="dim"># Build and launch</span><span>cargo run -p zed</span></div><a class="more" href="https://github.com/zorca-org/zorca#install">Read the full build instructions</a></div>
+      <div class="facts"><div class="fact"><strong>Pre-alpha</strong>Expect breaking changes.</div><div class="fact"><strong>No packaged release yet</strong>Packaged and signed releases are not currently available.</div><div class="fact"><strong>macOS and Linux</strong>Windows is not supported.</div><div class="fact"><strong>Independent and open source</strong>GPL-3.0-or-later. Not affiliated with Zed Industries or Stably AI.</div></div>
+    </div>
+  </section>
+</main>
+
+<footer><div class="wrap foot"><a class="brand" href="#top"><img src="zorca-logo-m1-128.png" width="29" height="29" alt="">ZOrca</a><span>GPL-3.0-or-later · zorca.net</span></div></footer>
+<script>
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const syncFeatureVideos = () => document.querySelectorAll('.product-view video').forEach(video => {
+  video.playbackRate = 1.5;
+  reducedMotion.matches ? video.pause() : video.play().catch(() => {});
+});
+reducedMotion.addEventListener('change', syncFeatureVideos);
+syncFeatureVideos();
+</script>
+</body>
+</html>

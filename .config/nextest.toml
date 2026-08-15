@@ -13,10 +13,7 @@ test-group = 'sequential-db-tests'
 [[profile.default.overrides]]
 filter = 'package(worktree) and test(test_random_worktree_changes)'
 priority = 100
-
-[[profile.default.overrides]]
-filter = 'package(collab) and (test(random_project_collaboration_tests) or test(random_channel_buffer_tests) or test(test_contact_requests) or test(test_basic_following))'
-priority = 99
+slow-timeout = { period = "300s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(extension_host) and test(test_extension_store_with_test_extension)'
@@ -27,9 +24,13 @@ priority = 99
 filter = 'test(test_rainbow_bracket_highlights) or test(test_wrapped_invisibles_drawing) or test(test_basic_following) or test(test_random_diagnostics_blocks)'
 slow-timeout = { period = "300s", terminate-after = 1 }
 
+# The test budgets one step — `install_dev_extension`, which builds the test
+# extension's wasm — at 300s of its own. That budget has to fit inside this one
+# with room for the steps before it, or nextest terminates the test first and
+# the message naming the step that hung is never printed.
 [[profile.default.overrides]]
 filter = 'package(extension_host) and test(test_extension_store_with_test_extension)'
-slow-timeout = { period = "300s", terminate-after = 1 }
+slow-timeout = { period = "420s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 filter = 'package(language_model) and test(test_from_image_downscales_to_default_5mb_limit)'
@@ -45,4 +46,8 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 
 [[profile.default.overrides]]
 filter =  'package(editor) and test(test_random_blocks)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(workspace) and test(single_pane_navigation)'
 slow-timeout = { period = "300s", terminate-after = 1 }

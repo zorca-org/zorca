@@ -30,16 +30,19 @@ pub static RELEASE_CHANNEL: LazyLock<ReleaseChannel> =
 #[cfg(target_os = "windows")]
 pub fn app_identifier() -> &'static str {
     match *RELEASE_CHANNEL {
-        ReleaseChannel::Dev => "Zed-Editor-Dev",
-        ReleaseChannel::Nightly => "Zed-Editor-Nightly",
-        ReleaseChannel::Preview => "Zed-Editor-Preview",
-        ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Dev => "ZOrca-Editor-Dev",
+        ReleaseChannel::Nightly => "ZOrca-Editor-Nightly",
+        ReleaseChannel::Preview => "ZOrca-Editor-Preview",
+        ReleaseChannel::Stable => "ZOrca-Editor-Stable",
     }
 }
 
 /// The Git commit SHA that Zed was built at.
 #[derive(Clone, Eq, Debug, PartialEq)]
-pub struct AppCommitSha(String);
+pub struct AppCommitSha {
+    sha: String,
+    source_is_dirty: bool,
+}
 
 struct GlobalAppCommitSha(AppCommitSha);
 
@@ -47,8 +50,11 @@ impl Global for GlobalAppCommitSha {}
 
 impl AppCommitSha {
     /// Creates a new [`AppCommitSha`].
-    pub fn new(sha: String) -> Self {
-        AppCommitSha(sha)
+    pub fn new(sha: String, source_is_dirty: bool) -> Self {
+        Self {
+            sha,
+            source_is_dirty,
+        }
     }
 
     /// Returns the global [`AppCommitSha`], if one is set.
@@ -64,12 +70,17 @@ impl AppCommitSha {
 
     /// Returns the full commit SHA.
     pub fn full(&self) -> String {
-        self.0.to_string()
+        self.sha.clone()
     }
 
     /// Returns the short (7 character) commit SHA.
     pub fn short(&self) -> String {
-        self.0.chars().take(7).collect()
+        self.sha.chars().take(7).collect()
+    }
+
+    /// Returns whether tracked source files differed from the commit.
+    pub fn source_is_dirty(&self) -> bool {
+        self.source_is_dirty
     }
 }
 
@@ -101,7 +112,7 @@ impl AppVersion {
 
         if let Some(sha) = commit_sha {
             pre.push('.');
-            pre.push_str(&sha.0);
+            pre.push_str(&sha.sha);
         }
         if let Ok(build) = semver::BuildMetadata::new(&pre) {
             version.build = build;
@@ -191,10 +202,10 @@ impl ReleaseChannel {
     /// Returns the display name for this [`ReleaseChannel`].
     pub fn display_name(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "Zed Dev",
-            ReleaseChannel::Nightly => "Zed Nightly",
-            ReleaseChannel::Preview => "Zed Preview",
-            ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Dev => "ZOrca Dev",
+            ReleaseChannel::Nightly => "ZOrca Nightly",
+            ReleaseChannel::Preview => "ZOrca Preview",
+            ReleaseChannel::Stable => "ZOrca",
         }
     }
 
@@ -213,10 +224,10 @@ impl ReleaseChannel {
     /// This also has to match the bundle identifier for Zed on macOS.
     pub fn app_id(&self) -> &'static str {
         match self {
-            ReleaseChannel::Dev => "dev.zed.Zed-Dev",
-            ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
-            ReleaseChannel::Preview => "dev.zed.Zed-Preview",
-            ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Dev => "dev.zorca.ZOrca-Dev",
+            ReleaseChannel::Nightly => "dev.zorca.ZOrca-Nightly",
+            ReleaseChannel::Preview => "dev.zorca.ZOrca-Preview",
+            ReleaseChannel::Stable => "dev.zorca.ZOrca",
         }
     }
 

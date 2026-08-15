@@ -305,6 +305,56 @@ impl GlobalCopilotAuth {
 }
 impl Global for GlobalCopilotAuth {}
 
+/// Copilot runs one language server per project, because the server is told
+/// which entry is focused and resolves its node runtime from the project. The
+/// global instance above only carries authentication, which is shared.
+#[derive(Default)]
+struct CopilotProjects(HashMap<EntityId, Entity<Copilot>>);
+
+impl Global for CopilotProjects {}
+
+impl Copilot {
+    pub fn for_project(project: &Entity<Project>, cx: &App) -> Option<Entity<Copilot>> {
+        cx.try_global::<CopilotProjects>()
+            .and_then(|projects| projects.0.get(&project.entity_id()).cloned())
+    }
+
+    pub fn start_for_project(project: &Entity<Project>, cx: &mut App) -> Option<Entity<Copilot>> {
+        if DisableAiSettings::get(None, cx).disable_ai {
+            return None;
+        }
+        if let Some(copilot) = Self::for_project(project, cx) {
+            return Some(copilot);
+        }
+
+        let project_id = project.entity_id();
+        let (node_runtime, server_id, fs) = {
+            let read = project.read(cx);
+            (
+                read.node_runtime().cloned()?,
+                read.languages().next_language_server_id(),
+                read.fs().clone(),
+            )
+        };
+
+        let copilot = cx.new({
+            let project = project.clone();
+            |cx| Copilot::new(Some(project), server_id, fs, node_runtime, cx)
+        });
+        cx.default_global::<CopilotProjects>()
+            .0
+            .insert(project_id, copilot.clone());
+        cx.observe_release(project, move |_, cx| {
+            if cx.has_global::<CopilotProjects>() {
+                cx.global_mut::<CopilotProjects>().0.remove(&project_id);
+            }
+        })
+        .detach();
+
+        Some(copilot)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompletionSource {
     NextEditSuggestion,

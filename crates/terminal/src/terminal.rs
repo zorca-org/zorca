@@ -2023,6 +2023,15 @@ impl Terminal {
         }
     }
 
+    /// Keep a daemon-owned session at its last active size while its view is unfocused.
+    /// Dock and tab changes must not resize the shared PTY merely because its viewport moved.
+    pub fn set_view_size(&mut self, new_bounds: TerminalBounds, view_is_focused: bool) {
+        if !view_is_focused && self.is_ade_session() {
+            return;
+        }
+        self.set_size(new_bounds);
+    }
+
     /// Write the Input payload to the PTY, if applicable.
     /// (This is a no-op for display-only terminals.)
     fn write_to_pty(&self, input: impl Into<Cow<'static, [u8]>>) {
@@ -2341,15 +2350,21 @@ impl Terminal {
     }
 
     pub fn focus_in(&self) {
-        if self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
+        if !self.is_ade_session() && self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
             self.write_to_pty("\x1b[I".as_bytes());
         }
     }
 
     pub fn focus_out(&mut self) {
-        if self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
+        if !self.is_ade_session() && self.last_content.mode.contains(Modes::FOCUS_IN_OUT) {
             self.write_to_pty("\x1b[O".as_bytes());
         }
+    }
+
+    fn is_ade_session(&self) -> bool {
+        self.task
+            .as_ref()
+            .is_some_and(|task| task.spawned_task.id.is_ade_session())
     }
 
     fn mouse_changed(&mut self, point: Point, side: SelectionSide) -> bool {
@@ -3377,7 +3392,7 @@ mod tests {
     };
     use parking_lot::Mutex;
     use rand::{Rng, distr, rngs::StdRng};
-    use task::{Shell, ShellBuilder};
+    use task::{ADE_SESSION_TASK_PREFIX, Shell, ShellBuilder, TaskId};
 
     #[test]
     fn test_init_command_startup_marker_commands_do_not_contain_marker() {
@@ -4303,6 +4318,82 @@ mod tests {
             terminal.events.back(),
             Some(InternalEvent::Resize(_))
         ));
+    }
+
+    #[gpui::test]
+    async fn test_ade_session_ignores_unfocused_view_changes(cx: &mut TestAppContext) {
+        let builder = cx.update(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::Block,
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+        });
+        let mut terminal = builder.terminal;
+        let (_, completion_rx) = async_channel::unbounded();
+        terminal.task = Some(TaskState {
+            status: TaskStatus::Running,
+            completion_rx,
+            spawned_task: SpawnInTerminal {
+                id: TaskId(format!("{ADE_SESSION_TASK_PREFIX}test")),
+                ..Default::default()
+            },
+        });
+        terminal.last_content.mode = Modes::FOCUS_IN_OUT;
+
+        let base_bounds = TerminalBounds {
+            cell_width: Pixels::from(10.),
+            line_height: Pixels::from(10.),
+            bounds: bounds(
+                GpuiPoint::default(),
+                size(Pixels::from(100.), Pixels::from(100.)),
+            ),
+        };
+        terminal.set_view_size(base_bounds, true);
+        terminal.events.clear();
+
+        let mut background_bounds = base_bounds;
+        background_bounds.bounds.size.width = Pixels::from(80.);
+        terminal.set_view_size(background_bounds, false);
+        assert!(terminal.events.is_empty());
+        assert_eq!(terminal.last_content.terminal_bounds, base_bounds);
+
+        terminal.focus_out();
+        terminal.focus_in();
+
+        assert!(terminal.take_pty_write_log().is_empty());
+
+        terminal.set_view_size(background_bounds, true);
+        assert!(matches!(
+            terminal.events.back(),
+            Some(InternalEvent::Resize(bounds)) if *bounds == background_bounds
+        ));
+
+        terminal.events.clear();
+        let (_, completion_rx) = async_channel::unbounded();
+        terminal.task = Some(TaskState {
+            status: TaskStatus::Running,
+            completion_rx,
+            spawned_task: SpawnInTerminal {
+                id: TaskId("regular-task".into()),
+                ..Default::default()
+            },
+        });
+        terminal.set_view_size(base_bounds, false);
+        terminal.focus_out();
+        terminal.focus_in();
+
+        assert!(matches!(
+            terminal.events.back(),
+            Some(InternalEvent::Resize(bounds)) if *bounds == base_bounds
+        ));
+        assert_eq!(
+            terminal.take_pty_write_log(),
+            vec![b"\x1b[O".to_vec(), b"\x1b[I".to_vec()]
+        );
     }
 
     fn get_cells(size: TerminalBounds, rng: &mut StdRng) -> Vec<Vec<char>> {

@@ -19,6 +19,12 @@ pub struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if path == "images/zorca_logo.png" {
+            return Ok(Some(std::borrow::Cow::Borrowed(include_bytes!(
+                "../../../docs/branding/logos/zorca-logo-transparent.png"
+            ))));
+        }
+
         Self::get(path)
             .map(|f| Some(f.data))
             .with_context(|| format!("loading asset at path {path:?}"))

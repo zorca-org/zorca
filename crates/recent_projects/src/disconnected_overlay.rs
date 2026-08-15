@@ -89,8 +89,7 @@ impl DisconnectedOverlay {
     }
 
     fn handle_reconnect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.finished = true;
-        cx.emit(DismissEvent);
+        self.dismiss(cx);
 
         if let Host::RemoteServerProject(remote_connection_options, _) = &self.host {
             self.reconnect_to_remote_project(remote_connection_options.clone(), window, cx);
@@ -136,9 +135,38 @@ impl DisconnectedOverlay {
         .detach_and_prompt_err("Failed to reconnect", window, cx, |_, _, _| None);
     }
 
-    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+    fn handle_close_workspace(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let Some(multi_workspace) = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(WeakEntity::upgrade)
+        else {
+            return;
+        };
+
+        self.dismiss(cx);
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace
+                .close_workspace(&workspace, window, cx)
+                .detach_and_log_err(cx);
+        });
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
         self.finished = true;
-        cx.emit(DismissEvent)
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        self.dismiss(cx);
     }
 }
 
@@ -183,6 +211,7 @@ impl Render for DisconnectedOverlay {
                     .header(
                         ModalHeader::new()
                             .show_dismiss_button(true)
+                            .on_dismiss(cx.listener(|this, _, _, cx| this.dismiss(cx)))
                             .child(Headline::new("Disconnected").size(HeadlineSize::Small)),
                     )
                     .section(Section::new().child(Label::new(message)))
@@ -191,12 +220,18 @@ impl Render for DisconnectedOverlay {
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    Button::new("close-window", "Close Window")
-                                        .style(ButtonStyle::Filled)
-                                        .layer(ElevationIndex::ModalSurface)
-                                        .on_click(cx.listener(move |_, _, window, _| {
-                                            window.remove_window();
-                                        })),
+                                    div()
+                                        .debug_selector(|| {
+                                            "disconnected-close-workspace".to_owned()
+                                        })
+                                        .child(
+                                            Button::new("close-workspace", "Close Workspace")
+                                                .style(ButtonStyle::Filled)
+                                                .layer(ElevationIndex::ModalSurface)
+                                                .on_click(
+                                                    cx.listener(Self::handle_close_workspace),
+                                                ),
+                                        ),
                                 )
                                 .when(can_reconnect, |el| {
                                     el.child(
@@ -210,5 +245,99 @@ impl Render for DisconnectedOverlay {
                         ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use gpui::{Entity, Modifiers, TestAppContext};
+    use project::Project;
+    use workspace::AppState;
+
+    use super::*;
+
+    fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
+        cx.update(|cx| {
+            let app_state = AppState::test(cx);
+            crate::init(cx);
+            editor::init(cx);
+            app_state
+        })
+    }
+
+    fn show_disconnected_overlay(workspace: &Entity<Workspace>, cx: &mut gpui::VisualTestContext) {
+        let weak_workspace = workspace.downgrade();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_modal(window, cx, |_, cx| DisconnectedOverlay {
+                workspace: weak_workspace,
+                host: Host::CollabGuestProject,
+                focus_handle: cx.focus_handle(),
+                finished: false,
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn close_icon_dismisses_disconnected_overlay(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        show_disconnected_overlay(&workspace, cx);
+        let workspace_focus = workspace.read_with(cx, |workspace, cx| workspace.focus_handle(cx));
+        cx.update(|window, cx| workspace_focus.focus(window, cx));
+
+        let close_bounds = cx
+            .debug_bounds("ICON-Close")
+            .expect("disconnected overlay close icon should render");
+        cx.simulate_click(close_bounds.center(), Modifiers::none());
+
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<DisconnectedOverlay>(cx).is_none()
+        }));
+    }
+
+    #[gpui::test]
+    async fn close_disconnected_workspace_keeps_window_open(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let replacement_project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(replacement_project, window, cx);
+            multi_workspace.activate(workspace.clone(), None, window, cx);
+        });
+        show_disconnected_overlay(&workspace, cx);
+
+        let close_bounds = cx
+            .debug_bounds("disconnected-close-workspace")
+            .expect("close workspace button should render");
+        cx.simulate_click(close_bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 1);
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert_ne!(
+                multi_workspace.workspace().entity_id(),
+                workspace.entity_id()
+            );
+            assert!(
+                !multi_workspace
+                    .workspaces()
+                    .any(|candidate| candidate == &workspace)
+            );
+        });
     }
 }

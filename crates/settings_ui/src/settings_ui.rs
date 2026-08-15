@@ -54,13 +54,9 @@ use zed_actions::{
 
 use crate::components::{
     EnumVariantDropdown, NumberField, NumberFieldMode, NumberFieldType, SettingsInputField,
-    SettingsSectionHeader, font_picker, icon_theme_picker, render_ollama_model_picker,
-    text_field_a11y_state, theme_picker,
+    SettingsSectionHeader, font_picker, icon_theme_picker, text_field_a11y_state, theme_picker,
 };
-use crate::pages::{
-    CustomAgentForm, LlmProviderForm, McpServerForm, render_input_audio_device_dropdown,
-    render_output_audio_device_dropdown,
-};
+use crate::pages::{render_input_audio_device_dropdown, render_output_audio_device_dropdown};
 
 const NAVBAR_CONTAINER_TAB_INDEX: isize = 0;
 const NAVBAR_GROUP_TAB_INDEX: isize = 1;
@@ -546,6 +542,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::MultiCursorModifier>(render_dropdown)
         .add_basic_renderer::<settings::HideMouseMode>(render_dropdown)
         .add_basic_renderer::<settings::ReduceMotionMode>(render_dropdown)
+        .add_basic_renderer::<settings::AppIcon>(render_dropdown)
         .add_basic_renderer::<settings::CurrentLineHighlight>(render_dropdown)
         .add_basic_renderer::<settings::ShowWhitespaceSetting>(render_dropdown)
         .add_basic_renderer::<settings::SoftWrap>(render_dropdown)
@@ -643,7 +640,6 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<settings::WindowButtonLayoutContentDiscriminants>(render_dropdown)
         .add_basic_renderer::<settings::ScanSymlinksSetting>(render_dropdown)
         .add_basic_renderer::<settings::FontSize>(render_editable_number_field)
-        .add_basic_renderer::<settings::OllamaModelName>(render_ollama_model_picker)
         .add_basic_renderer::<settings::SemanticTokens>(render_dropdown)
         .add_basic_renderer::<settings::DocumentFoldingRanges>(render_dropdown)
         .add_basic_renderer::<settings::DocumentSymbols>(render_dropdown)
@@ -956,32 +952,21 @@ pub struct SettingsWindow {
     pub(crate) regex_validation_error: Option<String>,
     pub(crate) sandbox_host_validation_error: Option<String>,
     last_copied_link_path: Option<&'static str>,
-    /// Cached configuration views per provider, created lazily.
-    pub(crate) provider_configuration_views:
-        HashMap<language_model::LanguageModelProviderId, gpui::AnyView>,
-    /// The provider whose configuration sub-page is currently open, if any.
-    pub(crate) configuring_provider: Option<language_model::LanguageModelProviderId>,
     /// Directory path of the skill whose share link was most recently copied,
     /// used to show a transient "copied" checkmark on its share button.
     pub(crate) last_copied_skill_directory_path: Option<PathBuf>,
     /// State for the active "add OpenAI/Anthropic-compatible provider" form sub-page, if open.
-    pub(crate) llm_provider_form: Option<LlmProviderForm>,
     /// Stable focus handle for the LLM "Add Provider" button, so it can show a
     /// focus ring when the page auto-focuses it on open (which happens via mouse,
     /// where `focus_visible` styling would otherwise be suppressed).
-    pub(crate) llm_provider_add_focus_handle: FocusHandle,
     /// State for the active "add/edit custom MCP server" form sub-page, if open.
-    pub(crate) mcp_server_form: Option<McpServerForm>,
     /// Stable focus handle for the MCP "Add Server" button, so it can show a
     /// focus ring when the page auto-focuses it on open (which happens via mouse,
     /// where `focus_visible` styling would otherwise be suppressed).
-    pub(crate) mcp_add_server_focus_handle: FocusHandle,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
-    pub(crate) custom_agent_form: Option<CustomAgentForm>,
     /// Stable focus handle for the external agents "Add Agent" button, so it can
     /// show a focus ring when the page auto-focuses it on open (which happens via
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
-    pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
 }
 
@@ -1995,15 +1980,7 @@ impl SettingsWindow {
             sandbox_host_validation_error: None,
             list_state,
             last_copied_link_path: None,
-            provider_configuration_views: HashMap::default(),
-            configuring_provider: None,
             last_copied_skill_directory_path: None,
-            llm_provider_form: None,
-            llm_provider_add_focus_handle: cx.focus_handle(),
-            mcp_server_form: None,
-            mcp_add_server_focus_handle: cx.focus_handle(),
-            custom_agent_form: None,
-            external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };
 
@@ -3632,20 +3609,6 @@ impl SettingsWindow {
         self.render_sub_page_items_in(page_content, items, false, window, cx)
     }
 
-    fn render_sub_page_items_section<'a, Items>(
-        &self,
-        items: Items,
-        is_inline_section: bool,
-        window: &mut Window,
-        cx: &mut Context<SettingsWindow>,
-    ) -> impl IntoElement
-    where
-        Items: Iterator<Item = (usize, &'a SettingsPageItem)>,
-    {
-        let page_content = v_flex().id("settings-ui-sub-page-section").size_full();
-        self.render_sub_page_items_in(page_content, items, is_inline_section, window, cx)
-    }
-
     fn render_sub_page_items_in<'a, Items>(
         &self,
         page_content: Stateful<Div>,
@@ -3724,10 +3687,6 @@ impl SettingsWindow {
         if let Some(current_sub_page) = self.sub_page_stack.last() {
             let is_skills_page =
                 current_sub_page.link.json_path == Some(AGENT_SKILLS_SETTINGS_PATH);
-            let is_llm_providers_page = current_sub_page.link.json_path == Some("llm_providers")
-                && current_sub_page.link.title.as_ref() == "LLM Providers";
-            let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
-            let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
 
             page_header = h_flex()
                 .w_full()
@@ -3766,9 +3725,6 @@ impl SettingsWindow {
                                     })),
                             )
                         })
-                        .when(is_llm_providers_page, |this| {
-                            this.child(pages::render_add_llm_provider_popover(self, window, cx))
-                        })
                         .when(is_skills_page, |this| {
                             this.child(
                                 Button::new("open-skill-creator", "Create Skill")
@@ -3782,12 +3738,6 @@ impl SettingsWindow {
                                         );
                                     })),
                             )
-                        })
-                        .when(is_external_agents_page, |this| {
-                            this.child(pages::render_add_agent_popover(self, window, cx))
-                        })
-                        .when(is_mcp_servers_page, |this| {
-                            this.child(pages::render_add_server_popover(self, window, cx))
                         }),
                 )
                 .into_any_element();
@@ -5305,15 +5255,7 @@ pub mod test {
                 regex_validation_error: None,
                 sandbox_host_validation_error: None,
                 last_copied_link_path: None,
-                provider_configuration_views: HashMap::default(),
-                configuring_provider: None,
                 last_copied_skill_directory_path: None,
-                llm_provider_form: None,
-                llm_provider_add_focus_handle: cx.focus_handle(),
-                mcp_server_form: None,
-                mcp_add_server_focus_handle: cx.focus_handle(),
-                custom_agent_form: None,
-                external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
             }
         }
@@ -5444,15 +5386,7 @@ pub mod test {
             regex_validation_error: None,
             sandbox_host_validation_error: None,
             last_copied_link_path: None,
-            provider_configuration_views: HashMap::default(),
-            configuring_provider: None,
             last_copied_skill_directory_path: None,
-            llm_provider_form: None,
-            llm_provider_add_focus_handle: cx.focus_handle(),
-            mcp_server_form: None,
-            mcp_add_server_focus_handle: cx.focus_handle(),
-            custom_agent_form: None,
-            external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };
 

@@ -11539,6 +11539,21 @@ mod tests {
             panel.selected_entry = Some(1);
             panel.open_diff(&menu::Confirm, window, cx);
         });
+
+        let project_diff = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .item_of_type::<ProjectDiff>(cx)
+                .expect("ProjectDiff should exist")
+        });
+        let first_visible_path = loop {
+            assert!(cx.executor().tick(), "diff loading should make progress");
+            if let Some(path) = project_diff.read_with(cx, |diff, cx| diff.active_project_path(cx))
+            {
+                break path;
+            }
+        };
+        assert_eq!(first_visible_path.path, rel_path("untracked").into_arc());
+
         cx.run_until_parked();
 
         workspace.update_in(cx, |workspace, _window, cx| {

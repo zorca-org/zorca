@@ -22,11 +22,10 @@
     "bindings": {
       // In VS Code `ctrl-k z` is Zen Mode; the word wrap toggle moves to `alt-z`.
       "ctrl-k z": "workspace::ToggleCenteredLayout",
-      "ctrl-i": "assistant::InlineAssist", // Inline Chat
     },
   },
   {
-    "context": "!AcpThread > Editor && mode == full",
+    "context": "mode == full",
     "use_key_equivalents": true,
     "bindings": {
       "ctrl-enter": "editor::NewlineBelow", // Insert Line Below (Inline Chat lives on `ctrl-i`)

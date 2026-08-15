@@ -1,11 +1,9 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use client::{Client, TelemetrySettings, UserStore, zed_urls};
-use cloud_api_types::Plan;
+use client::{TelemetrySettings, UserStore};
 use collections::HashMap;
 use fs::Fs;
-use gpui::{Action, Animation, AnimationExt, App, Entity, IntoElement, TaskExt, pulsating_between};
+use gpui::{Action, App, Entity, IntoElement};
 use project::agent_server_store::AllAgentServersSettings;
 use project::project_settings::ProjectSettings;
 use project::{AgentRegistryStore, RegistryAgent};
@@ -250,7 +248,7 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
             SwitchField::new(
                 "onboarding-telemetry-metrics",
                 None::<&str>,
-                Some("Help improve Zed by sending anonymous usage data".into()),
+                Some("Send anonymous usage data (currently to Zed's servers; ZOrca has none of its own yet)".into()),
                 if TelemetrySettings::get_global(cx).metrics {
                     ui::ToggleState::Selected
                 } else {
@@ -290,7 +288,7 @@ fn render_telemetry_section(tab_index: &mut isize, cx: &App) -> impl IntoElement
                 "onboarding-telemetry-crash-reports",
                 None::<&str>,
                 Some(
-                    "Help fix Zed by sending crash reports so we can fix critical issues fast"
+                    "Send crash reports (currently to Zed's servers; ZOrca has none of its own yet)"
                         .into(),
                 ),
                 if TelemetrySettings::get_global(cx).diagnostics {
@@ -439,12 +437,14 @@ fn render_worktree_auto_trust_switch(tab_index: &mut isize, cx: &mut App) -> imp
         ui::ToggleState::Unselected
     };
 
-    let tooltip_description = "Zed can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
+    let tooltip_description = "ZOrca can only allow services like language servers, project settings, and MCP servers to run after you mark a new project as trusted.";
 
     SwitchField::new(
         "onboarding-auto-trust-worktrees",
         Some("Trust All Projects By Default"),
-        Some("Automatically mark all new projects as trusted to unlock all Zed's features".into()),
+        Some(
+            "Automatically mark all new projects as trusted to unlock all ZOrca's features".into(),
+        ),
         toggle_state,
         {
             let fs = <dyn Fs>::global(cx);
@@ -536,8 +536,9 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
         .child(h_flex().gap_1().child(vscode).child(cursor))
 }
 
-pub(crate) const FEATURED_AGENT_IDS: &[&str] =
-    &["claude-acp", "codex-acp", "github-copilot-cli", "cursor"];
+/// ZOrca runs coding agents as terminals, so only the CLI ones are offered.
+/// Chat-style in-editor agents are deliberately absent.
+pub(crate) const FEATURED_AGENT_IDS: &[&str] = &["claude-acp", "codex-acp"];
 
 fn render_registry_agent_button(
     agent: &RegistryAgent,
@@ -598,79 +599,7 @@ fn render_registry_agent_button(
         })
 }
 
-fn render_zed_agent_button(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
-    let client = Client::global(cx);
-    let status = *client.status().borrow();
-
-    let plan = user_store.read(cx).plan();
-    let is_free = matches!(plan, Some(Plan::ZedFree) | None);
-    let is_pro = matches!(plan, Some(Plan::ZedPro));
-    let is_trial = matches!(plan, Some(Plan::ZedProTrial));
-
-    let is_signed_out = status.is_signed_out()
-        || matches!(
-            status,
-            client::Status::AuthenticationError | client::Status::ConnectionError
-        );
-    let is_signing_in = status.is_signing_in();
-    let is_signed_in = !is_signed_out;
-
-    let state_element = if is_signed_out {
-        Label::new("Sign In")
-            .size(LabelSize::XSmall)
-            .color(Color::Muted)
-            .into_any_element()
-    } else if is_signing_in {
-        Label::new("Signing In…")
-            .size(LabelSize::XSmall)
-            .color(Color::Muted)
-            .with_animation(
-                "signing-in",
-                Animation::new(Duration::from_secs(2))
-                    .repeat()
-                    .with_easing(pulsating_between(0.4, 0.8)),
-                |label, delta| label.alpha(delta),
-            )
-            .into_any_element()
-    } else if is_signed_in && is_free {
-        Label::new("Start Free Trial")
-            .size(LabelSize::XSmall)
-            .color(Color::Muted)
-            .into_any_element()
-    } else {
-        Icon::new(IconName::Check)
-            .size(IconSize::Small)
-            .color(Color::Success)
-            .into_any_element()
-    };
-
-    AgentSetupButton::new("zed-agent-onboarding")
-        .icon(
-            Icon::new(IconName::ZedAgent)
-                .size(IconSize::XSmall)
-                .color(Color::Muted),
-        )
-        .name("Zed Agent")
-        .state(state_element)
-        .disabled(is_trial || is_pro)
-        .map(|this| {
-            if is_signed_in && is_free {
-                this.on_click(move |_, _window, cx| {
-                    telemetry::event!("Start Trial Clicked", state = "post-sign-in");
-                    cx.open_url(&zed_urls::start_trial_url(cx))
-                })
-            } else {
-                this.on_click(move |_, _, cx| {
-                    telemetry::event!("Welcome Zed Agent Sign In Clicked");
-                    let client = Client::global(cx);
-                    cx.spawn(async move |cx| client.sign_in_with_optional_connect(true, cx).await)
-                        .detach_and_log_err(cx);
-                })
-            }
-        })
-}
-
-fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+fn render_ai_section(cx: &mut App) -> impl IntoElement {
     let registry_agents = AgentRegistryStore::try_global(cx)
         .map(|store| store.read(cx).agents().to_vec())
         .unwrap_or_default();
@@ -680,7 +609,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
         .get::<AllAgentServersSettings>(None)
         .clone();
 
-    let column_count = 1 + FEATURED_AGENT_IDS.len() as u16;
+    let column_count = FEATURED_AGENT_IDS.len() as u16;
 
     let grid = FEATURED_AGENT_IDS.iter().fold(
         div()
@@ -688,8 +617,7 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
             .mt_1p5()
             .grid()
             .grid_cols(column_count)
-            .gap_2()
-            .child(render_zed_agent_button(user_store, cx)),
+            .gap_2(),
         |grid, agent_id| {
             let Some(agent) = registry_agents
                 .iter()
@@ -704,15 +632,18 @@ fn render_ai_section(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoE
 
     v_flex()
         .gap_0p5()
-        .child(Label::new("Agent Setup"))
+        .child(Label::new("Coding Agents"))
         .child(
-            Label::new("Install your favorite agents and start your first thread.")
+            Label::new("Install a CLI agent. ZOrca runs them as terminals, one per worktree.")
                 .color(Color::Muted),
         )
         .child(grid)
 }
 
-pub(crate) fn render_basics_page(user_store: &Entity<UserStore>, cx: &mut App) -> impl IntoElement {
+pub(crate) fn render_basics_page(
+    _user_store: &Entity<UserStore>,
+    cx: &mut App,
+) -> impl IntoElement {
     let mut tab_index = 0;
 
     v_flex()
@@ -720,7 +651,7 @@ pub(crate) fn render_basics_page(user_store: &Entity<UserStore>, cx: &mut App) -
         .gap_6()
         .child(render_theme_section(&mut tab_index, cx))
         .child(render_base_keymap_section(&mut tab_index, cx))
-        .child(render_ai_section(user_store, cx))
+        .child(render_ai_section(cx))
         .child(render_import_settings_section(&mut tab_index, cx))
         .child(render_vim_mode_switch(&mut tab_index, cx))
         .child(render_worktree_auto_trust_switch(&mut tab_index, cx))

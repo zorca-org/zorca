@@ -4,6 +4,27 @@ $PSNativeCommandUseErrorActionPreference = $true
 $CARGO_ABOUT_VERSION="0.8.2"
 $outputFile=$args[0] ? $args[0] : "$(Get-Location)/assets/licenses.md"
 $templateFile="script/licenses/template.md.hbs"
+$cacheFile = $null
+
+if (-not $env:ALLOW_MISSING_LICENSES) {
+    $targetDir = $env:CARGO_TARGET_DIR ? $env:CARGO_TARGET_DIR : "target"
+    $cacheDir = Join-Path $targetDir "license-cache"
+    $hashes = @(
+        "Cargo.lock"
+        "assets/themes/LICENSES"
+        "assets/icons/LICENSES"
+        "script/licenses/zorca-licenses.toml"
+        $templateFile
+        "script/generate-licenses.ps1"
+    ) | ForEach-Object { git hash-object $_ }
+    $cacheKey = (($hashes -join "`n") | git hash-object --stdin).Trim()
+    $cacheFile = Join-Path $cacheDir "$cacheKey.md"
+    if (Test-Path $cacheFile) {
+        Copy-Item -Path $cacheFile -Destination $outputFile -Force
+        Write-Host "Using cached cargo licenses from $cacheFile"
+        return
+    }
+}
 
 New-Item -Path "$outputFile" -ItemType File -Value "" -Force
 
@@ -35,7 +56,7 @@ if ($needsInstall) {
 Write-Host "Generating cargo licenses"
 
 $failFlag = $env:ALLOW_MISSING_LICENSES ? "--fail" : ""
-$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/zed-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
+$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/zorca-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
 cargo @args
 
 Write-Host "Applying replacements"
@@ -52,5 +73,10 @@ foreach ($find in $replacements.keys) {
     $content = $content -replace $find, $replacements[$find]
 }
 $content | Set-Content $outputFile
+
+if ($cacheFile) {
+    New-Item -Path (Split-Path $cacheFile) -ItemType Directory -Force | Out-Null
+    Copy-Item -Path $outputFile -Destination $cacheFile -Force
+}
 
 Write-Host "generate-licenses completed. See $outputFile"

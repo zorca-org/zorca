@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gpui::Transformation;
-use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, svg};
+use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, img, svg};
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
@@ -13,14 +13,27 @@ use crate::traits::transformable::Transformable;
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum VectorName {
-    BusinessStamp,
-    VipStamp,
     Grid,
-    ProTrialStamp,
-    ProUserStamp,
-    StudentStamp,
-    ZedLogo,
-    ZedXCopilot,
+}
+
+#[derive(IntoElement)]
+pub struct ZorcaLogo {
+    size: Rems,
+}
+
+impl ZorcaLogo {
+    pub fn square(size: Rems) -> Self {
+        Self { size }
+    }
+}
+
+impl RenderOnce for ZorcaLogo {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        img("images/zorca_logo.png")
+            .flex_none()
+            .w(self.size)
+            .h(self.size)
+    }
 }
 
 impl VectorName {
@@ -120,20 +133,13 @@ impl Component for Vector {
                 example_group_with_title(
                     "Basic Usage",
                     vec![
-                        single_example(
-                            "Default",
-                            Vector::square(VectorName::ZedLogo, size).into_any_element(),
-                        ),
+                        single_example("Default", ZorcaLogo::square(size).into_any_element()),
                         single_example(
                             "Custom Size",
                             h_flex()
                                 .h(rems_from_px(120.))
                                 .justify_center()
-                                .child(Vector::new(
-                                    VectorName::ZedLogo,
-                                    rems_from_px(120.),
-                                    rems_from_px(200.),
-                                ))
+                                .child(ZorcaLogo::square(rems_from_px(120.)))
                                 .into_any_element(),
                         ),
                     ],
@@ -143,25 +149,17 @@ impl Component for Vector {
                     vec![
                         single_example(
                             "Accent Color",
-                            Vector::square(VectorName::ZedLogo, size)
+                            Vector::square(VectorName::Grid, size)
                                 .color(Color::Accent)
                                 .into_any_element(),
                         ),
                         single_example(
                             "Error Color",
-                            Vector::square(VectorName::ZedLogo, size)
+                            Vector::square(VectorName::Grid, size)
                                 .color(Color::Error)
                                 .into_any_element(),
                         ),
                     ],
-                ),
-                example_group_with_title(
-                    "Different Vectors",
-                    vec![single_example(
-                        "Zed X Copilot",
-                        Vector::square(VectorName::ZedXCopilot, rems_from_px(100.))
-                            .into_any_element(),
-                    )],
                 ),
             ])
             .into_any_element()
@@ -174,6 +172,6 @@ mod tests {
 
     #[test]
     fn vector_path() {
-        assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
+        assert_eq!(VectorName::Grid.path().as_ref(), "images/grid.svg");
     }
 }

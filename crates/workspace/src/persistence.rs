@@ -328,6 +328,10 @@ pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
 ) -> Vec<model::SerializedMultiWorkspace> {
+    let identity_hints = WorkspaceDb::global(cx)
+        .project_group_identity_hints()
+        .log_err()
+        .unwrap_or_default();
     let mut window_groups: Vec<Vec<model::SessionWorkspace>> = Vec::new();
     let mut window_id_to_group: HashMap<WindowId, usize> = HashMap::default();
 
@@ -350,9 +354,10 @@ pub fn read_serialized_multi_workspaces(
         .into_iter()
         .filter_map(|group| {
             let window_id = group.first().and_then(|sw| sw.window_id);
-            let state = window_id
+            let mut state = window_id
                 .map(|wid| read_multi_workspace_state(wid, cx))
                 .unwrap_or_default();
+            normalize_project_groups(&mut state.project_groups, &identity_hints);
             let active_workspace = state
                 .active_workspace_id
                 .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
@@ -371,6 +376,50 @@ pub fn read_serialized_multi_workspaces(
             })
         })
         .collect()
+}
+
+fn normalize_project_groups(
+    groups: &mut Vec<model::SerializedProjectGroup>,
+    identity_hints: &[(ProjectGroupKey, PathList)],
+) {
+    let mut normalized: Vec<(model::SerializedProjectGroup, bool)> =
+        Vec::with_capacity(groups.len());
+    for group in std::mem::take(groups) {
+        let mut restored = group.into_restored_state();
+        let canonical = if let Some((_, identity_paths)) = identity_hints
+            .iter()
+            .find(|(paths_key, _)| paths_key.matches(&restored.key))
+        {
+            let canonical = restored.key.path_list() == identity_paths;
+            restored.key = ProjectGroupKey::new(restored.key.host(), identity_paths.clone());
+            canonical
+        } else {
+            identity_hints
+                .iter()
+                .any(|(_, identity_paths)| restored.key.path_list() == identity_paths)
+        };
+        let insert_index = normalized.iter().position(|(group, _)| {
+            let existing: ProjectGroupKey = group.clone().into();
+            existing.matches(&restored.key)
+        });
+        if let Some(index) = insert_index {
+            if canonical && !normalized[index].1 {
+                normalized.remove(index);
+            } else {
+                continue;
+            }
+        }
+        let group = (
+            model::SerializedProjectGroup::from_group(&restored.key, restored.expanded),
+            canonical,
+        );
+        if let Some(index) = insert_index {
+            normalized.insert(index, group);
+        } else {
+            normalized.push(group);
+        }
+    }
+    *groups = normalized.into_iter().map(|(group, _)| group).collect();
 }
 
 const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
@@ -1704,6 +1753,10 @@ impl WorkspaceDb {
                 host = Some(format!("mock-{}", id));
                 user = Some(format!("mock-user-{}", id));
             }
+            // Dev-dependency feature unification can expose `remote`'s test-only
+            // identity variant while compiling workspace's normal library target.
+            #[allow(unreachable_patterns)]
+            _ => bail!("unsupported test-only remote connection identity"),
         }
 
         if let RemoteConnectionOptions::Docker(options) = options {
@@ -1850,12 +1903,27 @@ impl WorkspaceDb {
         }
     }
 
+    fn project_group_identity_hints(&self) -> Result<Vec<(ProjectGroupKey, PathList)>> {
+        let remote_connections = self.remote_connections()?;
+        Ok(self
+            .recent_workspaces()?
+            .into_iter()
+            .filter_map(|(_, paths, identity_paths, remote_connection_id, _, _)| {
+                let remote_connection_id = remote_connection_id?;
+                let identity_paths = identity_paths?;
+                let host = remote_connections.get(&remote_connection_id)?.clone();
+                Some((ProjectGroupKey::new(Some(host), paths), identity_paths))
+            })
+            .collect())
+    }
+
     fn session_workspaces(
         &self,
         session_id: String,
     ) -> Result<
         Vec<(
             WorkspaceId,
+            PathList,
             PathList,
             Option<u64>,
             Option<RemoteConnectionId>,
@@ -1865,10 +1933,28 @@ impl WorkspaceDb {
             .session_workspaces_query(session_id)?
             .into_iter()
             .map(
-                |(workspace_id, paths, order, window_id, remote_connection_id)| {
+                |(
+                    workspace_id,
+                    paths,
+                    order,
+                    identity_paths,
+                    identity_paths_order,
+                    window_id,
+                    remote_connection_id,
+                )| {
+                    let paths = PathList::deserialize(&SerializedPathList { paths, order });
+                    let identity_paths = identity_paths
+                        .map(|paths| {
+                            PathList::deserialize(&SerializedPathList {
+                                paths,
+                                order: identity_paths_order.unwrap_or_default(),
+                            })
+                        })
+                        .unwrap_or_else(|| paths.clone());
                     (
                         WorkspaceId(workspace_id),
-                        PathList::deserialize(&SerializedPathList { paths, order }),
+                        paths,
+                        identity_paths,
                         window_id,
                         remote_connection_id.map(RemoteConnectionId),
                     )
@@ -1878,8 +1964,8 @@ impl WorkspaceDb {
     }
 
     query! {
-        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<u64>, Option<u64>)>> {
-            SELECT workspace_id, paths, paths_order, window_id, remote_connection_id
+        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<String>, Option<String>, Option<u64>, Option<u64>)>> {
+            SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, window_id, remote_connection_id
             FROM workspaces
             WHERE session_id = ?1
             ORDER BY timestamp DESC
@@ -2185,7 +2271,7 @@ impl WorkspaceDb {
     ) -> Result<Vec<SessionWorkspace>> {
         let mut workspaces = Vec::new();
 
-        for (workspace_id, paths, window_id, remote_connection_id) in
+        for (workspace_id, paths, identity_paths, window_id, remote_connection_id) in
             self.session_workspaces(last_session_id.to_owned())?
         {
             let window_id = window_id.map(WindowId::from);
@@ -2197,6 +2283,7 @@ impl WorkspaceDb {
                         self.remote_connection(remote_connection_id)?,
                     ),
                     paths,
+                    identity_paths,
                     window_id,
                 });
                 continue;
@@ -2207,6 +2294,7 @@ impl WorkspaceDb {
                     workspace_id,
                     location: SerializedWorkspaceLocation::Local,
                     paths,
+                    identity_paths,
                     window_id,
                 });
             }
@@ -2766,13 +2854,14 @@ mod tests {
     use super::*;
     use crate::OpenMode;
     use crate::PathList;
+    use crate::ProjectGroup;
     use crate::ProjectGroupKey;
     use crate::{
         multi_workspace::MultiWorkspace,
         persistence::{
             model::{
-                SerializedItem, SerializedPane, SerializedPaneGroup, SerializedWorkspace,
-                SessionWorkspace,
+                MultiWorkspaceState, SerializedItem, SerializedPane, SerializedPaneGroup,
+                SerializedProjectGroup, SerializedWorkspace, SessionWorkspace,
             },
             read_multi_workspace_state,
         },
@@ -2784,7 +2873,11 @@ mod tests {
     use project::Project;
     use remote::SshConnectionOptions;
     use serde_json::json;
-    use std::{thread, time::Duration};
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        thread,
+        time::Duration,
+    };
 
     /// Creates a unique directory in a FakeFs, returning the path.
     /// Uses a UUID suffix to avoid collisions with other tests sharing the global DB.
@@ -3498,7 +3591,7 @@ mod tests {
         let workspace_2 = SerializedWorkspace {
             id: WorkspaceId(2),
             paths: PathList::new(&["/tmp2"]),
-            identity_paths: None,
+            identity_paths: Some(PathList::new(&["/parent-repo"])),
             location: SerializedWorkspaceLocation::Local,
             center_group: Default::default(),
             window_bounds: Default::default(),
@@ -3604,20 +3697,24 @@ mod tests {
         assert_eq!(locations.len(), 2);
         assert_eq!(locations[0].0, WorkspaceId(2));
         assert_eq!(locations[0].1, PathList::new(&["/tmp2"]));
-        assert_eq!(locations[0].2, Some(20));
+        assert_eq!(locations[0].2, PathList::new(&["/parent-repo"]));
+        assert_eq!(locations[0].3, Some(20));
         assert_eq!(locations[1].0, WorkspaceId(1));
         assert_eq!(locations[1].1, PathList::new(&["/tmp1"]));
-        assert_eq!(locations[1].2, Some(10));
+        assert_eq!(locations[1].2, PathList::new(&["/tmp1"]));
+        assert_eq!(locations[1].3, Some(10));
 
         let locations = db.session_workspaces("session-id-2".to_owned()).unwrap();
         assert_eq!(locations.len(), 2);
         assert_eq!(locations[0].0, WorkspaceId(5));
         assert_eq!(locations[0].1, PathList::default());
-        assert_eq!(locations[0].2, Some(50));
-        assert_eq!(locations[0].3, Some(connection_id));
+        assert_eq!(locations[0].2, PathList::default());
+        assert_eq!(locations[0].3, Some(50));
+        assert_eq!(locations[0].4, Some(connection_id));
         assert_eq!(locations[1].0, WorkspaceId(3));
         assert_eq!(locations[1].1, PathList::new(&["/tmp3"]));
-        assert_eq!(locations[1].2, Some(30));
+        assert_eq!(locations[1].2, PathList::new(&["/tmp3"]));
+        assert_eq!(locations[1].3, Some(30));
 
         let locations = db.session_workspaces("session-id-3".to_owned()).unwrap();
         assert_eq!(locations.len(), 1);
@@ -3626,7 +3723,11 @@ mod tests {
             locations[0].1,
             PathList::new(&["/tmp6c", "/tmp6b", "/tmp6a"]),
         );
-        assert_eq!(locations[0].2, Some(60));
+        assert_eq!(
+            locations[0].2,
+            PathList::new(&["/tmp6c", "/tmp6b", "/tmp6a"]),
+        );
+        assert_eq!(locations[0].3, Some(60));
     }
 
     fn default_workspace<P: AsRef<Path>>(
@@ -3718,36 +3819,42 @@ mod tests {
                     workspace_id: WorkspaceId(4),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir4.path()]),
+                    identity_paths: PathList::new(&[dir4.path()]),
                     window_id: Some(WindowId::from(2u64)),
                 },
                 SessionWorkspace {
                     workspace_id: WorkspaceId(3),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir3.path()]),
+                    identity_paths: PathList::new(&[dir3.path()]),
                     window_id: Some(WindowId::from(8u64)),
                 },
                 SessionWorkspace {
                     workspace_id: WorkspaceId(2),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir2.path()]),
+                    identity_paths: PathList::new(&[dir2.path()]),
                     window_id: Some(WindowId::from(5u64)),
                 },
                 SessionWorkspace {
                     workspace_id: WorkspaceId(1),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir1.path()]),
+                    identity_paths: PathList::new(&[dir1.path()]),
                     window_id: Some(WindowId::from(9u64)),
                 },
                 SessionWorkspace {
                     workspace_id: WorkspaceId(5),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir1.path(), dir2.path(), dir3.path()]),
+                    identity_paths: PathList::new(&[dir1.path(), dir2.path(), dir3.path()]),
                     window_id: Some(WindowId::from(3u64)),
                 },
                 SessionWorkspace {
                     workspace_id: WorkspaceId(6),
                     location: SerializedWorkspaceLocation::Local,
                     paths: PathList::new(&[dir4.path(), dir3.path(), dir2.path()]),
+                    identity_paths: PathList::new(&[dir4.path(), dir3.path(), dir2.path()]),
                     window_id: Some(WindowId::from(4u64)),
                 },
             ]
@@ -4097,6 +4204,7 @@ mod tests {
                 workspace_id: WorkspaceId(4),
                 location: SerializedWorkspaceLocation::Remote(remote_connections[3].clone()),
                 paths: PathList::default(),
+                identity_paths: PathList::default(),
                 window_id: Some(WindowId::from(2u64)),
             }
         );
@@ -4106,6 +4214,7 @@ mod tests {
                 workspace_id: WorkspaceId(3),
                 location: SerializedWorkspaceLocation::Remote(remote_connections[2].clone()),
                 paths: PathList::default(),
+                identity_paths: PathList::default(),
                 window_id: Some(WindowId::from(8u64)),
             }
         );
@@ -4115,6 +4224,7 @@ mod tests {
                 workspace_id: WorkspaceId(2),
                 location: SerializedWorkspaceLocation::Remote(remote_connections[1].clone()),
                 paths: PathList::default(),
+                identity_paths: PathList::default(),
                 window_id: Some(WindowId::from(5u64)),
             }
         );
@@ -4124,6 +4234,7 @@ mod tests {
                 workspace_id: WorkspaceId(1),
                 location: SerializedWorkspaceLocation::Remote(remote_connections[0].clone()),
                 paths: PathList::default(),
+                identity_paths: PathList::default(),
                 window_id: Some(WindowId::from(9u64)),
             }
         );
@@ -4612,24 +4723,28 @@ mod tests {
                 workspace_id: WorkspaceId(1),
                 location: SerializedWorkspaceLocation::Local,
                 paths: PathList::new(&["/a"]),
+                identity_paths: PathList::new(&["/a"]),
                 window_id: Some(window_10),
             },
             SessionWorkspace {
                 workspace_id: WorkspaceId(2),
                 location: SerializedWorkspaceLocation::Local,
                 paths: PathList::new(&["/b"]),
+                identity_paths: PathList::new(&["/b"]),
                 window_id: Some(window_10),
             },
             SessionWorkspace {
                 workspace_id: WorkspaceId(3),
                 location: SerializedWorkspaceLocation::Local,
                 paths: PathList::new(&["/c"]),
+                identity_paths: PathList::new(&["/c"]),
                 window_id: Some(window_20),
             },
             SessionWorkspace {
                 workspace_id: WorkspaceId(4),
                 location: SerializedWorkspaceLocation::Local,
                 paths: PathList::new(&["/d"]),
+                identity_paths: PathList::new(&["/d"]),
                 window_id: None,
             },
         ];
@@ -4656,6 +4771,423 @@ mod tests {
         assert_eq!(group_none.active_workspace.workspace_id, WorkspaceId(4));
         assert_eq!(group_none.state.active_workspace_id, None);
         assert_eq!(group_none.state.sidebar_open, false);
+    }
+
+    #[gpui::test]
+    async fn test_read_serialized_multi_workspaces_migrates_stale_remote_groups_from_workspace_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let window_id = WindowId::from(411u64);
+        let persisted_host = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.com".into(),
+            username: Some("user".to_string()),
+            nickname: Some("persisted nickname".to_string()),
+            ..Default::default()
+        });
+        let runtime_host = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.com".into(),
+            username: Some("user".to_string()),
+            password: Some("runtime password".to_string()),
+            nickname: Some("runtime nickname".to_string()),
+            ..Default::default()
+        });
+        let linked_path = PathBuf::from("/repo/.worktrees/feature");
+        let main_path = PathBuf::from("/repo");
+        let unrelated_path = PathBuf::from("/farmbase");
+        let linked_id = db.next_id().await.unwrap();
+        let active_id = db.next_id().await.unwrap();
+
+        db.save_workspace(SerializedWorkspace {
+            id: linked_id,
+            location: SerializedWorkspaceLocation::Remote(persisted_host.clone()),
+            paths: PathList::new(std::slice::from_ref(&linked_path)),
+            identity_paths: Some(PathList::new(std::slice::from_ref(&main_path))),
+            center_group: Default::default(),
+            window_bounds: None,
+            centered_layout: false,
+            display: None,
+            docks: Default::default(),
+            session_id: Some("older-session".to_string()),
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            user_toolchains: Default::default(),
+            window_id: Some(window_id.as_u64()),
+        })
+        .await;
+        db.save_workspace(SerializedWorkspace {
+            id: active_id,
+            location: SerializedWorkspaceLocation::Remote(persisted_host.clone()),
+            paths: PathList::new(std::slice::from_ref(&unrelated_path)),
+            identity_paths: Some(PathList::new(std::slice::from_ref(&unrelated_path))),
+            center_group: Default::default(),
+            window_bounds: None,
+            centered_layout: false,
+            display: None,
+            docks: Default::default(),
+            session_id: Some("current-session".to_string()),
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            user_toolchains: Default::default(),
+            window_id: Some(window_id.as_u64()),
+        })
+        .await;
+
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        write_multi_workspace_state(
+            &kvp,
+            window_id,
+            MultiWorkspaceState {
+                active_workspace_id: Some(active_id),
+                project_groups: vec![
+                    SerializedProjectGroup::from_group(
+                        &ProjectGroupKey::new(
+                            Some(runtime_host.clone()),
+                            PathList::new(std::slice::from_ref(&linked_path)),
+                        ),
+                        true,
+                    ),
+                    SerializedProjectGroup::from_group(
+                        &ProjectGroupKey::new(
+                            Some(runtime_host.clone()),
+                            PathList::new(std::slice::from_ref(&unrelated_path)),
+                        ),
+                        true,
+                    ),
+                    SerializedProjectGroup::from_group(
+                        &ProjectGroupKey::new(
+                            Some(runtime_host.clone()),
+                            PathList::new(std::slice::from_ref(&main_path)),
+                        ),
+                        false,
+                    ),
+                ],
+                sidebar_open: true,
+                sidebar_state: None,
+            },
+        )
+        .await;
+
+        let restored = cx.update(|cx| {
+            read_serialized_multi_workspaces(
+                vec![SessionWorkspace {
+                    workspace_id: active_id,
+                    location: SerializedWorkspaceLocation::Remote(runtime_host.clone()),
+                    paths: PathList::new(std::slice::from_ref(&unrelated_path)),
+                    identity_paths: PathList::new(std::slice::from_ref(&unrelated_path)),
+                    window_id: Some(window_id),
+                }],
+                cx,
+            )
+        });
+        let keys = restored[0]
+            .state
+            .project_groups
+            .iter()
+            .cloned()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>();
+        let main_key = ProjectGroupKey::new(
+            Some(runtime_host.clone()),
+            PathList::new(std::slice::from_ref(&main_path)),
+        );
+        let unrelated_key = ProjectGroupKey::new(
+            Some(runtime_host),
+            PathList::new(std::slice::from_ref(&unrelated_path)),
+        );
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys[0].matches(&main_key));
+        assert!(keys[1].matches(&unrelated_key));
+        assert!(!restored[0].state.project_groups[0].expanded);
+        assert!(
+            !keys
+                .iter()
+                .any(|key| key.path_list().paths() == [linked_path.clone()])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_read_serialized_multi_workspaces_ignores_stale_local_identity_hints(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let window_id = WindowId::from(412u64);
+        let checkout_path = PathBuf::from("/local-checkout");
+        let stale_main_path = PathBuf::from("/stale-main");
+        let workspace_id = db.next_id().await.unwrap();
+
+        db.save_workspace(SerializedWorkspace {
+            id: workspace_id,
+            location: SerializedWorkspaceLocation::Local,
+            paths: PathList::new(std::slice::from_ref(&checkout_path)),
+            identity_paths: Some(PathList::new(std::slice::from_ref(&stale_main_path))),
+            center_group: Default::default(),
+            window_bounds: None,
+            centered_layout: false,
+            display: None,
+            docks: Default::default(),
+            session_id: Some("stale-local-session".to_string()),
+            bookmarks: Default::default(),
+            breakpoints: Default::default(),
+            user_toolchains: Default::default(),
+            window_id: Some(window_id.as_u64()),
+        })
+        .await;
+
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        write_multi_workspace_state(
+            &kvp,
+            window_id,
+            MultiWorkspaceState {
+                active_workspace_id: Some(workspace_id),
+                project_groups: vec![SerializedProjectGroup::from_group(
+                    &ProjectGroupKey::new(
+                        None,
+                        PathList::new(std::slice::from_ref(&checkout_path)),
+                    ),
+                    true,
+                )],
+                sidebar_open: true,
+                sidebar_state: None,
+            },
+        )
+        .await;
+
+        let restored = cx.update(|cx| {
+            read_serialized_multi_workspaces(
+                vec![SessionWorkspace {
+                    workspace_id,
+                    location: SerializedWorkspaceLocation::Local,
+                    paths: PathList::new(std::slice::from_ref(&checkout_path)),
+                    identity_paths: PathList::new(std::slice::from_ref(&checkout_path)),
+                    window_id: Some(window_id),
+                }],
+                cx,
+            )
+        });
+        let restored_key: ProjectGroupKey = restored[0].state.project_groups[0].clone().into();
+
+        assert_eq!(restored_key.path_list().paths(), [checkout_path]);
+    }
+
+    #[test]
+    fn test_normalize_project_groups_uses_full_paths_and_preserves_legacy_rows() {
+        let repo_a_checkout = PathBuf::from("/repos/a/worktrees/feature");
+        let repo_b_checkout = PathBuf::from("/repos/b/worktrees/feature");
+        let legacy_checkout = PathBuf::from("/repos/legacy/worktrees/feature");
+        let repo_a = PathBuf::from("/repos/a");
+        let repo_b = PathBuf::from("/repos/b");
+        let mut groups = vec![
+            SerializedProjectGroup::from_group(
+                &ProjectGroupKey::new(None, PathList::new(std::slice::from_ref(&repo_a_checkout))),
+                true,
+            ),
+            SerializedProjectGroup::from_group(
+                &ProjectGroupKey::new(None, PathList::new(std::slice::from_ref(&repo_b_checkout))),
+                true,
+            ),
+            SerializedProjectGroup::from_group(
+                &ProjectGroupKey::new(None, PathList::new(std::slice::from_ref(&legacy_checkout))),
+                false,
+            ),
+        ];
+
+        normalize_project_groups(
+            &mut groups,
+            &[
+                (
+                    ProjectGroupKey::new(
+                        None,
+                        PathList::new(std::slice::from_ref(&repo_a_checkout)),
+                    ),
+                    PathList::new(std::slice::from_ref(&repo_a)),
+                ),
+                (
+                    ProjectGroupKey::new(
+                        None,
+                        PathList::new(std::slice::from_ref(&repo_b_checkout)),
+                    ),
+                    PathList::new(std::slice::from_ref(&repo_b)),
+                ),
+            ],
+        );
+
+        let keys = groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.path_list().paths().to_vec())
+                .collect::<Vec<_>>(),
+            vec![vec![repo_a], vec![repo_b], vec![legacy_checkout]]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_apply_restored_state_persists_normalized_groups_when_sidebar_is_closed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                ".git": {
+                    "worktrees": {
+                        "feature": { "commondir": "../../" }
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            "/worktree",
+            json!({ ".git": "gitdir: /repo/.git/worktrees/feature" }),
+        )
+        .await;
+        fs.insert_tree("/other", json!({})).await;
+        let project = Project::test(fs.clone(), ["/worktree".as_ref()], cx).await;
+        cx.run_until_parked();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let (window_handle, window_id) = multi_workspace.update_in(cx, |_, window, _cx| {
+            let handle = window.window_handle().downcast::<MultiWorkspace>().unwrap();
+            (handle, window.window_handle().window_id())
+        });
+        let main_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/repo")]));
+        let linked_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/worktree")]));
+        let other_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/other")]));
+        let state = MultiWorkspaceState {
+            active_workspace_id: None,
+            project_groups: vec![
+                SerializedProjectGroup::from_group(&linked_key, true),
+                SerializedProjectGroup::from_group(&other_key, true),
+                SerializedProjectGroup::from_group(&main_key, false),
+            ],
+            sidebar_open: false,
+            sidebar_state: None,
+        };
+        let restored_main_key = main_key.clone();
+
+        cx.update(|_, cx| {
+            cx.spawn(async move |mut cx| {
+                crate::apply_restored_multiworkspace_state(
+                    window_handle,
+                    &state,
+                    restored_main_key,
+                    fs,
+                    &mut cx,
+                )
+                .await;
+            })
+        })
+        .await;
+        cx.run_until_parked();
+
+        let persisted = cx.update(|_, cx| read_multi_workspace_state(window_id, cx));
+        assert!(!persisted.sidebar_open);
+        assert_eq!(persisted.project_groups.len(), 2);
+        let persisted_keys = persisted
+            .project_groups
+            .iter()
+            .cloned()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_keys, vec![main_key, other_key]);
+        assert!(!persisted.project_groups[0].expanded);
+    }
+
+    #[gpui::test(seed = 0)]
+    async fn test_apply_restored_state_normalizes_before_exposing_persisted_groups(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repo",
+            json!({
+                ".git": {
+                    "worktrees": {
+                        "feature": { "commondir": "../../" }
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            "/worktree",
+            json!({ ".git": "gitdir: /repo/.git/worktrees/feature" }),
+        )
+        .await;
+        fs.insert_tree("/active", json!({})).await;
+        let project = Project::test(fs.clone(), ["/active".as_ref()], cx).await;
+        cx.run_until_parked();
+        let metadata_calls_before_restore = fs.metadata_call_count();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let window_handle = multi_workspace.update_in(cx, |_, window, _cx| {
+            window.window_handle().downcast::<MultiWorkspace>().unwrap()
+        });
+        let active_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/active")]));
+        let linked_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/worktree")]));
+        let main_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/repo")]));
+        let state = MultiWorkspaceState {
+            active_workspace_id: None,
+            project_groups: vec![SerializedProjectGroup::from_group(&linked_key, true)],
+            sidebar_open: false,
+            sidebar_state: None,
+        };
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = finished.clone();
+        let fs_for_restore = fs.clone();
+        let restored_main_key = main_key.clone();
+
+        let task = cx.update(|_, cx| {
+            cx.spawn(async move |mut cx| {
+                crate::apply_restored_multiworkspace_state(
+                    window_handle,
+                    &state,
+                    restored_main_key,
+                    fs_for_restore,
+                    &mut cx,
+                )
+                .await;
+                task_finished.store(true, Ordering::SeqCst);
+            })
+        });
+
+        let mut observed_pending_discovery = false;
+        for _ in 0..100 {
+            cx.executor().tick();
+            if fs.metadata_call_count() > metadata_calls_before_restore
+                && !finished.load(Ordering::SeqCst)
+            {
+                observed_pending_discovery = true;
+                break;
+            }
+        }
+        assert!(observed_pending_discovery);
+        let visible_key = multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).project_group_key(cx)
+        });
+        assert_eq!(visible_key, active_key);
+
+        task.await;
+        cx.run_until_parked();
+        let restored_key = multi_workspace.read_with(cx, |multi_workspace, cx| {
+            multi_workspace.workspace().read(cx).project_group_key(cx)
+        });
+        assert_eq!(restored_key, active_key);
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| {
+                multi_workspace.project_group_keys()
+            }),
+            vec![main_key, active_key]
+        );
     }
 
     #[gpui::test]
@@ -5870,6 +6402,79 @@ mod tests {
         assert!(
             active_paths.is_empty(),
             "After removing the only remaining group, should have an empty workspace"
+        );
+    }
+
+    /// Regression test: closing a project group that has no live workspace
+    /// must persist. Such a removal activates nothing, so it has no
+    /// activation-triggered serialize to piggyback on — without an explicit
+    /// `serialize` the group was restored again on the next launch.
+    #[gpui::test]
+    async fn test_remove_empty_project_group_is_persisted(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let dir_a = unique_test_dir(&fs, "live-group").await;
+        let project_a = Project::test(fs.clone(), [dir_a.as_path()], cx).await;
+
+        let (multi_workspace, cx) = cx
+            .add_window_view(|window, cx| MultiWorkspace::test_new(project_a.clone(), window, cx));
+
+        // Opening the sidebar retains the active workspace, creating group A.
+        multi_workspace.update(cx, |mw, cx| mw.open_sidebar(cx));
+        multi_workspace.update_in(cx, |mw, _window, cx| {
+            mw.set_random_database_id(cx);
+        });
+
+        let window_id =
+            multi_workspace.update_in(cx, |_, window, _cx| window.window_handle().window_id());
+
+        // A second group with no live workspace — what the sidebar renders as
+        // "No workspaces yet".
+        let empty_key = ProjectGroupKey::new(None, PathList::new(&["/empty-group"]));
+        multi_workspace.update(cx, |mw, cx| {
+            mw.test_add_project_group(ProjectGroup {
+                key: empty_key.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            });
+            mw.serialize(cx);
+        });
+        cx.run_until_parked();
+
+        let key_a = project_a.read_with(cx, |project, cx| project.project_group_key(cx));
+
+        let keys_before: Vec<ProjectGroupKey> = cx
+            .update(|_, cx| read_multi_workspace_state(window_id, cx))
+            .project_groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect();
+        assert!(
+            keys_before.contains(&empty_key) && keys_before.contains(&key_a),
+            "Both groups should be persisted before the removal, got {keys_before:?}"
+        );
+
+        // --- Remove the group that has no live workspace. ---
+        multi_workspace.update_in(cx, |mw, window, cx| {
+            mw.remove_project_group(&empty_key, window, cx)
+                .detach_and_log_err(cx);
+        });
+        cx.run_until_parked();
+
+        let keys_after: Vec<ProjectGroupKey> = cx
+            .update(|_, cx| read_multi_workspace_state(window_id, cx))
+            .project_groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect();
+        assert!(
+            !keys_after.contains(&empty_key),
+            "Removing a group with no live workspace should be persisted, got {keys_after:?}"
+        );
+        assert!(
+            keys_after.contains(&key_a),
+            "The group with a live workspace should still be persisted, got {keys_after:?}"
         );
     }
 

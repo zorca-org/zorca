@@ -22,7 +22,20 @@ use util::{
     command::new_std_command, get_default_system_shell, get_system_shell, maybe, rel_path::RelPath,
 };
 
-use crate::{Project, ProjectPath};
+use crate::{Project, ProjectPath, environment::ZED_ENVIRONMENT_ORIGIN_MARKER};
+
+fn apply_terminal_environment_settings(
+    env: &mut HashMap<String, String>,
+    settings_env: HashMap<String, String>,
+) {
+    if env
+        .get(ZED_ENVIRONMENT_ORIGIN_MARKER)
+        .is_some_and(|origin| origin == "cli")
+    {
+        env.remove("NO_COLOR");
+    }
+    env.extend(settings_env);
+}
 
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
@@ -66,7 +79,30 @@ impl Project {
         spawn_task: SpawnInTerminal,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
-        let is_via_remote = self.remote_client.is_some();
+        self.create_terminal_task_internal(spawn_task, false, cx)
+    }
+
+    /// Creates a local task terminal even if the project is remote.
+    /// In remote projects: runs the task's argv on this machine (bypasses SSH).
+    /// In local projects: identical to a regular task terminal.
+    pub fn create_local_terminal_task(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        self.create_terminal_task_internal(spawn_task, true, cx)
+    }
+
+    /// Internal method for creating task terminals.
+    /// If force_local is true, creates a local terminal even if the project has a remote client.
+    /// This allows running a task's argv on this machine in remote projects.
+    fn create_terminal_task_internal(
+        &mut self,
+        spawn_task: SpawnInTerminal,
+        force_local: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Terminal>>> {
+        let is_via_remote = !force_local && self.remote_client.is_some();
 
         let path: Option<Arc<Path>> = if let Some(cwd) = &spawn_task.cwd {
             if is_via_remote {
@@ -76,6 +112,15 @@ impl Project {
                 let tilde_substituted = shellexpand::tilde(&cwd);
                 Some(Arc::from(Path::new(tilde_substituted.as_ref())))
             }
+        } else if force_local && self.remote_client.is_some() {
+            // A forced-local spawn in a remote project has nowhere to fall back
+            // to: the project's directories are paths on the *remote* host, and
+            // resolving one here would load the shell environment of whatever
+            // local directory happens to share the name — or, more often, fail
+            // and report that it could not open a path the user never named.
+            // A caller that wants a working directory for such a spawn has to
+            // give it one that exists on this machine.
+            None
         } else {
             self.active_project_directory(cx)
         };
@@ -100,7 +145,11 @@ impl Project {
             status: TaskStatus::Running,
             completion_rx,
         });
-        let remote_client = self.remote_client.clone();
+        let remote_client = if force_local {
+            None
+        } else {
+            self.remote_client.clone()
+        };
         let shell = match &remote_client {
             Some(remote_client) => remote_client
                 .read(cx)
@@ -138,7 +187,7 @@ impl Project {
         let lang_registry = self.languages.clone();
         cx.spawn(async move |project, cx| {
             let mut env = env_task.await.unwrap_or_default();
-            env.extend(settings.env);
+            apply_terminal_environment_settings(&mut env, settings.env);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -381,7 +430,7 @@ impl Project {
         cx.spawn(async move |project, cx| {
             let shell_kind = ShellKind::new(&shell, path_style.is_windows());
             let mut env = env_task.await.unwrap_or_default();
-            env.extend(settings.env);
+            apply_terminal_environment_settings(&mut env, settings.env);
 
             let activation_script = maybe!(async {
                 for toolchain in toolchains {
@@ -719,6 +768,23 @@ fn quote_cmd_command_arg_for_outer_shell(arg: &str, shell_kind: ShellKind) -> Op
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn cli_no_color_is_removed_unless_configured_for_the_terminal() {
+        let mut env = HashMap::from_iter([
+            (ZED_ENVIRONMENT_ORIGIN_MARKER.to_string(), "cli".to_string()),
+            ("NO_COLOR".to_string(), "1".to_string()),
+        ]);
+
+        apply_terminal_environment_settings(&mut env, HashMap::default());
+        assert!(!env.contains_key("NO_COLOR"));
+
+        apply_terminal_environment_settings(
+            &mut env,
+            HashMap::from_iter([("NO_COLOR".to_string(), "1".to_string())]),
+        );
+        assert_eq!(env.get("NO_COLOR").map(String::as_str), Some("1"));
+    }
 
     fn prepared_cmd_task(command_arg: &str) -> SpawnInTerminal {
         SpawnInTerminal {

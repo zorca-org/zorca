@@ -112,18 +112,7 @@ pub fn init(cx: &mut App) {
         );
 
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
-            let focused_dock = workspace.focused_dock_position(window, cx);
-            let project = workspace.project().clone();
-            let workspace_handle = workspace.weak_handle();
-            workspace.toggle_modal(window, cx, |window, cx| {
-                worktree_picker::WorktreePicker::new_modal(
-                    project,
-                    workspace_handle,
-                    focused_dock,
-                    window,
-                    cx,
-                )
-            });
+            worktree_picker::toggle(workspace, window, cx);
         });
 
         workspace.register_action(

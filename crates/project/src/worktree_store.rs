@@ -451,6 +451,22 @@ impl WorktreeStore {
             .find(|worktree| worktree.read(cx).id() == id)
     }
 
+    pub(crate) fn update_worktree_abs_path(
+        &mut self,
+        id: WorktreeId,
+        new_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(worktree) = self.worktree_for_id(id, cx) else {
+            return false;
+        };
+        worktree.update(cx, |worktree, cx| {
+            worktree.update_abs_path_after_move(SanitizedPath::new_arc(new_path), cx);
+        });
+        self.send_project_updates(cx);
+        true
+    }
+
     pub fn worktree_for_entry(
         &self,
         entry_id: ProjectEntryId,
@@ -1081,6 +1097,14 @@ impl WorktreeStore {
             if let Some(old_worktree) =
                 old_worktrees_by_id.remove(&WorktreeId::from_proto(worktree.id))
             {
+                if old_worktree.read(cx).abs_path().as_ref() != Path::new(&worktree.abs_path) {
+                    old_worktree.update(cx, |old_worktree, cx| {
+                        old_worktree.update_abs_path_after_move(
+                            SanitizedPath::new_arc(Path::new(&worktree.abs_path)),
+                            cx,
+                        );
+                    });
+                }
                 let push_strong_handle =
                     self.retain_worktrees || old_worktree.read(cx).is_visible();
                 let handle = if push_strong_handle {

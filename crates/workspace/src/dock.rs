@@ -24,6 +24,12 @@ use util::ResultExt as _;
 
 pub(crate) const RESIZE_HANDLE_SIZE: Pixels = px(6.);
 
+/// How small a dock may get before it stops shrinking. A dock narrower than
+/// this shows nothing usable and leaves only a sliver of resize handle to grab,
+/// so dragging one "closed" strands the panel with no way to pull it back out.
+/// Panels that need more room say so via [`Panel::min_size`].
+pub(crate) const MIN_PANEL_SIZE: Pixels = px(100.);
+
 pub enum PanelEvent {
     ZoomIn,
     ZoomOut,
@@ -377,7 +383,7 @@ fn resize_panel_entry(
     window: &mut Window,
     cx: &mut App,
 ) -> (&'static str, PanelSizeState) {
-    let size = size.map(|size| size.max(RESIZE_HANDLE_SIZE).round());
+    let size = size.map(|size| size.max(MIN_PANEL_SIZE).round());
     let uses_flexible_width = panel_uses_flexible_width(position, entry.panel.as_ref(), window, cx);
     if uses_flexible_width {
         entry.size_state.flex = flex;

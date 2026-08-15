@@ -1,0 +1,50 @@
+#!/bin/sh
+set -eu
+
+repository_root="$(git rev-parse --show-toplevel)"
+cd "$repository_root"
+
+if [ ! -f graphify-out/.graphify_python ]; then
+  echo "[graphify hook] graphify-out/.graphify_python is missing; run graphify once manually." >&2
+  exit 1
+fi
+
+graphify_python="$(cat graphify-out/.graphify_python)"
+
+"$graphify_python" - <<'PY'
+from pathlib import Path
+
+from graphify.detect import detect_incremental
+from graphify.watch import _CODE_EXTENSIONS, _rebuild_code
+
+# A full `graphify update .` drops semantic-only nodes in this mixed corpus.
+root = Path.cwd().resolve()
+ast_changes = detect_incremental(root, kind="ast")
+changed_code = [
+    Path(path)
+    for path in ast_changes.get("new_files", {}).get("code", [])
+    if ".codex" not in Path(path).parts
+]
+changed_code.extend(
+    Path(path)
+    for path in ast_changes.get("deleted_files", [])
+    if Path(path).suffix.lower() in _CODE_EXTENSIONS and ".codex" not in Path(path).parts
+)
+
+if changed_code and not _rebuild_code(root, changed_paths=changed_code, block_on_lock=True):
+    raise SystemExit(1)
+
+semantic_changes = detect_incremental(root, kind="semantic")
+pending_semantic = sum(
+    len(semantic_changes.get("new_files", {}).get(category, []))
+    for category in ("document", "paper", "image", "video")
+)
+flag = root / "graphify-out" / "needs_update"
+if pending_semantic:
+    flag.write_text("1", encoding="utf-8")
+    print(f"[graphify hook] {pending_semantic} semantic file(s) need a manual graphify update.")
+else:
+    flag.unlink(missing_ok=True)
+    if not changed_code:
+        print("[graphify hook] graph is current.")
+PY

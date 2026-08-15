@@ -835,6 +835,28 @@ impl Worktree {
         }
     }
 
+    pub fn update_abs_path_after_move(&mut self, new_path: Arc<SanitizedPath>, cx: &Context<Self>) {
+        match self {
+            Worktree::Local(worktree) => worktree.update_abs_path_and_refresh(new_path, cx),
+            Worktree::Remote(worktree) => {
+                let root_name = new_path
+                    .as_path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| RelPath::from_unix_str(name).ok())
+                    .map_or(RelPath::empty_arc(), Into::into);
+                worktree
+                    .snapshot
+                    .update_abs_path(new_path.clone(), root_name.clone());
+                worktree
+                    .background_snapshot
+                    .lock()
+                    .0
+                    .update_abs_path(new_path, root_name);
+            }
+        }
+    }
+
     pub fn root_file(&self, cx: &Context<Self>) -> Option<Arc<File>> {
         let entry = self.root_entry()?;
         Some(File::for_entry(entry.clone(), cx.entity()))
@@ -7018,17 +7040,22 @@ async fn discover_root_repo_metadata(
 }
 
 async fn discover_git_paths(dot_git_abs_path: &Arc<Path>, fs: &dyn Fs) -> (Arc<Path>, Arc<Path>) {
+    let dot_git_abs_path: Arc<Path> = fs
+        .canonicalize(dot_git_abs_path)
+        .await
+        .map(Into::into)
+        .unwrap_or_else(|_| dot_git_abs_path.clone());
     let mut repository_dir_abs_path = dot_git_abs_path.clone();
     let mut common_dir_abs_path = dot_git_abs_path.clone();
 
     if let Some(path) = fs
-        .load(dot_git_abs_path)
+        .load(&dot_git_abs_path)
         .await
         .ok()
         .as_ref()
         .and_then(|contents| parse_gitfile(contents).log_err())
     {
-        let path = resolve_gitfile_path(dot_git_abs_path, path);
+        let path = resolve_gitfile_path(&dot_git_abs_path, path);
         if let Some(path) = fs.canonicalize(&path).await.log_err() {
             repository_dir_abs_path = Path::new(&path).into();
             common_dir_abs_path = repository_dir_abs_path.clone();

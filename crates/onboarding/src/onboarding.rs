@@ -15,8 +15,8 @@ use serde::Deserialize;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
-    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, Vector, VectorName,
-    WithScrollbar as _, prelude::*, rems_from_px,
+    Divider, KeyBinding, ParentElement as _, StatefulInteractiveElement, WithScrollbar as _,
+    ZorcaLogo, prelude::*, rems_from_px,
 };
 
 pub use workspace::welcome::ShowWelcome;
@@ -345,22 +345,21 @@ impl Render for Onboarding {
                                     .gap_4()
                                     .justify_between()
                                     .child(
-                                        h_flex()
-                                            .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
-                                            .child(
-                                                v_flex()
-                                                    .child(
-                                                        Headline::new("Welcome to Zed")
-                                                            .size(HeadlineSize::Small),
+                                        h_flex().gap_4().child(ZorcaLogo::square(rems(2.5))).child(
+                                            v_flex()
+                                                .child(
+                                                    Headline::new("Welcome to ZOrca")
+                                                        .size(HeadlineSize::Small),
+                                                )
+                                                .child(
+                                                    Label::new(
+                                                        "The terminal-first workspace manager",
                                                     )
-                                                    .child(
-                                                        Label::new("The editor for what's next")
-                                                            .color(Color::Muted)
-                                                            .size(LabelSize::Small)
-                                                            .italic(),
-                                                    ),
-                                            ),
+                                                    .color(Color::Muted)
+                                                    .size(LabelSize::Small)
+                                                    .italic(),
+                                                ),
+                                        ),
                                     )
                                     .child({
                                         Button::new("finish_setup", "Finish Setup")

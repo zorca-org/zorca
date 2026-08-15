@@ -78,8 +78,4 @@
       "cmd-alt-c": "project_panel::CopyPath",
     },
   },
-  {
-    "context": "Dock",
-    "bindings": {},
-  },
 ]

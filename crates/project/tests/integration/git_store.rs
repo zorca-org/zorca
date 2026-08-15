@@ -1187,7 +1187,7 @@ mod git_traversal {
 }
 
 mod git_worktrees {
-    use fs::{FakeFs, Fs};
+    use fs::{FakeFs, Fs, RemoveOptions};
     use gpui::TestAppContext;
     use project::worktrees_directory_for_repo;
     use serde_json::json;
@@ -1264,7 +1264,7 @@ mod git_worktrees {
     }
 
     #[gpui::test]
-    async fn test_git_worktrees_list_and_create(cx: &mut TestAppContext) {
+    async fn test_local_git_worktree_lifecycle(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -1291,7 +1291,7 @@ mod git_worktrees {
         assert_eq!(worktrees.len(), 1);
         assert_eq!(worktrees[0].path, PathBuf::from(path!("/root")));
 
-        let worktrees_directory = PathBuf::from(path!("/root"));
+        let worktrees_directory = PathBuf::from(path!("/worktrees"));
         let worktree_1_directory = worktrees_directory.join("feature-branch");
         cx.update(|cx| {
             repository.update(cx, |repository, _| {
@@ -1362,6 +1362,487 @@ mod git_worktrees {
             .expect("should find bugfix-branch worktree");
         assert_eq!(worktree_2.path, worktree_2_directory);
         assert_eq!(worktree_2.sha.as_ref(), "fake-sha");
+
+        let renamed_worktree_directory = worktrees_directory.join("renamed-feature");
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.rename_worktree(
+                    worktree_1_directory.clone(),
+                    renamed_worktree_directory.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        let worktrees = cx
+            .update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            worktrees
+                .iter()
+                .any(|worktree| worktree.path == renamed_worktree_directory)
+        );
+        assert!(
+            worktrees
+                .iter()
+                .all(|worktree| worktree.path != worktree_1_directory)
+        );
+
+        for worktree_path in [renamed_worktree_directory, worktree_2_directory] {
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(worktree_path, false)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+
+        let worktrees = cx
+            .update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].path, PathBuf::from(path!("/root")));
+    }
+
+    #[gpui::test]
+    async fn test_force_remove_prunes_registered_worktree_missing_dot_git(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let worktree_path = PathBuf::from(path!("/worktrees/stale"));
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "stale".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        fs.remove_file(&worktree_path.join(".git"), RemoveOptions::default())
+            .await
+            .unwrap();
+
+        let error = cx
+            .update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(worktree_path.clone(), false)
+                })
+            })
+            .await
+            .unwrap()
+            .expect_err("non-force removal must expose Git's validation failure");
+        assert!(error.to_string().contains("validation failed"));
+        assert!(Fs::is_dir(fs.as_ref(), &worktree_path).await);
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.remove_worktree(worktree_path.clone(), true)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        cx.executor().run_until_parked();
+
+        assert!(!Fs::is_dir(fs.as_ref(), &worktree_path).await);
+        let worktrees = cx
+            .update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktrees.len(), 1);
+        assert!(repository.read_with(cx, |repository, _| repository.linked_worktrees().is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_force_remove_succeeds_when_only_checkout_cleanup_fails(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let worktree_path = PathBuf::from(path!("/worktrees/undeletable"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "undeletable".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        fs.set_remove_dir_error(&worktree_path, "permission denied".to_string());
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.remove_worktree(worktree_path.clone(), true)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        cx.executor().run_until_parked();
+
+        assert!(Fs::is_dir(fs.as_ref(), &worktree_path).await);
+        assert!(
+            cx.update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+                .await
+                .unwrap()
+                .unwrap()
+                .iter()
+                .all(|worktree| worktree.path != worktree_path)
+        );
+        assert!(repository.read_with(cx, |repository, _| repository.linked_worktrees().is_empty()));
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository
+                        .remove_worktree(PathBuf::from(path!("/worktrees/not-registered")), true)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_force_remove_preserves_locked_and_main_worktrees(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let dirty_path = PathBuf::from(path!("/worktrees/dirty"));
+        let locked_path = PathBuf::from(path!("/worktrees/locked"));
+        for (worktree_path, branch_name) in [(&dirty_path, "dirty"), (&locked_path, "locked")] {
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.create_worktree(
+                        git::repository::CreateWorktreeTarget::NewBranch {
+                            branch_name: branch_name.to_string(),
+                            base_sha: Some("abc123".to_string()),
+                        },
+                        worktree_path.clone(),
+                    )
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        fs.with_git_state(Path::new(path!("/root/.git")), false, |state| {
+            state
+                .worktrees_requiring_force_delete
+                .insert(dirty_path.clone());
+            state.locked_worktrees.insert(locked_path.clone());
+        })
+        .unwrap();
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(dirty_path.clone(), false)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), &dirty_path).await);
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.remove_worktree(dirty_path.clone(), true)
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!Fs::is_dir(fs.as_ref(), &dirty_path).await);
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(locked_path.clone(), true)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), &locked_path).await);
+        assert!(Fs::is_file(fs.as_ref(), &locked_path.join(".git")).await);
+
+        let stale_locked_path = PathBuf::from(path!("/worktrees/stale-locked"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "stale-locked".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    stale_locked_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        fs.write(&stale_locked_path.join("sentinel.txt"), b"keep me")
+            .await
+            .unwrap();
+        fs.remove_file(&stale_locked_path.join(".git"), RemoveOptions::default())
+            .await
+            .unwrap();
+        fs.with_git_state(Path::new(path!("/root/.git")), false, |state| {
+            state.locked_worktrees.insert(stale_locked_path.clone());
+        })
+        .unwrap();
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(stale_locked_path.clone(), true)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(
+            fs.load(&stale_locked_path.join("sentinel.txt"))
+                .await
+                .unwrap(),
+            "keep me"
+        );
+        assert!(
+            cx.update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+                .await
+                .unwrap()
+                .unwrap()
+                .iter()
+                .any(|worktree| worktree.path == stale_locked_path)
+        );
+
+        let stale_empty_locked_path = PathBuf::from(path!("/worktrees/stale-empty-locked"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "stale-empty-locked".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    stale_empty_locked_path.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        fs.remove_file(
+            &stale_empty_locked_path.join(".git"),
+            RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+        fs.with_git_state(Path::new(path!("/root/.git")), false, |state| {
+            state
+                .locked_worktrees
+                .insert(stale_empty_locked_path.clone());
+        })
+        .unwrap();
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(stale_empty_locked_path.clone(), true)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), &stale_empty_locked_path).await);
+        assert!(
+            cx.update(|cx| repository.update(cx, |repository, _| repository.worktrees()))
+                .await
+                .unwrap()
+                .unwrap()
+                .iter()
+                .any(|worktree| worktree.path == stale_empty_locked_path)
+        );
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.remove_worktree(PathBuf::from(path!("/root")), true)
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), Path::new(path!("/root"))).await);
+        assert!(Fs::is_dir(fs.as_ref(), Path::new(path!("/root/.git"))).await);
+    }
+
+    #[gpui::test]
+    async fn test_rename_worktree_edge_cases_preserve_source(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                ".git": {},
+                "file.txt": "content",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+        let source = PathBuf::from(path!("/worktrees/- source with spaces"));
+        let destination = PathBuf::from(path!("/worktrees/- destination with spaces"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "rename-edge".to_string(),
+                        base_sha: Some("abc123".to_string()),
+                    },
+                    source.clone(),
+                )
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        fs.create_dir(&destination).await.unwrap();
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.rename_worktree(source.clone(), destination.clone())
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), &source).await);
+        fs.remove_dir(&destination, RemoveOptions::default())
+            .await
+            .unwrap();
+
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.rename_worktree(source.clone(), destination.clone())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!Fs::is_dir(fs.as_ref(), &source).await);
+        assert!(Fs::is_dir(fs.as_ref(), &destination).await);
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.rename_worktree(destination.clone(), source.clone())
+            })
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        fs.remove_dir(
+            Path::new(path!("/root/.git/worktrees/rename-edge")),
+            RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.rename_worktree(source.clone(), destination.clone())
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(Fs::is_dir(fs.as_ref(), &source).await);
+        assert!(!Fs::is_dir(fs.as_ref(), &destination).await);
+
+        assert!(
+            cx.update(|cx| {
+                repository.update(cx, |repository, _| {
+                    repository.rename_worktree(
+                        PathBuf::from(path!("/worktrees/missing")),
+                        destination.clone(),
+                    )
+                })
+            })
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert!(!Fs::is_dir(fs.as_ref(), &destination).await);
     }
 
     #[gpui::test]
@@ -1639,7 +2120,7 @@ mod resolve_worktree_tests {
     use gpui::TestAppContext;
     use project::{
         git_store::resolve_git_worktree_to_main_repo, linked_worktree_short_name,
-        repo_identity_path,
+        repo_identity_path, worktree_display_name,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -1724,6 +2205,73 @@ mod resolve_worktree_tests {
     }
 
     #[gpui::test]
+    async fn test_resolve_git_worktree_non_dot_bare_repo_with_relative_and_symlinked_paths(
+        cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/repos/source.git",
+            json!({
+                "worktrees": {
+                    "feature": {
+                        "commondir": "../..",
+                        "HEAD": "ref: refs/heads/feature"
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_symlink("/repos-alias", PathBuf::from("/repos"))
+            .await;
+        fs.insert_tree(
+            "/checkouts/feature",
+            json!({
+                ".git": "gitdir: ../../repos-alias/source.git/worktrees/feature",
+                "src": { "main.rs": "" }
+            }),
+        )
+        .await;
+
+        let result =
+            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/checkouts/feature")).await;
+        assert_eq!(result, Some(PathBuf::from("/repos/source.git")));
+    }
+
+    #[gpui::test]
+    async fn test_resolve_git_worktree_rejects_incomplete_metadata(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/metadata",
+            json!({
+                "worktrees": {
+                    "missing-commondir": {
+                        "HEAD": "ref: refs/heads/feature"
+                    }
+                }
+            }),
+        )
+        .await;
+        fs.insert_tree(
+            "/checkouts",
+            json!({
+                "malformed": { ".git": "not a gitdir" },
+                "missing-commondir": {
+                    ".git": "gitdir: /metadata/worktrees/missing-commondir"
+                }
+            }),
+        )
+        .await;
+
+        for path in ["/checkouts/malformed", "/checkouts/missing-commondir"] {
+            assert_eq!(
+                resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new(path)).await,
+                None,
+                "incomplete Git metadata at {path} must not create a project identity",
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn test_resolve_git_worktree_no_git_returns_none(cx: &mut TestAppContext) {
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
@@ -1794,5 +2342,20 @@ mod resolve_worktree_tests {
                 "short name for {linked_worktree_path:?}, linked worktree of {main_worktree_path:?}, should be {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_worktree_display_name() {
+        assert_eq!(
+            worktree_display_name(Path::new("/home/bob/zed"), Path::new("/home/bob/zed")),
+            "main"
+        );
+        assert_eq!(
+            worktree_display_name(
+                Path::new("/home/bob/zed"),
+                Path::new("/home/bob/worktrees/olivetti/zed"),
+            ),
+            "olivetti"
+        );
     }
 }

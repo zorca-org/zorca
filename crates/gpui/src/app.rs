@@ -984,6 +984,11 @@ impl App {
         self.platform.quit();
     }
 
+    /// Sets the application icon on platforms that support changing it at runtime.
+    pub fn set_application_icon(&self, png_bytes: &[u8]) {
+        self.platform.set_application_icon(png_bytes);
+    }
+
     /// Returns the current policy for hiding the cursor in response to
     /// keyboard input.
     pub fn cursor_hide_mode(&self) -> CursorHideMode {

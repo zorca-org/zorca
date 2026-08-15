@@ -60,3 +60,11 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+
+# graphify knowledge-graph output (generated)
+graphify-out/*
+!graphify-out/GRAPH_REPORT.md
+!graphify-out/graph.html
+!graphify-out/graph.json
+!graphify-out/manifest.json
+.impeccable/

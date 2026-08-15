@@ -10,6 +10,7 @@ pub struct ProjectEmptyState {
     open_project_key_binding: KeyBinding,
     on_open_project: Option<ClickHandler>,
     on_clone_repo: Option<ClickHandler>,
+    on_open_remote: Option<ClickHandler>,
 }
 
 impl ProjectEmptyState {
@@ -24,6 +25,7 @@ impl ProjectEmptyState {
             open_project_key_binding,
             on_open_project: None,
             on_clone_repo: None,
+            on_open_remote: None,
         }
     }
 
@@ -40,6 +42,14 @@ impl ProjectEmptyState {
         handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_clone_repo = Some(Box::new(handler));
+        self
+    }
+
+    pub fn on_open_remote(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_open_remote = Some(Box::new(handler));
         self
     }
 }
@@ -88,7 +98,21 @@ impl RenderOnce for ProjectEmptyState {
                             .when_some(self.on_clone_repo, |button, handler| {
                                 button.on_click(handler)
                             }),
-                    ),
+                    )
+                    .when_some(self.on_open_remote, |this, handler| {
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .child(Divider::horizontal().color(DividerColor::Border))
+                                .child(Label::new("or").size(LabelSize::XSmall).color(Color::Muted))
+                                .child(Divider::horizontal().color(DividerColor::Border)),
+                        )
+                        .child(
+                            Button::new("open_remote", "Connect to Remote Server")
+                                .full_width()
+                                .on_click(handler),
+                        )
+                    }),
             )
     }
 }

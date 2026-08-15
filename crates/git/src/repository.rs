@@ -2128,7 +2128,14 @@ impl GitRepository for RealGitRepository {
     }
 
     fn remove_worktree(&self, path: PathBuf, force: bool) -> BoxFuture<'_, Result<()>> {
-        let git = self.git_binary();
+        let git = GitBinary::new(
+            self.any_git_binary_path.clone(),
+            original_repo_path_from_common_dir(&self.common_dir)
+                .unwrap_or_else(|| self.command_directory()),
+            self.path(),
+            self.executor.clone(),
+            self.is_trusted(),
+        );
 
         self.executor
             .spawn(async move {
@@ -2149,6 +2156,20 @@ impl GitRepository for RealGitRepository {
 
         self.executor
             .spawn(async move {
+                match smol::fs::symlink_metadata(&new_path).await {
+                    Ok(_) => {
+                        anyhow::bail!(
+                            "worktree destination already exists: {}",
+                            new_path.display()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to stat worktree destination {}", new_path.display())
+                        });
+                    }
+                }
                 let args: Vec<OsString> = vec![
                     "worktree".into(),
                     "move".into(),
@@ -5696,6 +5717,9 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(repo.remove_worktree(repo_dir.clone(), true).await.is_err());
+        assert!(repo_dir.join(".git").is_dir());
+
         // Create a worktree
         let worktree_path = worktrees_dir.join("worktree-to-remove");
         repo.create_worktree(
@@ -5748,14 +5772,147 @@ mod tests {
             "non-force removal of dirty worktree should fail"
         );
 
-        // Force removal should succeed
-        repo.remove_worktree(worktree_path.clone(), true)
+        let linked_repo = RealGitRepository::new(
+            &worktree_path.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        smol::fs::remove_dir_all(&worktree_path).await.unwrap();
+
+        // Force removal should succeed when initiated from the deleted linked worktree
+        linked_repo
+            .remove_worktree(worktree_path.clone(), true)
             .await
             .unwrap();
 
         let worktrees = repo.worktrees().await.unwrap();
         assert_eq!(worktrees.len(), 1);
         assert!(!worktree_path.exists());
+    }
+
+    #[gpui::test]
+    async fn test_remove_prunable_worktree_requires_missing_checkout(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        git_init_repo(&repo_dir);
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        smol::fs::write(repo_dir.join("file.txt"), "content")
+            .await
+            .unwrap();
+        repo.stage_paths(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .unwrap();
+
+        let worktree_path = temp_dir.path().join("worktrees/stale with spaces");
+        repo.create_worktree(
+            CreateWorktreeTarget::NewBranch {
+                branch_name: "stale".to_string(),
+                base_sha: Some("HEAD".to_string()),
+            },
+            worktree_path.clone(),
+        )
+        .await
+        .unwrap();
+        smol::fs::remove_file(worktree_path.join(".git"))
+            .await
+            .unwrap();
+
+        for force in [false, true] {
+            let error = repo
+                .remove_worktree(worktree_path.clone(), force)
+                .await
+                .expect_err("Git validates an existing checkout before pruning metadata");
+            assert!(
+                error.to_string().contains("validation failed"),
+                "unexpected error: {error:#}"
+            );
+        }
+        assert_eq!(repo.worktrees().await.unwrap().len(), 2);
+
+        smol::fs::remove_dir_all(&worktree_path).await.unwrap();
+        repo.remove_worktree(worktree_path.clone(), true)
+            .await
+            .unwrap();
+        assert_eq!(repo.worktrees().await.unwrap().len(), 1);
+    }
+
+    #[gpui::test]
+    async fn test_locked_worktree_rejects_single_force_without_deleting_checkout(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_dir = temp_dir.path().join("repo");
+        git_init_repo(&repo_dir);
+        let repo = RealGitRepository::new(
+            &repo_dir.join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        smol::fs::write(repo_dir.join("file.txt"), "content")
+            .await
+            .unwrap();
+        repo.stage_paths(vec![repo_path("file.txt")], Arc::new(HashMap::default()))
+            .await
+            .unwrap();
+        repo.commit(
+            "Initial commit".into(),
+            None,
+            CommitOptions::default(),
+            AskPassDelegate::new(&mut cx.to_async(), |_, _, _| {}),
+            Arc::new(test_commit_envs()),
+        )
+        .await
+        .unwrap();
+
+        let worktree_path = temp_dir.path().join("worktrees/locked");
+        repo.create_worktree(
+            CreateWorktreeTarget::NewBranch {
+                branch_name: "locked".to_string(),
+                base_sha: Some("HEAD".to_string()),
+            },
+            worktree_path.clone(),
+        )
+        .await
+        .unwrap();
+        repo.git_binary()
+            .run(&["worktree", "lock", "--", worktree_path.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        for force in [false, true] {
+            assert!(
+                repo.remove_worktree(worktree_path.clone(), force)
+                    .await
+                    .is_err()
+            );
+            assert!(worktree_path.join(".git").is_file());
+            assert_eq!(repo.worktrees().await.unwrap().len(), 2);
+        }
     }
 
     #[gpui::test]
@@ -5795,7 +5952,7 @@ mod tests {
         .unwrap();
 
         // Create a worktree
-        let old_path = worktrees_dir.join("old-worktree-name");
+        let old_path = worktrees_dir.join("- old wørktree 名");
         repo.create_worktree(
             CreateWorktreeTarget::NewBranch {
                 branch_name: "old-name".to_string(),
@@ -5807,9 +5964,12 @@ mod tests {
         .unwrap();
 
         assert!(old_path.exists());
+        smol::fs::write(old_path.join("untracked.txt"), "dirty")
+            .await
+            .unwrap();
 
         // Move the worktree to a new path
-        let new_path = worktrees_dir.join("new-worktree-name");
+        let new_path = worktrees_dir.join("- new wørktree 名");
         repo.rename_worktree(old_path.clone(), new_path.clone())
             .await
             .unwrap();
@@ -5817,6 +5977,12 @@ mod tests {
         // Verify the old path is gone and new path exists
         assert!(!old_path.exists());
         assert!(new_path.exists());
+        assert_eq!(
+            smol::fs::read_to_string(new_path.join("untracked.txt"))
+                .await
+                .unwrap(),
+            "dirty"
+        );
 
         // Verify it shows up in worktree list at the new path
         let worktrees = repo.worktrees().await.unwrap();
@@ -5829,6 +5995,77 @@ mod tests {
             moved_worktree.path.canonicalize().unwrap(),
             new_path.canonicalize().unwrap()
         );
+
+        for occupied_path in [
+            worktrees_dir.join("empty destination"),
+            worktrees_dir.join("nonempty destination"),
+        ] {
+            smol::fs::create_dir_all(&occupied_path).await.unwrap();
+            if occupied_path.ends_with("nonempty destination") {
+                smol::fs::write(occupied_path.join("keep.txt"), "keep")
+                    .await
+                    .unwrap();
+            }
+            repo.rename_worktree(new_path.clone(), occupied_path.clone())
+                .await
+                .expect_err("an existing directory must not silently become a parent");
+            assert!(new_path.join(".git").is_file());
+            assert!(!occupied_path.join(new_path.file_name().unwrap()).exists());
+        }
+
+        let occupied_file = worktrees_dir.join("occupied file");
+        smol::fs::write(&occupied_file, "keep").await.unwrap();
+        repo.rename_worktree(new_path.clone(), occupied_file.clone())
+            .await
+            .expect_err("an existing file must be rejected");
+        assert!(new_path.join(".git").is_file());
+        assert_eq!(
+            smol::fs::read_to_string(&occupied_file).await.unwrap(),
+            "keep"
+        );
+
+        repo.rename_worktree(new_path.clone(), new_path.clone())
+            .await
+            .expect_err("renaming a worktree to itself must be rejected");
+        assert!(new_path.join(".git").is_file());
+
+        let missing_parent_destination = worktrees_dir.join("missing/child");
+        repo.rename_worktree(new_path.clone(), missing_parent_destination.clone())
+            .await
+            .expect_err("git does not create destination parents");
+        assert!(new_path.join(".git").is_file());
+        assert!(!missing_parent_destination.exists());
+
+        repo.git_binary()
+            .run(&["worktree", "lock", "--", new_path.to_str().unwrap()])
+            .await
+            .unwrap();
+        let locked_destination = worktrees_dir.join("locked destination");
+        repo.rename_worktree(new_path.clone(), locked_destination.clone())
+            .await
+            .expect_err("locked worktrees cannot be moved");
+        assert!(new_path.join(".git").is_file());
+        assert!(new_path.join("untracked.txt").is_file());
+        assert!(!locked_destination.exists());
+        repo.git_binary()
+            .run(&["worktree", "unlock", "--", new_path.to_str().unwrap()])
+            .await
+            .unwrap();
+
+        let main_destination = temp_dir.path().join("main destination");
+        repo.rename_worktree(repo_dir.clone(), main_destination.clone())
+            .await
+            .expect_err("the main worktree cannot be moved");
+        assert!(repo_dir.join(".git").is_dir());
+        assert!(!main_destination.exists());
+
+        let missing_source = worktrees_dir.join("missing");
+        assert!(
+            repo.rename_worktree(missing_source, worktrees_dir.join("unused"))
+                .await
+                .is_err()
+        );
+        assert!(new_path.join(".git").is_file());
     }
 
     #[gpui::test]

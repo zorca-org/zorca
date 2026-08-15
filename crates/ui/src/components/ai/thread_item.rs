@@ -16,6 +16,133 @@ pub enum AgentThreadStatus {
     Error,
 }
 
+/// The word a compact row shows next to its status indicator. A finished turn
+/// the user has not looked at (`notified`) is blocked on the user just as an
+/// explicit confirmation request is, so the two read the same.
+pub fn agent_thread_status_word(status: AgentThreadStatus, notified: bool) -> &'static str {
+    match status {
+        AgentThreadStatus::Error => "Error",
+        AgentThreadStatus::Running => "Working",
+        AgentThreadStatus::WaitingForConfirmation => "Needs input",
+        _ if notified => "Needs input",
+        _ => "Idle",
+    }
+}
+
+/// Text variants of the status hues: the saturated hue stays on the icon, so
+/// the word blends it toward the theme's text color until it clears the 4.5:1
+/// bar against both the panel and the selected row. Never reuse a dot colour
+/// as text.
+fn status_word_color(hue: Hsla, cx: &App) -> Color {
+    Color::Custom(hue.blend(cx.theme().colors().text.opacity(0.55)))
+}
+
+/// The phrase a session's status tooltip states. `needs_input` covers the same
+/// two cases [`agent_thread_status_word`] does.
+pub fn agent_thread_status_text(status: AgentThreadStatus, needs_input: bool) -> &'static str {
+    match status {
+        AgentThreadStatus::Error => "Thread has an error",
+        AgentThreadStatus::Running => "Working…",
+        _ if needs_input => "Waiting for your input",
+        _ => "Idle",
+    }
+}
+
+/// The tooltip a session carries. Naming the session is only worth a line of
+/// tooltip where more than one of them is in play, so the prefix is the
+/// caller's call.
+pub fn agent_thread_status_tooltip(
+    status: AgentThreadStatus,
+    needs_input: bool,
+    prefix: Option<&SharedString>,
+) -> SharedString {
+    let text = agent_thread_status_text(status, needs_input);
+    match prefix {
+        Some(prefix) => format!("{prefix} — {text}").into(),
+        None => text.into(),
+    }
+}
+
+/// How large [`agent_thread_status_indicator`] draws: the slot a compact row
+/// leads with, or the miniature a collapsed group packs several of into one
+/// status cluster.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AgentThreadStatusIndicatorSize {
+    #[default]
+    Row,
+    Miniature,
+}
+
+impl AgentThreadStatusIndicatorSize {
+    fn icon_size(self) -> IconSize {
+        match self {
+            Self::Row => IconSize::XSmall,
+            Self::Miniature => IconSize::Indicator,
+        }
+    }
+
+    /// The filled needs-input dot and the hollow idle circle, in that order.
+    /// They differ by a pixel so the two read apart at a glance.
+    fn dot_sizes(self) -> (Pixels, Pixels) {
+        match self {
+            Self::Row => (px(7.), px(6.)),
+            Self::Miniature => (px(6.), px(5.)),
+        }
+    }
+}
+
+/// The three indicators that say what a session is doing: a spinning ring
+/// while the agent works, a pulsing dot while it is blocked on the user, a
+/// hollow circle while it is idle. Single-sourced so the compact row, the
+/// divided workspace row and the collapsed group's cluster share one
+/// vocabulary.
+///
+/// Both animations go through `with_animation`, which collapses to a single
+/// static frame when `App::reduce_motion` is set; the states stay
+/// distinguishable by shape and color without motion.
+pub fn agent_thread_status_indicator(
+    id: SharedString,
+    status: AgentThreadStatus,
+    needs_input: bool,
+    idle_color: Color,
+    size: AgentThreadStatusIndicatorSize,
+    cx: &App,
+) -> AnyElement {
+    let (needs_input_dot, idle_dot) = size.dot_sizes();
+    match status {
+        AgentThreadStatus::Error => Icon::new(IconName::Close)
+            .size(size.icon_size())
+            .color(Color::Error)
+            .into_any_element(),
+        AgentThreadStatus::Running => Icon::new(IconName::LoadCircle)
+            .size(size.icon_size())
+            .color(Color::Info)
+            .with_keyed_rotate_animation(SharedString::from(format!("{id}-working")), 1)
+            .into_any_element(),
+        _ if needs_input => {
+            let dot_color = Color::Warning.color(cx);
+            div()
+                .size(needs_input_dot)
+                .rounded_full()
+                .bg(dot_color)
+                .with_animation(
+                    SharedString::from(format!("{id}-needs-input")),
+                    Animation::new(Duration::from_millis(1800))
+                        .repeat()
+                        .with_easing(pulsating_between(0.45, 1.0)),
+                    move |this, delta| this.bg(dot_color.opacity(delta)),
+                )
+                .into_any_element()
+        }
+        _ => div()
+            .size(idle_dot)
+            .rounded_full()
+            .border_1()
+            .border_color(idle_color.color(cx))
+            .into_any_element(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WorktreeKind {
     #[default]
@@ -52,7 +179,10 @@ pub struct ThreadItem {
     focused: bool,
     hovered: bool,
     rounded: bool,
+    compact: bool,
     is_truncated: bool,
+    show_status_word: bool,
+    status_tooltip_prefix: Option<SharedString>,
     added: Option<usize>,
     removed: Option<usize>,
     project_paths: Option<Arc<[PathBuf]>>,
@@ -87,7 +217,10 @@ impl ThreadItem {
             focused: false,
             hovered: false,
             rounded: false,
+            compact: false,
             is_truncated: true,
+            show_status_word: false,
+            status_tooltip_prefix: None,
             added: None,
             removed: None,
             project_paths: None,
@@ -219,8 +352,30 @@ impl ThreadItem {
         self
     }
 
+    /// Collapses the row to a single line: the metadata line is dropped and the
+    /// diff stats and timestamp move inline to the right of the title.
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
+
     pub fn is_truncated(mut self, is_truncated: bool) -> Self {
         self.is_truncated = is_truncated;
+        self
+    }
+
+    /// Shows the status word ("Working", "Needs input", …) to the left of the
+    /// timestamp. Compact rows only — the roomier layout states the status in
+    /// its metadata line instead.
+    pub fn show_status_word(mut self, show: bool) -> Self {
+        self.show_status_word = show;
+        self
+    }
+
+    /// Names the session the status tooltip is about, as `<Agent>` or
+    /// `<Agent> #<instance>`; the tooltip then reads "<prefix> — <status>".
+    pub fn status_tooltip_prefix(mut self, prefix: impl Into<SharedString>) -> Self {
+        self.status_tooltip_prefix = Some(prefix.into());
         self
     }
 
@@ -297,7 +452,11 @@ impl RenderOnce for ThreadItem {
                 .justify_center()
                 .when(!icon_visible, |this| this.invisible())
         };
+        let compact = self.compact;
         let icon_color = self.icon_color.unwrap_or(Color::Muted);
+        // Compact rows lead with a status indicator instead of an agent glyph
+        // (see `compact_status_slot` below), so the glyph is only built for the
+        // roomier default layout.
         let agent_icon = if let Some(icon_char) = self.icon_char {
             Label::new(icon_char)
                 .size(LabelSize::Small)
@@ -314,6 +473,13 @@ impl RenderOnce for ThreadItem {
                 .size(IconSize::Small)
                 .into_any_element()
         };
+
+        let status = self.status;
+        // "Needs input" covers both the agent explicitly asking for
+        // confirmation and a finished turn the user has not looked at yet.
+        let needs_input = status == AgentThreadStatus::WaitingForConfirmation || self.notified;
+        let status_tooltip =
+            agent_thread_status_tooltip(status, needs_input, self.status_tooltip_prefix.as_ref());
 
         let status_icon = if self.status == AgentThreadStatus::Error {
             Some(
@@ -337,7 +503,34 @@ impl RenderOnce for ThreadItem {
             None
         };
 
-        let icon = if self.status == AgentThreadStatus::Running {
+        // A compact row is a live agent session in a tree, so it leads with a
+        // status indicator rather than an agent glyph. The slot is a fixed
+        // 12x12 box so titles stay in one column across all of the states.
+        let compact_status_slot = compact.then(|| {
+            let indicator = agent_thread_status_indicator(
+                SharedString::from(icon_id.clone()),
+                status,
+                needs_input,
+                icon_color,
+                AgentThreadStatusIndicatorSize::Row,
+                cx,
+            );
+
+            h_flex()
+                .id(icon_id.clone())
+                .size_3()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .when(!icon_visible, |this| this.invisible())
+                .child(indicator)
+                .tooltip(Tooltip::text(status_tooltip))
+                .into_any_element()
+        });
+
+        let icon = if let Some(slot) = compact_status_slot {
+            slot
+        } else if self.status == AgentThreadStatus::Running {
             icon_container()
                 .child(
                     Icon::new(IconName::LoadCircle)
@@ -360,6 +553,7 @@ impl RenderOnce for ThreadItem {
         } else if self.title_generating {
             Label::new(title)
                 .color(Color::Muted)
+                .when(compact, |label| label.size(LabelSize::Small))
                 .with_animation(
                     "generating-title",
                     Animation::new(Duration::from_secs(2))
@@ -371,17 +565,24 @@ impl RenderOnce for ThreadItem {
         } else if highlight_positions.is_empty() {
             Label::new(title)
                 .when_some(self.title_label_color, |label, color| label.color(color))
+                .when(compact, |label| label.size(LabelSize::Small))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
                 .when_some(self.title_label_color, |label, color| label.color(color))
+                .when(compact, |label| label.size(LabelSize::Small))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
 
+        let has_action_slot = self.action_slot.is_some();
+
         let has_diff_stats = self.added.is_some() || self.removed.is_some();
         let diff_stat_id = self.id.clone();
+        // `DiffStat::new` consumes the id, and compact mode renders the stat in a
+        // different place, so each site needs its own copy.
+        let inline_diff_stat_id = self.id.clone();
         let added_count = self.added.unwrap_or(0);
         let removed_count = self.removed.unwrap_or(0);
 
@@ -404,10 +605,13 @@ impl RenderOnce for ThreadItem {
         let has_timestamp = !self.timestamp.is_empty();
         let timestamp = self.timestamp;
 
-        let show_tooltip = matches!(
-            self.status,
-            AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
-        );
+        // Compact rows carry the tooltip on the status slot itself, so the
+        // whole-row tooltip would only ever duplicate it.
+        let show_tooltip = !compact
+            && matches!(
+                self.status,
+                AgentThreadStatus::Error | AgentThreadStatus::WaitingForConfirmation
+            );
 
         let linked_worktrees: Vec<ThreadItemWorktreeInfo> = self
             .worktrees
@@ -418,11 +622,36 @@ impl RenderOnce for ThreadItem {
 
         let has_worktree = !linked_worktrees.is_empty();
 
-        let has_metadata = has_project_name
-            || has_project_paths
-            || has_worktree
-            || has_diff_stats
-            || has_timestamp;
+        let has_metadata = !compact
+            && (has_project_name
+                || has_project_paths
+                || has_worktree
+                || has_diff_stats
+                || has_timestamp);
+
+        let status_word = (compact && self.show_status_word)
+            .then(|| agent_thread_status_word(status, self.notified));
+
+        // The action slot is drawn over the right end of the title row on hover,
+        // so the inline metadata yields to it rather than showing through.
+        let show_inline_metadata = compact
+            && (has_diff_stats || has_timestamp || status_word.is_some())
+            && !(self.hovered && has_action_slot);
+        let inline_timestamp = timestamp.clone();
+        // The timestamp echoes the status slot, so a live thread's relative
+        // time reads as part of the indicator rather than as chrome.
+        let timestamp_color = match status {
+            AgentThreadStatus::Running => Color::Info,
+            _ if needs_input => Color::Warning,
+            _ => Color::Muted,
+        };
+        // Idle has no hue to lighten, so it stays on the muted text role.
+        let status_word_color = match status {
+            AgentThreadStatus::Error => status_word_color(Color::Error.color(cx), cx),
+            AgentThreadStatus::Running => status_word_color(Color::Info.color(cx), cx),
+            _ if needs_input => status_word_color(Color::Warning.color(cx), cx),
+            _ => Color::Muted,
+        };
 
         v_flex()
             .id(self.id.clone())
@@ -432,7 +661,7 @@ impl RenderOnce for ThreadItem {
             .flex_shrink_0()
             .overflow_hidden()
             .w_full()
-            .py_1()
+            .map(|this| if compact { this.py_0p5() } else { this.py_1() })
             .px_1p5()
             .when(self.selected, |s| s.bg(color.element_active))
             .border_1()
@@ -459,6 +688,36 @@ impl RenderOnce for ThreadItem {
                     )
                     .when(self.is_truncated && opaque_window, |this| {
                         this.child(gradient_overlay)
+                    })
+                    // Drawn after the fade so it stays legible over it.
+                    .when(show_inline_metadata, |this| {
+                        this.child(
+                            h_flex()
+                                .flex_none()
+                                .gap_1p5()
+                                .when(has_diff_stats, |this| {
+                                    this.child(DiffStat::new(
+                                        inline_diff_stat_id,
+                                        added_count,
+                                        removed_count,
+                                    ))
+                                })
+                                .when(has_diff_stats && has_timestamp, |this| {
+                                    this.child(dot_separator())
+                                })
+                                .children(status_word.map(|word| {
+                                    Label::new(word)
+                                        .size(LabelSize::Small)
+                                        .color(status_word_color)
+                                }))
+                                .when(has_timestamp, |this| {
+                                    this.child(
+                                        Label::new(inline_timestamp)
+                                            .size(LabelSize::Small)
+                                            .color(timestamp_color),
+                                    )
+                                }),
+                        )
                     })
                     .when(self.hovered, |this| {
                         this.when_some(self.action_slot, |this, slot| {

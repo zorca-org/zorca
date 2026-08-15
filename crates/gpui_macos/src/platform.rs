@@ -13,7 +13,8 @@ use cocoa::{
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
-        NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSProcessInfo, NSString, NSUInteger, NSURL,
+        NSArray, NSAutoreleasePool, NSBundle, NSData, NSInteger, NSProcessInfo, NSString,
+        NSUInteger, NSURL,
     },
 };
 use core_foundation::{
@@ -602,6 +603,22 @@ impl Platform for MacPlatform {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, unhideAllApplications: nil];
+        }
+    }
+
+    fn set_application_icon(&self, png_bytes: &[u8]) {
+        unsafe {
+            let data = NSData::dataWithBytes_length_(
+                nil,
+                png_bytes.as_ptr().cast(),
+                png_bytes.len() as NSUInteger,
+            );
+            let image: id = msg_send![class!(NSImage), alloc];
+            let image: id = msg_send![image, initWithData: data];
+            if image != nil {
+                NSApplication::sharedApplication(nil).setApplicationIconImage_(image);
+                let _: () = msg_send![image, release];
+            }
         }
     }
 

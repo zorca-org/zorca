@@ -46,8 +46,8 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, ContextMenuEntry, ContextMenuItem, DecoratedIcon, IconButtonShape, IconDecoration,
-    IconDecorationKind, Indicator, PopoverMenu, PopoverMenuHandle, Tab, TabBar, TabPosition,
-    Tooltip, prelude::*, right_click_menu,
+    IconDecorationKind, Indicator, KeyBinding, PopoverMenu, PopoverMenuHandle, SpinnerLabel, Tab,
+    TabBar, TabPosition, Tooltip, prelude::*, right_click_menu,
 };
 use util::{
     ResultExt, debug_panic, markdown::MarkdownInlineCode, maybe, paths::PathStyle,
@@ -440,6 +440,10 @@ pub struct Pane {
     /// Otherwise, when `display_nav_history_buttons` is Some, it determines whether nav buttons should be displayed.
     display_nav_history_buttons: Option<bool>,
     double_click_dispatch_action: Box<dyn Action>,
+    /// Items requested for this pane that have not arrived yet. Creating a
+    /// terminal is slow enough to see, and until it lands the pane holds
+    /// nothing — without this an empty pane reads as if the click did nothing.
+    pending_items: usize,
     save_modals_spawned: HashSet<EntityId>,
     close_pane_if_empty: bool,
     pub new_item_context_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -613,6 +617,7 @@ impl Pane {
             ),
             _subscriptions: subscriptions,
             double_click_dispatch_action,
+            pending_items: 0,
             save_modals_spawned: HashSet::default(),
             close_pane_if_empty: true,
             split_item_context_menu_handle: Default::default(),
@@ -4218,20 +4223,25 @@ fn default_render_tab_bar_buttons(
                 )
                 .anchor(Anchor::TopRight)
                 .with_handle(pane.new_item_context_menu_handle.clone())
-                .menu(move |window, cx| {
-                    Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New File", NewFile.boxed_clone())
-                            .action("Open File", ToggleFileFinder::default().boxed_clone())
-                            .separator()
-                            .action("Search Project", DeploySearch::default().boxed_clone())
-                            .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
-                            .separator()
-                            .action("New Terminal", NewTerminal::default().boxed_clone())
-                            .action(
-                                "New Center Terminal",
-                                NewCenterTerminal::default().boxed_clone(),
-                            )
-                    }))
+                .menu({
+                    let workspace = pane.workspace.clone();
+                    move |window, cx| {
+                        let workspace = workspace.clone();
+                        Some(ContextMenu::build(window, cx, move |menu, window, cx| {
+                            let menu = menu
+                                .action("New File", NewFile.boxed_clone())
+                                .action("Open File", ToggleFileFinder::default().boxed_clone())
+                                .separator()
+                                .action("Search Project", DeploySearch::default().boxed_clone())
+                                .action("Search Symbols", ToggleProjectSymbols.boxed_clone())
+                                .separator()
+                                .action("New Terminal", NewTerminal::default().boxed_clone());
+                            // The agent presets are defined once, in agent_workspaces, and
+                            // registered here so this menu and the sidebar's row
+                            // menu cannot drift apart.
+                            crate::extend_new_item_menu(menu, workspace, window, cx)
+                        }))
+                    }
                 }),
         )
         .child(
@@ -4282,6 +4292,61 @@ fn default_render_tab_bar_buttons(
         .into_any_element()
         .into();
     (None, right_children)
+}
+
+impl Pane {
+    /// Records that an item has been requested for this pane, so the empty
+    /// pane shows progress instead of looking inert. Must be paired with
+    /// [`Pane::end_pending_item`].
+    pub fn begin_pending_item(&mut self, cx: &mut Context<Self>) {
+        self.pending_items += 1;
+        cx.notify();
+    }
+
+    pub fn end_pending_item(&mut self, cx: &mut Context<Self>) {
+        self.pending_items = self.pending_items.saturating_sub(1);
+        cx.notify();
+    }
+
+    pub fn has_pending_item(&self) -> bool {
+        self.pending_items > 0
+    }
+
+    fn render_pending_item(&self) -> impl IntoElement {
+        v_flex()
+            .debug_selector(|| "pane_pending_item".into())
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(SpinnerLabel::new().size(LabelSize::Large))
+            .child(Label::new("Loading\u{2026}").color(Color::Muted))
+    }
+
+    fn render_no_items(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle.clone();
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Label::new("No terminal open").size(LabelSize::Large))
+            .child(
+                Label::new("Pick a worktree in the sidebar, or open one here.").color(Color::Muted),
+            )
+            .child(
+                Button::new("open_center_terminal", "New Terminal")
+                    .style(ButtonStyle::Filled)
+                    .key_binding(KeyBinding::for_action_in(
+                        &NewCenterTerminal::default(),
+                        &self.focus_handle,
+                        cx,
+                    ))
+                    .on_click(move |_event, window, cx| {
+                        focus_handle.dispatch_action(&NewCenterTerminal::default(), window, cx)
+                    }),
+            )
+    }
 }
 
 impl Focusable for Pane {
@@ -4493,6 +4558,16 @@ impl Render for Pane {
                                 .overflow_hidden()
                                 .child(self.toolbar.clone())
                                 .child(item.to_any_view())
+                                .when(self.pending_items > 0, |content| {
+                                    content.child(
+                                        gpui::div()
+                                            .absolute()
+                                            .inset_0()
+                                            .occlude()
+                                            .bg(cx.theme().colors().editor_background)
+                                            .child(self.render_pending_item()),
+                                    )
+                                })
                         } else {
                             let placeholder = div
                                 .id("pane_placeholder")
@@ -4509,7 +4584,11 @@ impl Render for Pane {
                                         }
                                     },
                                 ));
-                            if has_worktrees || !self.should_display_welcome_page {
+                            if self.pending_items > 0 {
+                                placeholder.child(self.render_pending_item())
+                            } else if has_worktrees {
+                                placeholder.child(self.render_no_items(cx))
+                            } else if !self.should_display_welcome_page {
                                 placeholder
                             } else {
                                 if self.welcome_page.is_none() {

@@ -1,0 +1,1159 @@
+//! The workspace sidebar: an on-demand tab, opened from the command palette by
+//! `ade_workspaces::ToggleWorkspacesView`, that makes the *workspace*, not the
+//! file, the primary navigation object. It is a dev view — never resident, and
+//! deliberately not serializable, so it does not come back after a restart.
+//!
+//! The tree is two levels deep — project groups over workspace rows — and the
+//! dot on each row is the one honest thing on screen: it is whatever the last
+//! [`WorkspaceLifecycleService::reconcile_all`] pass found in the session
+//! backend, not what the registry remembered. That pass, and the status stream
+//! that drives it, belong to [`AdeWorkspaceStore`] — this panel observes the
+//! store and asks it to refresh after an action, so a second view of the same
+//! data (the ledger sidebar) cannot displace this one's status stream.
+//!
+//! Three rules from the lifecycle layer show through in the UI and must keep
+//! showing through:
+//!
+//! - **Selecting attaches; it never repairs.** A row whose session probed
+//!   [`SessionState::Dead`] does not silently get a new one. The row shows what
+//!   died and offers a "Recreate" button, and only that click recreates.
+//! - **Killing is reachable only from a control that says "Kill".** "Kill
+//!   workspace…" sends the daemon a single `KillWorkspace`: every session in
+//!   the workspace dies and the record goes with them. "Kill and Clean Up…"
+//!   freezes the displayed dead rows and re-probes them before deletion.
+//!   "Stop (detach)" and "Remove from list" sit next to them and neither kills.
+//! - **Every lifecycle call blocks.** The session backend is synchronous and
+//!   the registry is sqlite, so nothing in this file may call the service on
+//!   the foreground thread; it all goes through `cx.background_spawn`.
+//!
+//! **Remote workspaces are ordinary rows.** They reconcile, attach, stop and
+//! kill through the backend for their host exactly as local ones do, and
+//! project groups are scoped by that host. A host that cannot be reached costs
+//! its own error line and leaves its rows showing their last known status —
+//! never the whole tree.
+
+use crate::{
+    AdeWorkspace, AdeWorkspaceStore, SessionState, WorkspaceId, WorkspaceLifecycleService,
+    WorkspaceStatus,
+    attach::attach_terminal,
+    create_workspace_modal::CreateWorkspaceModal,
+    open_workspace_session,
+    workspace_view::{ensure_repository_worktree, name_window_after_workspace},
+};
+use anyhow::Result;
+use gpui::{Entity, EventEmitter, FocusHandle, Focusable, WeakEntity, actions};
+use std::{collections::HashMap, future::Future, rc::Rc, sync::Arc};
+use ui::{
+    ContextMenu, Divider, Indicator, ListItem, ListItemSpacing, SpinnerLabel, Tooltip, prelude::*,
+    right_click_menu,
+};
+use util::ResultExt as _;
+use workspace::{
+    Workspace,
+    item::{Item, TabContentParams},
+};
+
+actions!(
+    ade_workspaces,
+    [
+        /// Toggles the ADE workspaces debug view.
+        ToggleWorkspacesView,
+    ]
+);
+
+/// One rendered line of the tree. Kept separate from the render so the
+/// grouping is testable without a window.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum SidebarRow {
+    Project {
+        project_id: String,
+        remote_host: Option<String>,
+        live_count: usize,
+        gone_count: usize,
+    },
+    Workspace {
+        workspace: AdeWorkspace,
+        state: SessionState,
+    },
+}
+
+/// Flattens reconciled workspaces into project-grouped rows.
+///
+/// Group order is first-appearance, and within a group the input order is
+/// preserved — the registry lists most-recently-opened first, so the project
+/// you last worked in floats to the top and its newest workspace leads it.
+pub(crate) fn group_rows(entries: &[(AdeWorkspace, SessionState)]) -> Vec<SidebarRow> {
+    let mut order: Vec<(Option<&str>, &str)> = Vec::new();
+    let mut grouped: HashMap<(Option<&str>, &str), Vec<&(AdeWorkspace, SessionState)>> =
+        HashMap::new();
+
+    for entry in entries {
+        let key = (entry.0.remote_host.as_deref(), entry.0.project_id.as_str());
+        grouped
+            .entry(key)
+            .or_insert_with(|| {
+                order.push(key);
+                Vec::new()
+            })
+            .push(entry);
+    }
+
+    let mut rows = Vec::with_capacity(entries.len() + order.len());
+    for (remote_host, project_id) in order {
+        let group = grouped
+            .remove(&(remote_host, project_id))
+            .unwrap_or_default();
+        let live_count = group
+            .iter()
+            .filter(|(_, state)| *state == SessionState::Alive)
+            .count();
+        let gone_count = group
+            .iter()
+            .filter(|(_, state)| *state == SessionState::Dead)
+            .count();
+        rows.push(SidebarRow::Project {
+            project_id: project_id.to_owned(),
+            remote_host: remote_host.map(ToOwned::to_owned),
+            live_count,
+            gone_count,
+        });
+        rows.extend(
+            group
+                .into_iter()
+                .map(|(workspace, state)| SidebarRow::Workspace {
+                    workspace: workspace.clone(),
+                    state: *state,
+                }),
+        );
+    }
+    rows
+}
+
+/// The dot's colour, straight off the theme's status palette — the whole point
+/// of the panel is that this mapping is never guessed at in a component.
+pub(crate) fn status_color(status: WorkspaceStatus) -> Color {
+    match status {
+        WorkspaceStatus::Running => Color::Success,
+        WorkspaceStatus::Disconnected => Color::Warning,
+        WorkspaceStatus::Stopped | WorkspaceStatus::Creating => Color::Muted,
+        WorkspaceStatus::Error => Color::Error,
+    }
+}
+
+pub struct WorkspaceSidebar {
+    workspace: WeakEntity<Workspace>,
+    lifecycle: Arc<WorkspaceLifecycleService>,
+    /// The shared view of what the session backend last reported. Observed, not
+    /// polled — see the module docs.
+    store: Entity<AdeWorkspaceStore>,
+    focus_handle: FocusHandle,
+    rows: Vec<SidebarRow>,
+    /// The workspace whose terminal the centre is showing, as far as this
+    /// panel knows.
+    selected: Option<WorkspaceId>,
+    /// The last failed *action*, shown in the panel rather than swallowed — a
+    /// session backend that will not start is exactly what the user needs to
+    /// see. The store carries the failures of its own passes.
+    error: Option<SharedString>,
+    cleanup_in_progress: bool,
+    _store_observation: gpui::Subscription,
+}
+
+impl WorkspaceSidebar {
+    fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
+        let lifecycle = crate::lifecycle_service(cx);
+        let store = AdeWorkspaceStore::global(cx);
+        let store_observation = cx.observe(&store, |this, store, cx| {
+            this.take_rows_from_store(&store, cx);
+        });
+
+        let mut this = Self {
+            workspace,
+            lifecycle,
+            store: store.clone(),
+            focus_handle: cx.focus_handle(),
+            rows: Vec::new(),
+            selected: None,
+            error: None,
+            cleanup_in_progress: false,
+            _store_observation: store_observation,
+        };
+        this.take_rows_from_store(&store, cx);
+        this
+    }
+
+    /// Rebuilds the tree from the store's entries. The only thing that ever
+    /// writes [`Self::rows`].
+    fn take_rows_from_store(&mut self, store: &Entity<AdeWorkspaceStore>, cx: &mut Context<Self>) {
+        let entries = store.read(cx).entries();
+        // A workspace that has been removed can no longer be the selection, or
+        // the row would stay highlighted with nothing under it.
+        if let Some(selected) = &self.selected
+            && !entries
+                .iter()
+                .any(|(workspace, _)| &workspace.id == selected)
+        {
+            self.selected = None;
+        }
+        self.rows = group_rows(entries);
+        cx.notify();
+    }
+
+    /// Asks the store for a fresh pass over the session backend, so the dots
+    /// catch up with whatever the last action did.
+    fn reconcile(&mut self, cx: &mut Context<Self>) {
+        self.store.update(cx, |store, cx| store.refresh(cx));
+    }
+
+    /// Runs one blocking lifecycle call on the background executor, records
+    /// any failure, and reconciles so the dots catch up with what it did.
+    fn run_action<F>(
+        &mut self,
+        cx: &mut Context<Self>,
+        action: impl FnOnce(Arc<WorkspaceLifecycleService>) -> F + 'static,
+    ) where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        let lifecycle = self.lifecycle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(action(lifecycle)).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.error = None,
+                    Err(error) => this.error = Some(format!("{error:#}").into()),
+                }
+                this.reconcile(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Clicking a row: hand it to the shared open path, which marks the
+    /// workspace opened, probes its session, and attaches unless it is dead —
+    /// see [`open_workspace_session`].
+    fn select_workspace(&mut self, id: WorkspaceId, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some(id.clone());
+        cx.notify();
+
+        let Some(zed_workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let open = open_workspace_session(&zed_workspace, id, window, cx);
+        cx.spawn(async move |this, cx| {
+            let outcome = open.await;
+            this.update(cx, |this, _| {
+                this.error = outcome.err().map(|error| format!("{error:#}").into());
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The explicit repair for a dead session, from the button the dead row
+    /// renders. The connect flow (`crate::connect`) runs the same repair when
+    /// a fresh connection lands on a workspace with nothing alive — those are
+    /// the only two paths that reach
+    /// [`WorkspaceLifecycleService::recreate_session`].
+    fn recreate_and_attach(
+        &mut self,
+        id: WorkspaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some(id.clone());
+        cx.notify();
+
+        let lifecycle = self.lifecycle.clone();
+        let zed_workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let recreated = cx
+                .background_spawn(async move {
+                    let workspace = lifecycle.recreate_session(&id).await?;
+                    let attached = lifecycle.attach_command(&workspace)?;
+                    anyhow::Ok((workspace, attached))
+                })
+                .await;
+
+            let outcome = match recreated {
+                Ok((workspace, attached)) => {
+                    // Same as selecting: the window follows the workspace
+                    // before the terminal lands.
+                    ensure_repository_worktree(&zed_workspace, &workspace, cx).await;
+                    match name_window_after_workspace(&zed_workspace, &workspace, cx) {
+                        Ok(()) => attach_terminal(&zed_workspace, &workspace, attached, cx).await,
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+
+            this.update(cx, |this, cx| {
+                this.error = outcome.err().map(|error| format!("{error:#}").into());
+                this.reconcile(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Detaches every client and records the workspace stopped. **Nothing
+    /// dies** — the agents in the session keep running, which is why the menu
+    /// entry says "Stop (detach)".
+    fn stop_workspace(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
+        self.run_action(cx, move |lifecycle| async move {
+            lifecycle.stop_workspace(&id).await.map(|_| ())
+        });
+    }
+
+    /// The one killing path in this panel, and it takes the **whole
+    /// workspace**: every session in it dies and the daemon's record of it —
+    /// its layout included — is deleted, which is what
+    /// [`WorkspaceLifecycleService::kill_workspace`] sends as a single
+    /// `KillWorkspace`. Other clients showing it are told and stop syncing.
+    ///
+    /// Destructive and unconfirmed on purpose: there is no working confirmation
+    /// dialog in this shell, so the menu entry's own label ("Kill workspace…")
+    /// is the guard. Do not reach this from any control that does not say
+    /// "Kill", and do not soften the label — "Kill session" would understate
+    /// what goes.
+    fn kill_workspace(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
+        self.run_action(cx, move |lifecycle| async move {
+            lifecycle.kill_workspace(&id).await.map(|_| ())
+        });
+    }
+
+    /// Forgets the workspace.
+    ///
+    /// **Registry only — this must never touch the session backend.** A
+    /// removed workspace's session goes on running and can be adopted again
+    /// later; that is exactly what makes removal safe to offer without a
+    /// confirmation, and exactly what would be destroyed by "helpfully"
+    /// killing the session here.
+    fn remove_workspace(&mut self, id: WorkspaceId, cx: &mut Context<Self>) {
+        if self.selected.as_ref() == Some(&id) {
+            self.selected = None;
+        }
+        self.run_action(cx, move |lifecycle| async move {
+            lifecycle.registry().delete_workspace(id).await
+        });
+    }
+
+    fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let lifecycle = self.lifecycle.clone();
+        let this = cx.entity().downgrade();
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    CreateWorkspaceModal::new(
+                        lifecycle,
+                        Rc::new(move |created: AdeWorkspace, window, cx| {
+                            this.update(cx, |this, cx| {
+                                // Creating already made the session; selecting
+                                // it is what attaches a terminal to it.
+                                this.select_workspace(created.id.clone(), window, cx);
+                            })
+                            .ok();
+                        }),
+                        window,
+                        cx,
+                    )
+                });
+            })
+            .log_err();
+    }
+
+    fn gone_workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                SidebarRow::Workspace {
+                    workspace,
+                    state: SessionState::Dead,
+                } => Some(workspace.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn cleanup_gone_workspaces(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let candidate_ids = self.gone_workspace_ids();
+        let gone_count = candidate_ids.len();
+        if gone_count == 0 || self.cleanup_in_progress {
+            return;
+        }
+
+        let suffix = if gone_count == 1 { "" } else { "s" };
+        let confirmation = window.prompt(
+            gpui::PromptLevel::Critical,
+            &format!("Kill and clean up {gone_count} gone workspace{suffix}?"),
+            Some(
+                "This permanently deletes their daemon workspace records and saved layouts. If a session starts in one before cleanup finishes, that session is terminated. Other live sessions and repository files are not changed.",
+            ),
+            &["Kill and Clean Up", "Cancel"],
+            cx,
+        );
+        let lifecycle = self.lifecycle.clone();
+
+        cx.spawn(async move |this, cx| {
+            if confirmation.await != Ok(0) {
+                return;
+            }
+            let started = this
+                .update(cx, |this, cx| {
+                    if this.cleanup_in_progress {
+                        return false;
+                    }
+                    this.cleanup_in_progress = true;
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !started {
+                return;
+            }
+
+            let result = cx
+                .background_spawn(
+                    async move { lifecycle.cleanup_dead_workspaces(candidate_ids).await },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.cleanup_in_progress = false;
+                this.error = result.err().map(|error| format!("{error:#}").into());
+                this.reconcile(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let gone_count = self.gone_workspace_ids().len();
+        h_flex()
+            .h(rems(1.75))
+            .px_2()
+            .justify_between()
+            .child(Label::new("Workspaces"))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .when(gone_count > 0, |this| {
+                        this.child(
+                            Button::new(
+                                "ade-cleanup-gone-workspaces",
+                                "Kill and Clean Up Gone Workspaces…",
+                            )
+                            .label_size(LabelSize::Small)
+                            .disabled(self.cleanup_in_progress)
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.cleanup_gone_workspaces(window, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        IconButton::new("ade-new-workspace", IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .aria_label("New workspace")
+                            .tooltip(Tooltip::text("New workspace"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.create_workspace(window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_project_header(
+        &self,
+        ix: usize,
+        project_id: &str,
+        remote_host: Option<&str>,
+        live_count: usize,
+        gone_count: usize,
+        contains_selection: bool,
+        cx: &App,
+    ) -> AnyElement {
+        h_flex()
+            .id(("ade-project-header", ix))
+            .h(rems(1.75))
+            .px_2()
+            .justify_between()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Icon::new(IconName::Folder).size(IconSize::Small).color(
+                        if contains_selection {
+                            Color::Default
+                        } else {
+                            Color::Muted
+                        },
+                    ))
+                    // The project is a human name, so it stays in the UI
+                    // font; only machine identifiers below go mono.
+                    .child(
+                        Label::new(project_id.to_owned())
+                            .color(if contains_selection {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            })
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(remote_host.unwrap_or("local").to_owned())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .buffer_font(cx)
+                            .truncate(),
+                    ),
+            )
+            .child(
+                Label::new(format!("{live_count} live · {gone_count} gone"))
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+
+    fn render_workspace_row(
+        &self,
+        ix: usize,
+        workspace: &AdeWorkspace,
+        state: SessionState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = workspace.id.clone();
+        let is_selected = self.selected.as_ref() == Some(&id);
+        let branch = workspace.branch.clone();
+        let name = workspace.name.clone();
+        let dot_color = status_color(workspace_status(workspace, state));
+        let repository_path = workspace.repository_path.to_string_lossy().into_owned();
+        let daemon_workspace_id = workspace.daemon_workspace_id();
+        // The row's element trees outlive this call, so nothing borrowed from
+        // `workspace` or `cx` may be captured — take owned copies first.
+        let this = cx.entity().downgrade();
+
+        let row = {
+            let this_for_click = this.clone();
+            let this_for_menu = this;
+            let id_for_click = id.clone();
+            let id_for_menu = id.clone();
+            right_click_menu::<ContextMenu>(("ade-workspace-row", ix))
+                .trigger(move |_, _, cx| {
+                    ListItem::new(("ade-workspace-item", ix))
+                        .spacing(ListItemSpacing::Sparse)
+                        .indent_level(1)
+                        .toggle_state(is_selected)
+                        .start_slot(Indicator::dot().color(dot_color))
+                        .child(
+                            v_flex()
+                                .w_full()
+                                .min_w_0()
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .min_w_0()
+                                        .gap_1p5()
+                                        .child(
+                                            Label::new(name)
+                                                .color(if is_selected {
+                                                    Color::Accent
+                                                } else {
+                                                    Color::Default
+                                                })
+                                                .truncate(),
+                                        )
+                                        .children(branch.map(|branch| {
+                                            Label::new(branch)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                                .buffer_font(cx)
+                                                .truncate()
+                                        })),
+                                )
+                                .child(
+                                    Label::new(format!(
+                                        "{daemon_workspace_id} · {repository_path}"
+                                    ))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .buffer_font(cx)
+                                    .truncate(),
+                                ),
+                        )
+                        .on_click(move |_, window, cx| {
+                            this_for_click
+                                .update(cx, |this, cx| {
+                                    this.select_workspace(id_for_click.clone(), window, cx)
+                                })
+                                .ok();
+                        })
+                })
+                .menu(move |window, cx| {
+                    let this = this_for_menu.clone();
+                    let id = id_for_menu.clone();
+                    ContextMenu::build(window, cx, move |menu, _, _| {
+                        menu.entry("Reconnect", None, {
+                            let this = this.clone();
+                            let id = id.clone();
+                            move |window, cx| {
+                                this.update(cx, |this, cx| {
+                                    this.select_workspace(id.clone(), window, cx)
+                                })
+                                .ok();
+                            }
+                        })
+                        // Detaches. The session and everything in it survives.
+                        .entry("Stop (detach)", None, {
+                            let this = this.clone();
+                            let id = id.clone();
+                            move |_, cx| {
+                                this.update(cx, |this, cx| this.stop_workspace(id.clone(), cx))
+                                    .ok();
+                            }
+                        })
+                        .separator()
+                        // The only entry that kills, and it says so — and says
+                        // what: every session in the workspace, and the
+                        // workspace record with them.
+                        .entry("Kill workspace…", None, {
+                            let this = this.clone();
+                            let id = id.clone();
+                            move |_, cx| {
+                                this.update(cx, |this, cx| this.kill_workspace(id.clone(), cx))
+                                    .ok();
+                            }
+                        })
+                        // Registry only; never touches the session backend.
+                        .entry("Remove from list", None, {
+                            move |_, cx| {
+                                this.update(cx, |this, cx| this.remove_workspace(id.clone(), cx))
+                                    .ok();
+                            }
+                        })
+                    })
+                })
+        };
+
+        if state != SessionState::Dead {
+            return row.into_any_element();
+        }
+
+        // Dead: say what died and offer the repair, but do not perform it.
+        let session = workspace
+            .terminal_session_id
+            .clone()
+            .unwrap_or_else(|| workspace.tmux_session_name());
+        v_flex()
+            .w_full()
+            .child(row)
+            .child(
+                h_flex()
+                    .pl_6()
+                    .pr_2()
+                    .pb_1()
+                    .gap_1()
+                    .child(
+                        Label::new(format!("Session {session} is gone"))
+                            .size(LabelSize::Small)
+                            .color(Color::Warning)
+                            .truncate(),
+                    )
+                    .child(
+                        Button::new(("ade-recreate-session", ix), "Recreate")
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.recreate_and_attach(id.clone(), window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty_state(&self) -> AnyElement {
+        v_flex()
+            .p_3()
+            .gap_1()
+            .child(Label::new("No workspaces yet").color(Color::Muted))
+            .child(
+                Label::new("Use + to create one from a repository path.")
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .into_any_element()
+    }
+}
+
+/// The status the dot should show, which is the reconciled status except that
+/// a session the backend says is dead reads as disconnected even if the
+/// registry has not been written yet.
+fn workspace_status(workspace: &AdeWorkspace, state: SessionState) -> WorkspaceStatus {
+    match state {
+        SessionState::Dead => WorkspaceStatus::Disconnected,
+        _ => workspace.status,
+    }
+}
+
+impl Render for WorkspaceSidebar {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.rows.clone();
+        let selected_group = self.rows.iter().find_map(|row| match row {
+            SidebarRow::Workspace { workspace, .. }
+                if self.selected.as_ref() == Some(&workspace.id) =>
+            {
+                Some((workspace.remote_host.clone(), workspace.project_id.clone()))
+            }
+            _ => None,
+        });
+        let is_refreshing = self.store.read(cx).is_refreshing();
+
+        v_flex()
+            .key_context("AdeWorkspaceSidebar")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .bg(cx.theme().colors().panel_background)
+            .child(self.render_header(cx))
+            .child(Divider::horizontal())
+            .children(
+                {
+                    let store = self.store.read(cx);
+                    store
+                        .status_stream_error()
+                        .cloned()
+                        .into_iter()
+                        .chain(store.host_errors().iter().cloned())
+                        .chain(store.error().cloned())
+                        .chain(self.error.clone())
+                        .collect::<Vec<_>>()
+                }
+                .into_iter()
+                .map(|error| {
+                    div()
+                        .px_2()
+                        .py_1()
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("ade-workspace-tree")
+                    .flex_1()
+                    .py_1()
+                    .overflow_y_scroll()
+                    .map(|this| {
+                        if rows.is_empty() {
+                            if is_refreshing {
+                                return this;
+                            }
+                            return this.child(self.render_empty_state());
+                        }
+                        this.children(rows.iter().enumerate().map(|(ix, row)| match row {
+                            SidebarRow::Project {
+                                project_id,
+                                remote_host,
+                                live_count,
+                                gone_count,
+                            } => self.render_project_header(
+                                ix,
+                                project_id,
+                                remote_host.as_deref(),
+                                *live_count,
+                                *gone_count,
+                                selected_group.as_ref().is_some_and(
+                                    |(selected_host, selected_project)| {
+                                        selected_host == remote_host
+                                            && selected_project == project_id
+                                    },
+                                ),
+                                cx,
+                            ),
+                            SidebarRow::Workspace { workspace, state } => {
+                                self.render_workspace_row(ix, workspace, *state, cx)
+                            }
+                        }))
+                    }),
+            )
+    }
+}
+
+impl Focusable for WorkspaceSidebar {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<()> for WorkspaceSidebar {}
+
+/// A plain pane item, and **deliberately not a `SerializableItem`**: the view
+/// is a debugging aid, so it must not be restored into a window on the next
+/// launch — the only way back is the command palette.
+impl Item for WorkspaceSidebar {
+    type Event = ();
+
+    fn to_item_events(_: &Self::Event, _: &mut dyn FnMut(workspace::item::ItemEvent)) {}
+
+    fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> AnyElement {
+        h_flex()
+            .gap_1()
+            .when(self.store.read(cx).is_refreshing(), |this| {
+                this.child(SpinnerLabel::new())
+            })
+            .child(Label::new("Workspaces").color(params.text_color()))
+            .into_any_element()
+    }
+
+    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
+        "Workspaces".into()
+    }
+
+    fn telemetry_event_text(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+pub(crate) fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &ToggleWorkspacesView, window, cx| {
+            // Toggle, not activate: a second invocation closes the tab, so the
+            // view is never left resident.
+            let existing = workspace.panes().iter().find_map(|pane| {
+                let item = pane.read(cx).items_of_type::<WorkspaceSidebar>().next()?;
+                Some((pane.clone(), item.entity_id()))
+            });
+            if let Some((pane, item_id)) = existing {
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(item_id, workspace::SaveIntent::Close, window, cx)
+                })
+                .detach_and_log_err(cx);
+                return;
+            }
+
+            let handle = cx.entity().downgrade();
+            let sidebar = cx.new(|cx| WorkspaceSidebar::new(handle, cx));
+            workspace.add_item_to_active_pane(Box::new(sidebar), None, true, window, cx);
+        });
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        AdeWorkspaceRegistry, Attached, SessionBackend, SessionId, SessionInfo, SessionSpec,
+        StatusDelivery,
+    };
+    use gpui::{Subscription, TestAppContext};
+    use std::{
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    struct PromptBackend {
+        calls: AtomicUsize,
+    }
+
+    impl PromptBackend {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn record_call(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SessionBackend for PromptBackend {
+        fn create(&self, _: &SessionSpec) -> Result<SessionId> {
+            self.record_call();
+            anyhow::bail!("unexpected create")
+        }
+
+        fn list(&self) -> Result<Vec<SessionInfo>> {
+            self.record_call();
+            Ok(Vec::new())
+        }
+
+        fn exists(&self, _: &SessionId) -> Result<bool> {
+            self.record_call();
+            Ok(false)
+        }
+
+        fn attach(&self, _: &SessionSpec) -> Result<Attached> {
+            self.record_call();
+            anyhow::bail!("unexpected attach")
+        }
+
+        fn detach(&self, _: &SessionId) -> Result<()> {
+            self.record_call();
+            Ok(())
+        }
+
+        fn kill(&self, _: &SessionId) -> Result<()> {
+            self.record_call();
+            Ok(())
+        }
+
+        fn status_delivery(&self) -> StatusDelivery {
+            StatusDelivery::Push
+        }
+    }
+
+    fn entry(
+        name: &str,
+        project_id: &str,
+        status: WorkspaceStatus,
+        state: SessionState,
+    ) -> (AdeWorkspace, SessionState) {
+        let mut workspace = AdeWorkspace::new(name, project_id, PathBuf::from("/repos/zed"));
+        workspace.status = status;
+        (workspace, state)
+    }
+
+    #[test]
+    fn test_group_rows_preserves_order_and_counts() {
+        let entries = vec![
+            entry("main", "zed", WorkspaceStatus::Running, SessionState::Alive),
+            entry(
+                "elsewhere",
+                "praxis",
+                WorkspaceStatus::Stopped,
+                SessionState::NeverCreated,
+            ),
+            // Back to the first project: it must rejoin its own group rather
+            // than open a second heading.
+            entry(
+                "spike",
+                "zed",
+                WorkspaceStatus::Disconnected,
+                SessionState::Dead,
+            ),
+        ];
+
+        let rows = group_rows(&entries);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0],
+            SidebarRow::Project {
+                project_id: "zed".into(),
+                remote_host: None,
+                live_count: 1,
+                gone_count: 1,
+            }
+        );
+        assert_eq!(
+            rows[1],
+            SidebarRow::Workspace {
+                workspace: entries[0].0.clone(),
+                state: SessionState::Alive,
+            }
+        );
+        assert_eq!(
+            rows[2],
+            SidebarRow::Workspace {
+                workspace: entries[2].0.clone(),
+                state: SessionState::Dead,
+            }
+        );
+        // The second project keeps first-appearance order, so it follows.
+        assert_eq!(
+            rows[3],
+            SidebarRow::Project {
+                project_id: "praxis".into(),
+                remote_host: None,
+                live_count: 0,
+                gone_count: 0,
+            }
+        );
+        assert_eq!(
+            rows[4],
+            SidebarRow::Workspace {
+                workspace: entries[1].0.clone(),
+                state: SessionState::NeverCreated,
+            }
+        );
+    }
+
+    #[test]
+    fn test_group_rows_of_nothing_is_nothing() {
+        assert!(group_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_group_rows_scopes_projects_by_host() {
+        let mut first = entry(
+            "first",
+            "viral-studio",
+            WorkspaceStatus::Running,
+            SessionState::Alive,
+        );
+        first.0.remote_host = Some("user@host-a".into());
+        let mut other_host = entry(
+            "other-host",
+            "viral-studio",
+            WorkspaceStatus::Running,
+            SessionState::Alive,
+        );
+        other_host.0.remote_host = Some("user@host-b".into());
+        let mut second = entry(
+            "second",
+            "viral-studio",
+            WorkspaceStatus::Disconnected,
+            SessionState::Dead,
+        );
+        second.0.remote_host = Some("user@host-a".into());
+        let entries = vec![first, other_host, second];
+
+        let rows = group_rows(&entries);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0],
+            SidebarRow::Project {
+                project_id: "viral-studio".into(),
+                remote_host: Some("user@host-a".into()),
+                live_count: 1,
+                gone_count: 1,
+            }
+        );
+        assert_eq!(
+            rows[3],
+            SidebarRow::Project {
+                project_id: "viral-studio".into(),
+                remote_host: Some("user@host-b".into()),
+                live_count: 1,
+                gone_count: 0,
+            }
+        );
+    }
+
+    #[gpui::test]
+    async fn test_store_reports_its_initial_refresh(cx: &mut TestAppContext) {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_store_initial_refresh").await;
+        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            Arc::new(PromptBackend::new()),
+        ));
+        cx.update(|cx| cx.set_global(crate::GlobalLifecycleService(lifecycle)));
+
+        let store = cx.update(AdeWorkspaceStore::global);
+        assert!(store.read_with(cx, |store, _| store.is_refreshing()));
+        cx.run_until_parked();
+        assert!(!store.read_with(cx, |store, _| store.is_refreshing()));
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_prompt_cancel_does_not_run_and_can_retry(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            cx.set_global(db::AppDatabase::test_new());
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let registry = AdeWorkspaceRegistry::open_test_db("test_cleanup_prompt_cancel").await;
+        let mut dead_workspace = AdeWorkspace::new("gone", "zed", PathBuf::from("/repos/zed"));
+        dead_workspace.status = WorkspaceStatus::Disconnected;
+        dead_workspace.terminal_session_id = Some(dead_workspace.daemon_workspace_id());
+        registry
+            .create_workspace(dead_workspace.clone())
+            .await
+            .expect("dead test workspace should be registered");
+
+        let backend = Arc::new(PromptBackend::new());
+        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            backend.clone(),
+        ));
+        cx.update(|cx| cx.set_global(crate::GlobalLifecycleService(lifecycle.clone())));
+
+        let rows = group_rows(&[(dead_workspace, SessionState::Dead)]);
+        let (sidebar, cx) = cx.add_window_view(|_, cx| WorkspaceSidebar {
+            workspace: WeakEntity::new_invalid(),
+            lifecycle,
+            store: AdeWorkspaceStore::global(cx),
+            focus_handle: cx.focus_handle(),
+            rows,
+            selected: None,
+            error: None,
+            cleanup_in_progress: false,
+            _store_observation: Subscription::new(|| {}),
+        });
+        cx.run_until_parked();
+        let calls_before_prompt = backend.call_count();
+
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.cleanup_gone_workspaces(window, cx);
+        });
+        let (title, detail) = cx.pending_prompt().expect("cleanup confirmation prompt");
+        assert_eq!(title, "Kill and clean up 1 gone workspace?");
+        assert!(
+            detail.contains("If a session starts in one before cleanup finishes"),
+            "the prompt must disclose the final probe-to-kill race: {detail}"
+        );
+        assert!(
+            detail.contains("Other live sessions and repository files are not changed"),
+            "the prompt must identify what remains outside cleanup scope: {detail}"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(backend.call_count(), calls_before_prompt);
+        assert!(!cx.has_pending_prompt());
+
+        sidebar.update_in(cx, |sidebar, window, cx| {
+            sidebar.cleanup_gone_workspaces(window, cx);
+        });
+        assert!(
+            cx.has_pending_prompt(),
+            "cancelling must leave cleanup available for another attempt"
+        );
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+        assert_eq!(backend.call_count(), calls_before_prompt);
+    }
+
+    #[test]
+    fn test_status_colors_come_from_the_status_palette() {
+        assert_eq!(status_color(WorkspaceStatus::Running), Color::Success);
+        assert_eq!(status_color(WorkspaceStatus::Disconnected), Color::Warning);
+        assert_eq!(status_color(WorkspaceStatus::Stopped), Color::Muted);
+        assert_eq!(status_color(WorkspaceStatus::Creating), Color::Muted);
+        assert_eq!(status_color(WorkspaceStatus::Error), Color::Error);
+    }
+
+    #[test]
+    fn test_a_dead_session_reads_disconnected_before_the_registry_catches_up() {
+        let (mut workspace, _) =
+            entry("main", "zed", WorkspaceStatus::Running, SessionState::Alive);
+        // The backend says gone; the row must not still show green.
+        assert_eq!(
+            workspace_status(&workspace, SessionState::Dead),
+            WorkspaceStatus::Disconnected
+        );
+        assert_eq!(
+            status_color(workspace_status(&workspace, SessionState::Dead)),
+            Color::Warning
+        );
+        // Otherwise the reconciled status is taken as-is.
+        assert_eq!(
+            workspace_status(&workspace, SessionState::Alive),
+            WorkspaceStatus::Running
+        );
+        workspace.status = WorkspaceStatus::Error;
+        assert_eq!(
+            workspace_status(&workspace, SessionState::NeverCreated),
+            WorkspaceStatus::Error
+        );
+    }
+}

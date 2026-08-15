@@ -3,15 +3,15 @@ Version=1.0
 Type=Application
 Name=$APP_NAME
 GenericName=Text Editor
-Comment=A high-performance, multiplayer code editor.
+Comment=A native workspace for coding agents, projects, and Git worktrees.
 TryExec=$APP_CLI
 StartupNotify=$DO_STARTUP_NOTIFY
 Exec=$APP_CLI $APP_ARGS
 Icon=$APP_ICON
 Categories=Utility;TextEditor;Development;IDE;
-Keywords=zed;
-# To add Zed to "Open Folder With..." context menu, add `inode/directory` to the MimeType field (semicolon separated)
-# Arch linux users have reported this setting Zed as default file browser. See https://github.com/zed-industries/zed/pull/39076 and related issues.
+Keywords=zorca;agents;git;worktrees;
+# To add ZOrca to "Open Folder With..." context menus, add `inode/directory` to the MimeType field.
+# Some Linux desktops may then treat ZOrca as the default file browser.
 # If this happens to you, an unconfirmed fix may be to install Arch's `gnome-defaults-list` package.
 MimeType=text/plain;application/x-zerosize;x-scheme-handler/zed;
 Actions=NewWorkspace;

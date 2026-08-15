@@ -96,6 +96,7 @@ pub struct ModalHeader {
     children: SmallVec<[AnyElement; 2]>,
     show_dismiss_button: bool,
     show_back_button: bool,
+    on_dismiss: Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
 }
 
 impl Default for ModalHeader {
@@ -113,6 +114,9 @@ impl ModalHeader {
             children: SmallVec::new(),
             show_dismiss_button: false,
             show_back_button: false,
+            on_dismiss: Box::new(|_, window, cx| {
+                window.dispatch_action(menu::Cancel.boxed_clone(), cx);
+            }),
         }
     }
 
@@ -140,6 +144,14 @@ impl ModalHeader {
         self
     }
 
+    pub fn on_dismiss(
+        mut self,
+        handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_dismiss = Box::new(handler);
+        self
+    }
+
     pub fn show_back_button(mut self, show: bool) -> Self {
         self.show_back_button = show;
         self
@@ -155,6 +167,7 @@ impl ParentElement for ModalHeader {
 impl RenderOnce for ModalHeader {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut children = self.children;
+        let on_dismiss = self.on_dismiss;
 
         if let Some(headline) = self.headline {
             children.insert(
@@ -203,9 +216,7 @@ impl RenderOnce for ModalHeader {
                                 this.child(
                                     IconButton::new("dismiss", IconName::Close)
                                         .icon_size(IconSize::Small)
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(menu::Cancel.boxed_clone(), cx);
-                                        }),
+                                        .on_click(on_dismiss),
                                 )
                             }),
                     )

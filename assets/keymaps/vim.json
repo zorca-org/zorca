@@ -359,7 +359,6 @@
       "escape": "vim::NormalBefore",
       "ctrl-x": null,
       "ctrl-x ctrl-o": "editor::ShowCompletions",
-      "ctrl-x ctrl-a": "assistant::InlineAssist", // zed specific
       "ctrl-x ctrl-c": "editor::ShowEditPrediction", // zed specific
       "ctrl-x ctrl-l": "editor::ToggleCodeActions", // zed specific
       "ctrl-x ctrl-z": "editor::Cancel",
@@ -1147,12 +1146,6 @@
       "tab": "editor::AcceptEditPrediction",
     },
   },
-  {
-    "context": "MessageEditor > Editor && VimControl",
-    "bindings": {
-      "enter": "agent::Chat",
-    },
-  },
 
   {
     "context": "SettingsWindow > NavigationMenu && !search",
@@ -1218,7 +1211,6 @@
       "g g": "menu::SelectFirst",
       "shift-g": "menu::SelectLast",
       "/": "agents_sidebar::FocusSidebarFilter",
-      "d d": "agent::RemoveSelectedThread",
       "o": "agents_sidebar::NewThreadInGroup",
       "shift-o": "agents_sidebar::NewThreadInGroup",
       "] p": "multi_workspace::NextProject",

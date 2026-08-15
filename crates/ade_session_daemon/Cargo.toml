@@ -1,0 +1,46 @@
+[package]
+name = "ade_session_daemon"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ade_session_daemon.rs"
+doctest = false
+
+# The binary is `ade-daemon`, not the crate name: `deploy::DEFAULT_BIN_PATH`
+# installs it as `~/.ade/bin/ade-daemon`, the proxy argv names it, and the
+# `attach` argv the workspace backend hands to Zed's terminal names it too.
+# Tests reach it through `CARGO_BIN_EXE_ade-daemon`.
+[[bin]]
+name = "ade-daemon"
+path = "src/main.rs"
+
+[dependencies]
+ade_session.workspace = true
+# The VT emulator behind the per-session screen grid (`grid.rs`), so that an
+# attach can replay a repaint instead of raw scrollback. The same version Zed's
+# own `terminal` crate parses with, which is what makes the daemon's idea of a
+# screen and the client's the same idea.
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true
+libc.workspace = true
+log.workspace = true
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smol.workspace = true
+uuid.workspace = true
+
+# Only `attach` builds here, and only for its console: raw mode is a pair of
+# console modes and there is no SIGWINCH to size the terminal by.
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

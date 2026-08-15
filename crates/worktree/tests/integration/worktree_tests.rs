@@ -2626,7 +2626,6 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         .unwrap();
     assert!(entry.is_file());
 
-    cx.executor().run_until_parked();
     tree_fake.read_with(cx, |tree, _| {
         assert!(
             tree.entry_for_path(rel_path("a/b/c/d.txt"))
@@ -2669,7 +2668,6 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         .unwrap();
     assert!(entry.is_file());
 
-    cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
         assert!(
             tree.entry_for_path(rel_path("a/b/c/d.txt"))
@@ -2696,7 +2694,6 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         .unwrap();
     assert!(entry.is_file());
 
-    cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
         assert!(
             tree.entry_for_path(rel_path("a/b/c/e.txt"))
@@ -2721,7 +2718,6 @@ async fn test_create_dir_all_on_create_entry(cx: &mut TestAppContext) {
         .unwrap();
     assert!(entry.is_file());
 
-    cx.executor().run_until_parked();
     tree_real.read_with(cx, |tree, _| {
         assert!(
             tree.entry_for_path(rel_path("d/e/f/g.txt"))
@@ -4143,6 +4139,49 @@ fn check_worktree_entries(tree: &Worktree, expectations: WorktreeExpectations) {
 }
 
 #[gpui::test]
+async fn test_root_repo_common_dir_is_canonical_before_scan(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let fs = FakeFs::new(executor);
+    fs.insert_tree(
+        path!("/real-repo"),
+        json!({
+            ".git": {},
+            "file.txt": "content",
+        }),
+    )
+    .await;
+    fs.create_symlink(path!("/repo-alias").as_ref(), path!("/real-repo").into())
+        .await
+        .unwrap();
+
+    let tree = Worktree::local(
+        path!("/repo-alias").as_ref(),
+        true,
+        fs,
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.snapshot()
+                .root_repo_common_dir()
+                .map(|path| path.as_ref()),
+            Some(Path::new(path!("/real-repo/.git"))),
+            "repository identity must not depend on which symlink opened it",
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_root_repo_common_dir_for_relative_gitdir(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,
@@ -4191,6 +4230,16 @@ async fn test_root_repo_common_dir_for_relative_gitdir(
     )
     .await
     .unwrap();
+    feature_tree.read_with(cx, |tree, _| {
+        assert_eq!(
+            tree.snapshot()
+                .root_repo_common_dir()
+                .map(|path| path.as_ref()),
+            Some(Path::new(path!("/repo/.git"))),
+            "linked-worktree identity must be available before repository scanning",
+        );
+        assert!(tree.snapshot().root_repo_is_linked_worktree());
+    });
     feature_tree
         .update(cx, |tree, _| tree.as_local().unwrap().scan_complete())
         .await;

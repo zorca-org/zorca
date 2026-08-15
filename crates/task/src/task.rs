@@ -32,10 +32,29 @@ pub use vscode_debug_format::VsCodeDebugTaskFile;
 pub use vscode_format::VsCodeTaskFile;
 pub use zed_actions::RevealTarget;
 
+/// The prefix on the task id of a terminal that is an ADE daemon session's
+/// attach client, rather than a task the user asked to run.
+///
+/// Reserved here because two crates that cannot see each other both need it:
+/// `ade_workspaces` stamps it on when it opens a session terminal, and
+/// `terminal_view` reads it back to tell a session terminal from a task one.
+pub const ADE_SESSION_TASK_PREFIX: &str = "ade-session:";
+
 /// Task identifier, unique within the application.
 /// Based on it, task reruns and terminal tabs are managed.
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 pub struct TaskId(pub String);
+
+impl TaskId {
+    /// Whether this names an ADE daemon session's attach client.
+    ///
+    /// Such a terminal holds nothing of the user's that a prompt could save:
+    /// the process is a client onto a session that lives in the daemon and
+    /// outlives the window, so closing the tab loses only the view of it.
+    pub fn is_ade_session(&self) -> bool {
+        self.0.starts_with(ADE_SESSION_TASK_PREFIX)
+    }
+}
 
 /// Contains all information needed by Zed to spawn a new terminal tab for the given task.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]

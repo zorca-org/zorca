@@ -1,5 +1,6 @@
 use std::{cmp, path::PathBuf, process::ExitStatus, sync::Arc, time::Duration};
 
+use crate::TerminalId;
 use crate::{
     TerminalView, default_working_directory,
     persistence::{
@@ -12,8 +13,8 @@ use db::kvp::KeyValueStore;
 use futures::{channel::oneshot, future::join_all};
 use gpui::{
     Action, Anchor, App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt, WeakEntity,
-    Window, actions,
+    Focusable, Global, IntoElement, ParentElement, Pixels, Render, Styled, Task, TaskExt,
+    WeakEntity, Window, actions,
 };
 use itertools::Itertools;
 use project::{Fs, Project};
@@ -38,9 +39,39 @@ use workspace::{
 };
 
 use anyhow::{Result, anyhow};
-use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
+
+type AddCenterTerminalHook = Arc<
+    dyn Fn(
+            &mut Workspace,
+            Option<TerminalId>,
+            &mut Window,
+            &mut Context<Workspace>,
+        ) -> Option<Task<Result<WeakEntity<Terminal>>>>
+        + Send
+        + Sync,
+>;
+
+struct AddCenterTerminal(AddCenterTerminalHook);
+
+impl Global for AddCenterTerminal {}
+
+/// Lets the owner of a workspace's center pane supply persistent terminals.
+pub fn on_add_center_terminal(
+    cx: &mut App,
+    hook: impl Fn(
+        &mut Workspace,
+        Option<TerminalId>,
+        &mut Window,
+        &mut Context<Workspace>,
+    ) -> Option<Task<Result<WeakEntity<Terminal>>>>
+    + Send
+    + Sync
+    + 'static,
+) {
+    cx.set_global(AddCenterTerminal(Arc::new(hook)));
+}
 
 actions!(
     terminal_panel,
@@ -57,17 +88,15 @@ pub fn init(cx: &mut App) {
         |workspace: &mut Workspace, _window, _: &mut Context<Workspace>| {
             workspace.register_action(TerminalPanel::new_terminal);
             workspace.register_action(TerminalPanel::open_terminal);
+            // These used to toggle the terminal dock. ZOrca has no terminal
+            // dock, so they focus the centre terminal instead, opening one when
+            // the centre has none. Both actions are kept because keymaps and
+            // vim's `:term` still name them.
             workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-                if is_enabled_in_workspace(workspace, cx) {
-                    workspace.toggle_panel_focus::<TerminalPanel>(window, cx);
-                }
+                TerminalPanel::focus_or_open_center_terminal(workspace, window, cx);
             });
             workspace.register_action(|workspace, _: &Toggle, window, cx| {
-                if is_enabled_in_workspace(workspace, cx) {
-                    if !workspace.toggle_panel_focus::<TerminalPanel>(window, cx) {
-                        workspace.close_panel::<TerminalPanel>(window, cx);
-                    }
-                }
+                TerminalPanel::focus_or_open_center_terminal(workspace, window, cx);
             });
         },
     )
@@ -82,7 +111,6 @@ pub struct TerminalPanel {
     pending_serialization: Task<Option<()>>,
     pending_terminals_to_add: usize,
     deferred_tasks: HashMap<TaskId, Task<()>>,
-    assistant_enabled: bool,
     active: bool,
 }
 
@@ -99,18 +127,10 @@ impl TerminalPanel {
             pending_serialization: Task::ready(None),
             pending_terminals_to_add: 0,
             deferred_tasks: HashMap::default(),
-            assistant_enabled: false,
             active: false,
         };
         terminal_panel.apply_tab_bar_buttons(&terminal_panel.active_pane, cx);
         terminal_panel
-    }
-
-    pub fn set_assistant_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        self.assistant_enabled = enabled;
-        for pane in self.center.panes() {
-            self.apply_tab_bar_buttons(pane, cx);
-        }
     }
 
     pub(crate) fn apply_tab_bar_buttons(
@@ -118,7 +138,6 @@ impl TerminalPanel {
         terminal_pane: &Entity<Pane>,
         cx: &mut Context<Self>,
     ) {
-        let assistant_enabled = self.assistant_enabled;
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -166,11 +185,6 @@ impl TerminalPanel {
                                 Some(menu)
                             }),
                     )
-                    .when(assistant_enabled, |this| {
-                        this.when_some(split_context.clone(), |this, focus_handle| {
-                            this.child(InlineAssistTabBarButton { focus_handle })
-                        })
-                    })
                     .child(
                         PopoverMenu::new("terminal-pane-tab-bar-split")
                             .trigger_with_tooltip(
@@ -511,24 +525,16 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
-            return;
-        };
-
-        terminal_panel
-            .update(cx, |panel, cx| {
-                if action.local {
-                    panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
-                } else {
-                    panel.add_terminal_shell(
-                        Some(action.working_directory.clone()),
-                        RevealStrategy::Always,
-                        window,
-                        cx,
-                    )
-                }
-            })
-            .detach_and_log_err(cx);
+        let local = action.local;
+        let working_directory = Some(action.working_directory.clone());
+        Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+            if local {
+                project.create_local_terminal(cx)
+            } else {
+                project.create_terminal_shell(working_directory, cx)
+            }
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn spawn_task(
@@ -619,67 +625,40 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
-        let reveal = spawn_task.reveal;
-        let reveal_target = spawn_task.reveal_target;
-        match reveal_target {
-            RevealTarget::Center => self
-                .workspace
-                .update(cx, |workspace, cx| {
-                    Self::add_center_terminal(workspace, window, cx, |project, cx| {
-                        project.create_terminal_task(spawn_task, cx)
-                    })
+        // Both reveal targets land in the centre. The panel is no longer added
+        // to a dock, so a task honouring `RevealTarget::Dock` would run in a
+        // pane nobody can see.
+        self.workspace
+            .update(cx, |workspace, cx| {
+                Self::add_center_terminal(workspace, window, cx, |project, cx| {
+                    project.create_terminal_task(spawn_task, cx)
                 })
-                .unwrap_or_else(|e| Task::ready(Err(e))),
-            RevealTarget::Dock => self.add_terminal_task(spawn_task, reveal, window, cx),
-        }
+            })
+            .unwrap_or_else(|e| Task::ready(Err(e)))
     }
 
-    /// Create a new Terminal in the current working directory or the user's home directory
+    /// Create a new Terminal in the current working directory or the user's home directory.
+    ///
+    /// ZOrca is terminal-first, so this always opens a centre-pane tab. Upstream
+    /// used the centre only when it already held a focused terminal and fell back
+    /// to the bottom dock otherwise, which is what produced two different kinds of
+    /// "new terminal" for the same action.
     fn new_terminal(
         workspace: &mut Workspace,
         action: &workspace::NewTerminal,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let center_pane = workspace.active_pane();
-        let center_pane_has_focus = center_pane.focus_handle(cx).contains_focused(window, cx);
-        let active_center_item_is_terminal = center_pane
-            .read(cx)
-            .active_item()
-            .is_some_and(|item| item.downcast::<TerminalView>().is_some());
-
-        if center_pane_has_focus && active_center_item_is_terminal {
-            let working_directory = default_working_directory(workspace, cx);
-            let local = action.local;
-            Self::add_center_terminal(workspace, window, cx, move |project, cx| {
-                if local {
-                    project.create_local_terminal(cx)
-                } else {
-                    project.create_terminal_shell(working_directory, cx)
-                }
-            })
-            .detach_and_log_err(cx);
-            return;
-        }
-
-        let Some(terminal_panel) = workspace.panel::<Self>(cx) else {
-            return;
-        };
-
-        terminal_panel
-            .update(cx, |this, cx| {
-                if action.local {
-                    this.add_local_terminal_shell(RevealStrategy::Always, window, cx)
-                } else {
-                    this.add_terminal_shell(
-                        default_working_directory(workspace, cx),
-                        RevealStrategy::Always,
-                        window,
-                        cx,
-                    )
-                }
-            })
-            .detach_and_log_err(cx);
+        let local = action.local;
+        let working_directory = default_working_directory(workspace, cx);
+        Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+            if local {
+                project.create_local_terminal(cx)
+            } else {
+                project.create_terminal_shell(working_directory, cx)
+            }
+        })
+        .detach_and_log_err(cx);
     }
 
     fn terminals_for_task(
@@ -737,6 +716,34 @@ impl TerminalPanel {
         })
     }
 
+    /// Focuses the centre terminal the user most recently looked at, opening a
+    /// new one when the centre holds none.
+    pub fn focus_or_open_center_terminal(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if !is_enabled_in_workspace(workspace, cx) {
+            return;
+        }
+
+        let existing = workspace
+            .panes()
+            .iter()
+            .find_map(|pane| pane.read(cx).items_of_type::<TerminalView>().next());
+
+        if let Some(view) = existing {
+            workspace.activate_item(&view, true, true, window, cx);
+            return;
+        }
+
+        let working_directory = default_working_directory(workspace, cx);
+        Self::add_center_terminal(workspace, window, cx, move |project, cx| {
+            project.create_terminal_shell(working_directory, cx)
+        })
+        .detach_and_log_err(cx);
+    }
+
     pub fn add_center_terminal(
         workspace: &mut Workspace,
         window: &mut Window,
@@ -747,25 +754,176 @@ impl TerminalPanel {
         ) -> Task<Result<Entity<Terminal>>>
         + 'static,
     ) -> Task<Result<WeakEntity<Terminal>>> {
+        Self::add_center_terminal_with_id(workspace, None, window, cx, create_terminal)
+    }
+
+    /// Puts a display-only terminal in the centre pane, tagged with
+    /// `terminal_id`. Display-only because a real PTY is not deterministic
+    /// under the test scheduler.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_test_center_terminal(
+        workspace: &mut Workspace,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        let terminal = cx.new(|cx| {
+            terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx)
+        });
+        let view = cx.new(|cx| {
+            let mut view = TerminalView::new(
+                terminal,
+                workspace.weak_handle(),
+                workspace.database_id(),
+                workspace.project().downgrade(),
+                window,
+                cx,
+            );
+            view.set_terminal_id(terminal_id);
+            view
+        });
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+    }
+
+    /// Activates the centre-pane terminal opened for `terminal_id`, when one
+    /// is still live. Returns false if no view carries that id, leaving the
+    /// caller to decide whether to open one.
+    pub fn activate_center_terminal(
+        workspace: &mut Workspace,
+        terminal_id: TerminalId,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let existing = workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items_of_type::<TerminalView>()
+                .find(|view| view.read(cx).terminal_id() == Some(terminal_id))
+        });
+        match existing {
+            Some(view) => workspace.activate_item(&view, true, focus, window, cx),
+            None => false,
+        }
+    }
+
+    /// Closes the centre-pane terminal opened for `terminal_id`, if one is
+    /// live. Returns false when no view carries that id.
+    pub fn close_center_terminal(
+        workspace: &mut Workspace,
+        terminal_id: TerminalId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let found = workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items_of_type::<TerminalView>()
+                .find(|view| view.read(cx).terminal_id() == Some(terminal_id))
+                .map(|view| (pane.clone(), view.entity_id()))
+        });
+        let Some((pane, item_id)) = found else {
+            return false;
+        };
+        pane.update(cx, |pane, cx| {
+            pane.close_item_by_id(item_id, workspace::SaveIntent::Skip, window, cx)
+        })
+        .detach_and_log_err(cx);
+        true
+    }
+
+    /// As [`Self::add_center_terminal`], but tags the view with the stored
+    /// terminal it was opened for.
+    pub fn add_center_terminal_with_id(
+        workspace: &mut Workspace,
+        terminal_id: Option<TerminalId>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+    ) -> Task<Result<WeakEntity<Terminal>>> {
+        if let Some(hook) = cx
+            .try_global::<AddCenterTerminal>()
+            .map(|hook| hook.0.clone())
+            && let Some(task) = hook(workspace, terminal_id, window, cx)
+        {
+            return task;
+        }
         if !is_enabled_in_workspace(workspace, cx) {
             return Task::ready(Err(anyhow!(
                 "terminal not yet supported for remote projects"
             )));
         }
         let project = workspace.project().downgrade();
+        // The pane sits empty until the terminal lands, which is long enough to
+        // look like nothing happened. Tell it to show progress meanwhile.
+        let pane = workspace.active_pane().downgrade();
+        workspace
+            .active_pane()
+            .update(cx, |pane, cx| pane.begin_pending_item(cx));
         cx.spawn_in(window, async move |workspace, cx| {
+            let result = Self::create_center_terminal(
+                &workspace,
+                &project,
+                terminal_id,
+                create_terminal,
+                cx,
+            )
+            .await;
+            pane.update(cx, |pane, cx| pane.end_pending_item(cx)).ok();
+            result
+        })
+    }
+
+    async fn create_center_terminal(
+        workspace: &WeakEntity<Workspace>,
+        project: &WeakEntity<Project>,
+        terminal_id: Option<TerminalId>,
+        create_terminal: impl FnOnce(
+            &mut Project,
+            &mut Context<Project>,
+        ) -> Task<Result<Entity<Terminal>>>
+        + 'static,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<WeakEntity<Terminal>> {
+        {
             let terminal = project.update(cx, create_terminal)?.await?;
+
+            // An untrusted project shows a folder-trust prompt the user has to
+            // answer. Opening a terminal on top of it both buries the prompt and
+            // starts a shell in a directory they have not vouched for yet.
+            // Asked for AFTER the terminal exists, not before: the prompt is
+            // created later in the open sequence than the terminal is
+            // requested, so a gate captured up front is always already
+            // resolved and waits for nothing.
+            let trust_answered = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.worktree_trust_answered(window, cx)
+            })?;
+            trust_answered.await;
 
             workspace.update_in(cx, |workspace, window, cx| {
                 let terminal_view = cx.new(|cx| {
-                    TerminalView::new(
+                    let mut view = TerminalView::new(
                         terminal.clone(),
                         workspace.weak_handle(),
                         workspace.database_id(),
                         workspace.project().downgrade(),
                         window,
                         cx,
-                    )
+                    );
+                    if let Some(terminal_id) = terminal_id {
+                        view.set_terminal_id(terminal_id);
+                    }
+                    view
                 });
                 // Don't steal focus from an open modal (e.g. the command palette):
                 // a background terminal can finish starting up after the user has
@@ -780,7 +938,7 @@ impl TerminalPanel {
                 );
             })?;
             Ok(terminal.downgrade())
-        })
+        }
     }
 
     pub fn add_terminal_task(
@@ -849,15 +1007,6 @@ impl TerminalPanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<WeakEntity<Terminal>>> {
         self.add_terminal_shell_internal(false, cwd, reveal_strategy, window, cx)
-    }
-
-    fn add_local_terminal_shell(
-        &mut self,
-        reveal_strategy: RevealStrategy,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<WeakEntity<Terminal>>> {
-        self.add_terminal_shell_internal(true, None, reveal_strategy, window, cx)
     }
 
     fn add_terminal_shell_internal(
@@ -1092,10 +1241,6 @@ impl TerminalPanel {
 
     fn has_no_terminals(&self, cx: &App) -> bool {
         self.active_pane.read(cx).items_len() == 0 && self.pending_terminals_to_add == 0
-    }
-
-    pub fn assistant_enabled(&self) -> bool {
-        self.assistant_enabled
     }
 
     /// Returns all panes in the terminal panel.
@@ -1704,38 +1849,79 @@ impl workspace::TerminalProvider for TerminalProvider {
     }
 }
 
-#[derive(IntoElement)]
-struct InlineAssistTabBarButton {
-    focus_handle: FocusHandle,
-}
-
-impl RenderOnce for InlineAssistTabBarButton {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let focus_handle = self.focus_handle;
-        IconButton::new("terminal_inline_assistant", IconName::ZedAssistant)
-            .icon_size(IconSize::Small)
-            .on_click({
-                let focus_handle = focus_handle.clone();
-                move |_, window, cx| {
-                    focus_handle.dispatch_action(&InlineAssist::default(), window, cx);
-                }
-            })
-            .tooltip(move |_window, cx| {
-                Tooltip::for_action_in("Inline Assist", &InlineAssist::default(), &focus_handle, cx)
-            })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::num::NonZero;
+    use std::{
+        num::NonZero,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::*;
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
     use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_center_terminal_entry_points_use_the_owner_hook(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        cx.update({
+            let calls = calls.clone();
+            move |cx| {
+                on_add_center_terminal(cx, move |_, _, _, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Task::ready(Err(anyhow!("terminal owner unavailable"))))
+                });
+            }
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("the workspace window should still be open");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        cx.dispatch_action(workspace::NewCenterTerminal::default());
+        cx.run_until_parked();
+        cx.dispatch_action(workspace::NewTerminal::default());
+        cx.run_until_parked();
+
+        let direct = workspace.update_in(cx, |workspace, window, cx| {
+            TerminalPanel::add_center_terminal(workspace, window, cx, |_, _| {
+                panic!("the fallback must not run while a center owner handles the request")
+            })
+        });
+        direct
+            .await
+            .expect_err("the simulated center owner is unavailable");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| {
+                workspace.active_pane().read(cx).items_len()
+            }),
+            0,
+            "none of the center entry points may bypass its registered owner"
+        );
+        assert!(
+            !workspace.read_with(cx, |workspace, cx| {
+                workspace.active_pane().read(cx).has_pending_item()
+            }),
+            "an owner failure must not leave the empty pane loading forever"
+        );
+    }
 
     #[test]
     fn test_prepare_empty_task() {
@@ -1911,7 +2097,13 @@ mod tests {
         let result = window_handle
             .update(cx, |_, window, cx| {
                 terminal_panel.update(cx, |terminal_panel, cx| {
-                    terminal_panel.add_local_terminal_shell(RevealStrategy::Always, window, cx)
+                    terminal_panel.add_terminal_shell_internal(
+                        true,
+                        None,
+                        RevealStrategy::Always,
+                        window,
+                        cx,
+                    )
                 })
             })
             .unwrap()
@@ -1966,6 +2158,112 @@ mod tests {
     }
 
     #[gpui::test]
+    /// A terminal requested while the folder-trust prompt is already up must
+    /// not open until the user answers it.
+    ///
+    /// Scope, so this is not read as more than it is: the prompt exists before
+    /// the request here. It does NOT cover the New Worktree ordering, where the
+    /// request precedes the prompt — the current gate handles that only because
+    /// real terminal creation is slow enough for the prompt to appear first,
+    /// which a display-only terminal in a test is not. Covering that needs the
+    /// gate keyed on trust state rather than on a modal being present.
+    #[gpui::test]
+    async fn test_center_terminal_waits_for_the_trust_answer(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/probe", serde_json::json!({ "README.md": "" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/probe".as_ref()], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let (worktree_store, worktree_id) = project.read_with(cx, |project, cx| {
+            let worktree_id = project
+                .worktrees(cx)
+                .next()
+                .expect("the project has a worktree")
+                .read(cx)
+                .id();
+            (project.worktree_store(), worktree_id)
+        });
+
+        cx.update(|_window, cx| {
+            project::trusted_worktrees::init(Default::default(), cx);
+            project::trusted_worktrees::track_worktree_trust(
+                worktree_store.clone(),
+                None,
+                None,
+                None,
+                cx,
+            );
+            let trusted = project::trusted_worktrees::TrustedWorktrees::try_get_global(cx)
+                .expect("initialised above");
+            trusted.update(cx, |trusted, cx| {
+                let mut restricted = collections::HashSet::default();
+                restricted.insert(project::trusted_worktrees::PathTrust::Worktree(worktree_id));
+                trusted.restrict(worktree_store.downgrade(), restricted, cx);
+            });
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.show_worktree_trust_security_modal(false, window, cx);
+        });
+        let modal = workspace
+            .read_with(cx, |workspace, cx| {
+                workspace.active_modal::<workspace::security_modal::SecurityModal>(cx)
+            })
+            .expect("a restricted worktree must raise the trust prompt");
+
+        // Requested but deliberately not awaited: the task is what has to stay
+        // pending until the prompt is answered.
+        workspace.update_in(cx, |workspace, window, cx| {
+            TerminalPanel::add_center_terminal(workspace, window, cx, |_, cx| {
+                let terminal = cx.new(|cx| {
+                    terminal::TerminalBuilder::new_display_only(
+                        terminal::terminal_settings::CursorShape::default(),
+                        terminal::terminal_settings::AlternateScroll::On,
+                        None,
+                        0,
+                        cx.background_executor(),
+                        util::paths::PathStyle::local(),
+                    )
+                    .subscribe(cx)
+                });
+                gpui::Task::ready(Ok(terminal))
+            })
+            .detach();
+        });
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items_len(),
+                0,
+                "the terminal must not open while the trust prompt is unanswered"
+            );
+        });
+
+        modal.update_in(cx, |modal, _window, cx| modal.answer_for_test(true, cx));
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace.active_pane().read(cx).items_len(),
+                1,
+                "once answered, the waiting terminal opens"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_center_terminal_keeps_focus_on_active_modal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
@@ -2009,6 +2307,44 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_center_pane_stops_pending_when_terminal_creation_fails(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+
+        let task = workspace.update_in(cx, |workspace, window, cx| {
+            let task = TerminalPanel::add_center_terminal(workspace, window, cx, |_, _| {
+                gpui::Task::ready(Err(anyhow!("no terminal for you")))
+            });
+            assert!(
+                workspace.active_pane().read(cx).has_pending_item(),
+                "the pane should report progress while the terminal is being created"
+            );
+            task
+        });
+        task.await
+            .expect_err("terminal creation was rigged to fail");
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            assert!(
+                !workspace.active_pane().read(cx).has_pending_item(),
+                "a failed creation must clear the pending state, or the pane spins forever"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_center_terminal_takes_focus_without_modal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
@@ -2041,47 +2377,6 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn test_inline_assist_tooltip_shows_keybinding_of_active_terminal(
-        cx: &mut TestAppContext,
-    ) {
-        cx.executor().allow_parking();
-        init_test(cx);
-
-        cx.update(|cx| {
-            cx.bind_keys([gpui::KeyBinding::new(
-                "ctrl-enter",
-                InlineAssist::default(),
-                Some("Terminal"),
-            )])
-        });
-
-        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
-        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
-
-        terminal_panel.update(cx, |panel, cx| panel.set_assistant_enabled(true, cx));
-        terminal_panel
-            .update_in(cx, |panel, window, cx| {
-                panel.add_terminal_shell(None, RevealStrategy::Always, window, cx)
-            })
-            .await
-            .unwrap();
-        cx.run_until_parked();
-
-        let button_bounds = cx
-            .debug_bounds("ICON-ZedAssistant")
-            .expect("inline assist button should be rendered in the terminal tab bar");
-        cx.simulate_mouse_move(button_bounds.center(), None, Modifiers::default());
-
-        cx.executor().advance_clock(Duration::from_millis(600));
-        cx.run_until_parked();
-
-        assert!(
-            cx.debug_bounds("KEY_BINDING-enter").is_some(),
-            "tooltip should show the InlineAssist keybinding resolved in the terminal's context"
-        );
-    }
-
     async fn init_workspace_with_panel(
         cx: &mut TestAppContext,
     ) -> (gpui::WindowHandle<MultiWorkspace>, Entity<TerminalPanel>) {
@@ -2104,7 +2399,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_terminal_opens_in_panel_by_default(cx: &mut TestAppContext) {
+    async fn test_new_terminal_opens_in_center_by_default(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
 
@@ -2152,14 +2447,60 @@ mod tests {
             .expect("Failed to read center pane items");
 
         assert_eq!(
-            panel_items_after,
-            panel_items_before + 1,
-            "Terminal should be added to the panel when no center terminal is focused"
+            panel_items_after, panel_items_before,
+            "ZOrca opens every new terminal in the center pane"
         );
         assert_eq!(
-            center_items_after, center_items_before,
-            "Center pane should not gain a new terminal"
+            center_items_after,
+            center_items_before + 1,
+            "The center pane should gain the new terminal"
         );
+    }
+
+    #[gpui::test]
+    async fn test_open_terminal_does_not_require_a_docked_panel(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let working_directory = std::env::current_dir().expect("current directory");
+
+        window_handle
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    assert!(workspace.panel::<TerminalPanel>(cx).is_none());
+                    TerminalPanel::open_terminal(
+                        workspace,
+                        &workspace::OpenTerminal {
+                            working_directory: working_directory.clone(),
+                            local: false,
+                        },
+                        window,
+                        cx,
+                    );
+                })
+            })
+            .expect("open terminal action");
+
+        cx.run_until_parked();
+
+        window_handle
+            .update(cx, |multi_workspace, _, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                assert!(
+                    workspace
+                        .active_pane()
+                        .read(cx)
+                        .active_item()
+                        .and_then(|item| item.downcast::<TerminalView>())
+                        .is_some(),
+                    "the center pane should contain the opened terminal"
+                );
+            })
+            .expect("inspect opened terminal");
     }
 
     #[gpui::test]
@@ -2255,7 +2596,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_terminal_opens_in_panel_when_panel_focused(cx: &mut TestAppContext) {
+    async fn test_new_terminal_opens_in_center_when_panel_focused(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
 
@@ -2321,13 +2662,13 @@ mod tests {
             .expect("Failed to read center pane items");
 
         assert_eq!(
-            panel_items_after,
-            panel_items_before + 1,
+            panel_items_after, panel_items_before,
             "New terminal should be added to the panel when panel is focused"
         );
         assert_eq!(
-            center_items_after, center_items_before,
-            "Center pane should not gain a new terminal"
+            center_items_after,
+            center_items_before + 1,
+            "The center pane should gain the new terminal"
         );
     }
 
@@ -2422,7 +2763,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_new_terminal_opens_in_panel_when_panel_focused_and_center_has_terminal(
+    async fn test_new_terminal_opens_in_center_when_panel_focused_and_center_has_terminal(
         cx: &mut TestAppContext,
     ) {
         cx.executor().allow_parking();
@@ -2502,12 +2843,12 @@ mod tests {
             .expect("Failed to read center pane items");
 
         assert_eq!(
-            panel_items_after,
-            panel_items_before + 1,
+            panel_items_after, panel_items_before,
             "New terminal should go to panel when panel is focused, even if center has a terminal"
         );
         assert_eq!(
-            center_items_after, center_items_before,
+            center_items_after,
+            center_items_before + 1,
             "Center pane should not gain a new terminal when panel is focused"
         );
     }

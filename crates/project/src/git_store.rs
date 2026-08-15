@@ -3251,13 +3251,58 @@ impl GitStore {
         let old_path = PathBuf::from(envelope.payload.old_path);
         let new_path = PathBuf::from(envelope.payload.new_path);
 
-        repository_handle
+        let rename_result = repository_handle
             .update(&mut cx, |repository_handle, _| {
-                repository_handle.rename_worktree(old_path, new_path)
+                repository_handle.rename_worktree(old_path.clone(), new_path.clone())
             })
-            .await??;
+            .await?;
+        if let Err(error) = rename_result {
+            let worktrees = repository_handle
+                .update(&mut cx, |repository_handle, _| {
+                    repository_handle.worktrees()
+                })
+                .await??;
+            if !Self::worktree_rename_has_converged(&worktrees, &old_path, &new_path) {
+                return Err(error);
+            }
+        }
+
+        let worktree_store = this.read_with(&cx, |this, _| this.worktree_store.clone());
+        worktree_store.update(&mut cx, |worktree_store, cx| {
+            Self::update_worktree_paths_after_rename(worktree_store, &old_path, &new_path, cx);
+        });
 
         Ok(proto::Ack {})
+    }
+
+    fn update_worktree_paths_after_rename(
+        worktree_store: &mut WorktreeStore,
+        old_path: &Path,
+        new_path: &Path,
+        cx: &mut Context<WorktreeStore>,
+    ) {
+        let updates = worktree_store
+            .worktrees()
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                let worktree_path = worktree.abs_path();
+                let suffix = worktree_path.strip_prefix(old_path).ok()?;
+                Some((worktree.id(), new_path.join(suffix)))
+            })
+            .collect::<Vec<_>>();
+        for (worktree_id, path) in updates {
+            worktree_store.update_worktree_abs_path(worktree_id, &path, cx);
+        }
+    }
+
+    fn worktree_rename_has_converged(
+        worktrees: &[GitWorktree],
+        old_path: &Path,
+        new_path: &Path,
+    ) -> bool {
+        let old_registered = worktrees.iter().any(|worktree| worktree.path == old_path);
+        let new_registered = worktrees.iter().any(|worktree| worktree.path == new_path);
+        !old_registered && new_registered
     }
 
     async fn handle_worktree_created_at(
@@ -8413,17 +8458,12 @@ impl Repository {
             move |repo, cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, fs, .. }) => {
-                        // When forcing, delete the worktree directory ourselves before
-                        // invoking git. `git worktree remove` can remove the admin
-                        // metadata in `.git/worktrees/<name>` but fail to delete the
-                        // working directory (it continues past directory-removal errors),
-                        // leaving an orphaned folder on disk. Deleting first guarantees
-                        // the directory is gone, and `git worktree remove --force`
-                        // tolerates a missing working tree while cleaning up the admin
-                        // entry. We keep this inside the `Local` arm so that for remote
-                        // projects the deletion runs on the remote machine (where the
-                        // `GitRemoveWorktree` RPC is handled against the local repo on
-                        // the headless server) using its own filesystem.
+                        // Git refuses to remove a registered checkout that still exists
+                        // after its `.git` file has disappeared. Removing that stale
+                        // directory first lets `git worktree remove --force` prune the
+                        // surviving admin entry. Valid checkouts must remain until Git
+                        // accepts the removal, otherwise a locked-worktree error would
+                        // leave the checkout deleted but its metadata registered.
                         //
                         // After a successful removal, also delete any empty ancestor
                         // directories between the worktree path and the configured
@@ -8432,21 +8472,70 @@ impl Repository {
                         // Non-force removals are left untouched before git runs:
                         // `git worktree remove` must see the dirty working tree to
                         // refuse the operation.
-                        if force {
+                        let was_registered = backend
+                            .worktrees()
+                            .await?
+                            .iter()
+                            .any(|worktree| worktree.path == path);
+                        let stale_checkout = force
+                            && fs.is_dir(&path).await
+                            && fs.metadata(&path.join(".git")).await?.is_none();
+                        if stale_checkout {
                             fs.remove_dir(
                                 &path,
                                 RemoveOptions {
-                                    recursive: true,
-                                    ignore_if_not_exists: true,
+                                    recursive: false,
+                                    ignore_if_not_exists: false,
                                 },
                             )
                             .await
-                            .with_context(|| {
-                                format!("failed to delete worktree directory '{}'", path.display())
-                            })?;
+                            .context("removing empty stale worktree before pruning metadata")?;
                         }
 
-                        backend.remove_worktree(path.clone(), force).await?;
+                        if let Err(error) = backend.remove_worktree(path.clone(), force).await {
+                            let registration_removed = was_registered
+                                && match backend.worktrees().await {
+                                Ok(worktrees) => {
+                                    worktrees.iter().all(|worktree| worktree.path != path)
+                                }
+                                Err(scan_error) => {
+                                    log::warn!(
+                                        "Failed to rescan worktrees after removal error: {scan_error:#}"
+                                    );
+                                    false
+                                }
+                            };
+                            if !registration_removed {
+                                if stale_checkout {
+                                    fs.create_dir(&path).await.context(
+                                        "restoring stale worktree after Git rejected removal",
+                                    )?;
+                                }
+                                return Err(error);
+                            }
+                            log::warn!(
+                                "Git removed worktree registration for '{}' but reported an error: {error:#}",
+                                path.display()
+                            );
+                        }
+
+                        if force && !stale_checkout {
+                            if let Err(error) = fs
+                                .remove_dir(
+                                    &path,
+                                    RemoveOptions {
+                                        recursive: true,
+                                        ignore_if_not_exists: true,
+                                    },
+                                )
+                                .await
+                            {
+                                log::warn!(
+                                    "Failed to delete removed worktree directory '{}': {error:#}",
+                                    path.display()
+                                );
+                            }
+                        }
 
                         let managed_worktree_base = cx.update(|cx| {
                             let setting = &ProjectSettings::get_global(cx).git.worktree_directory;
@@ -9734,6 +9823,10 @@ pub fn linked_worktree_short_name(
     Some(name.into())
 }
 
+pub fn worktree_display_name(main_worktree_path: &Path, worktree_path: &Path) -> SharedString {
+    linked_worktree_short_name(main_worktree_path, worktree_path).unwrap_or_else(|| "main".into())
+}
+
 fn get_permalink_in_rust_registry_src(
     provider_registry: Arc<GitHostingProviderRegistry>,
     path: PathBuf,
@@ -10155,14 +10248,17 @@ impl Repository {
 mod tests {
     use super::*;
     use crate::Project;
-    use fs::{FakeFs, Fs};
+    use fs::{FakeFs, Fs, RenameOptions};
     use git::repository::{RepoPath, repo_path};
     use gpui::TestAppContext;
     use gpui::proptest::prelude::*;
     use rand::{SeedableRng, rngs::StdRng};
     use serde_json::json;
     use settings::SettingsStore;
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::atomic::AtomicUsize,
+    };
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -10301,6 +10397,111 @@ mod tests {
             path,
             PathBuf::from("/home/user/dev/worktrees/lsp-tests/nimble-sky/lsp-tests")
         );
+    }
+
+    #[gpui::test]
+    async fn test_remote_rename_updates_exact_and_nested_worktree_roots(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/worktrees",
+            json!({
+                "source": {
+                    ".git": {},
+                    "nested": { "file.txt": "content" },
+                },
+                "unrelated": { "file.txt": "keep" },
+            }),
+        )
+        .await;
+        let old_path = Path::new("/worktrees/source");
+        let nested_path = Path::new("/worktrees/source/nested");
+        let unrelated_path = Path::new("/worktrees/unrelated");
+        let project = Project::test(fs.clone(), [old_path, unrelated_path], cx).await;
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let nested_worktree = Worktree::local(
+            nested_path,
+            true,
+            fs.clone(),
+            Arc::new(AtomicUsize::new(1)),
+            false,
+            WorktreeId::from_proto(1000),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+        worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.add(&nested_worktree, cx);
+        });
+
+        fs.rename(
+            old_path,
+            Path::new("/worktrees/renamed"),
+            RenameOptions::default(),
+        )
+        .await
+        .unwrap();
+        worktree_store.update(cx, |worktree_store, cx| {
+            GitStore::update_worktree_paths_after_rename(
+                worktree_store,
+                old_path,
+                Path::new("/worktrees/renamed"),
+                cx,
+            );
+        });
+
+        let paths = worktree_store.read_with(cx, |worktree_store, cx| {
+            worktree_store
+                .worktrees()
+                .map(|worktree| worktree.read(cx).abs_path())
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.as_ref() == Path::new("/worktrees/renamed"))
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.as_ref() == Path::new("/worktrees/renamed/nested"))
+        );
+        assert!(paths.iter().any(|path| path.as_ref() == unrelated_path));
+        assert!(paths.iter().all(|path| !path.starts_with(old_path)));
+    }
+
+    #[test]
+    fn test_worktree_rename_convergence_requires_exact_destination_registration() {
+        let old_path = Path::new("/worktrees/source");
+        let new_path = Path::new("/worktrees/renamed");
+        let worktree = |path: &Path| GitWorktree {
+            path: path.to_path_buf(),
+            sha: "abc123".into(),
+            ref_name: Some("refs/heads/feature".into()),
+            is_main: false,
+            is_bare: false,
+        };
+
+        assert!(GitStore::worktree_rename_has_converged(
+            &[worktree(new_path)],
+            old_path,
+            new_path
+        ));
+        assert!(!GitStore::worktree_rename_has_converged(
+            &[worktree(old_path), worktree(new_path)],
+            old_path,
+            new_path
+        ));
+        assert!(!GitStore::worktree_rename_has_converged(
+            &[worktree(Path::new("/worktrees/renamed/source"))],
+            old_path,
+            new_path
+        ));
+        assert!(!GitStore::worktree_rename_has_converged(
+            &[],
+            old_path,
+            new_path
+        ));
     }
 
     fn verify_invariants(repository: &Repository) -> anyhow::Result<()> {

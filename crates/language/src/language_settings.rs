@@ -474,11 +474,6 @@ pub struct EditPredictionSettings {
     pub mode: settings::EditPredictionsMode,
     /// Settings specific to GitHub Copilot.
     pub copilot: CopilotSettings,
-    /// Settings specific to Codestral.
-    pub codestral: CodestralSettings,
-    /// Settings specific to Ollama.
-    pub ollama: Option<OpenAiCompatibleEditPredictionSettings>,
-    pub open_ai_compatible_api: Option<OpenAiCompatibleEditPredictionSettings>,
     /// Controls whether training data collection is enabled.
     ///
     /// `Default` means the value stored in the legacy KV store is used as a fallback,
@@ -848,39 +843,6 @@ impl settings::Settings for AllLanguageSettings {
             enable_next_edit_suggestions: copilot.enable_next_edit_suggestions,
         };
 
-        let codestral = edit_predictions.codestral.unwrap();
-        let codestral_settings = CodestralSettings {
-            model: codestral.model,
-            max_tokens: codestral.max_tokens,
-            api_url: codestral.api_url,
-        };
-
-        let ollama = edit_predictions.ollama.unwrap();
-        let ollama_settings = ollama
-            .model
-            .filter(|model| !model.0.is_empty())
-            .map(|model| OpenAiCompatibleEditPredictionSettings {
-                model: model.0,
-                max_output_tokens: ollama.max_output_tokens.unwrap(),
-                api_url: ollama.api_url.unwrap().into(),
-                prompt_format: ollama.prompt_format.unwrap().into(),
-            });
-        let openai_compatible_settings = edit_predictions.open_ai_compatible_api.unwrap();
-        let openai_compatible_settings = openai_compatible_settings
-            .model
-            .filter(|model| !model.is_empty())
-            .zip(
-                openai_compatible_settings
-                    .api_url
-                    .filter(|api_url| !api_url.is_empty()),
-            )
-            .map(|(model, api_url)| OpenAiCompatibleEditPredictionSettings {
-                model,
-                max_output_tokens: openai_compatible_settings.max_output_tokens.unwrap(),
-                api_url: api_url.into(),
-                prompt_format: openai_compatible_settings.prompt_format.unwrap().into(),
-            });
-
         let mut file_types: FxHashMap<Arc<str>, (GlobSet, Vec<String>)> = FxHashMap::default();
 
         for (language, patterns) in all_languages.file_types.iter().flatten() {
@@ -918,9 +880,6 @@ impl settings::Settings for AllLanguageSettings {
                     .collect(),
                 mode: edit_predictions_mode,
                 copilot: copilot_settings,
-                codestral: codestral_settings,
-                ollama: ollama_settings,
-                open_ai_compatible_api: openai_compatible_settings,
                 allow_data_collection: edit_predictions.allow_data_collection.unwrap_or_default(),
             },
             defaults: default_language_settings,

@@ -134,6 +134,10 @@ Other entities can then register a callback to handle these events by doing `cx.
 ## Build guidelines
 
 - Use `./script/clippy` instead of `cargo clippy`
+- During implementation, run the narrowest relevant test command by itself. Run `cargo fmt --all`, `git diff --check`, and broader validation during final verification instead of chaining them before each test run.
+- Use `cargo check -p <crate>` when only compile validation is needed; use `cargo build` only when a linked artifact is required.
+- Keep the Cargo profile, features, target, `RUSTFLAGS`, and `CARGO_TARGET_DIR` consistent between iterative runs; changing them creates separate artifacts and can recompile the dependency graph.
+- Do not set `CARGO_BUILD_JOBS` above Cargo's default. Cargo already uses the available logical CPUs, while oversubscription increases contention and memory use without accelerating large single-crate frontend work.
 
 # Pull request hygiene
 
@@ -155,15 +159,12 @@ Release Notes:
 - N/A
 ```
 
-# Crash Investigation
-
-## Sentry Integration
-- Crash investigation prompts: `.factory/prompts/crash/investigate.md`
-- Crash fix prompts: `.factory/prompts/crash/fix.md`
-- Fetch crash reports: `script/sentry-fetch <issue-id>`
-- Generate investigation prompt from crash: `script/crash-to-prompt <issue-id>`
-
 # Rules Hygiene
+
+## Coding executor task sizing
+
+- Split implementation and verification work into small, bounded executor tasks with one coherent objective each.
+- Choose a generous but finite timeout for the first executor call, sized for the task and its expected test or build time, instead of relying on a timeout retry.
 
 These `.rules` files are read by every agent session. Keep them high-signal.
 

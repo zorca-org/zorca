@@ -1,7 +1,9 @@
 mod persistence;
 pub mod terminal_element;
+pub mod terminal_id;
 pub mod terminal_panel;
 mod terminal_path_like_target;
+pub use terminal_id::TerminalId;
 pub mod terminal_scrollbar;
 
 use editor::{
@@ -59,7 +61,7 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
-use zed_actions::{agent::AddSelectionToThread, assistant::InlineAssist};
+use zed_actions::agent::AddSelectionToThread;
 
 struct ImeState {
     marked_text: String,
@@ -129,6 +131,10 @@ pub struct BlockContext<'a, 'b> {
 ///A terminal view, maintains the PTY's file handles and communicates with the terminal
 pub struct TerminalView {
     terminal: Entity<Terminal>,
+    /// Identity of the stored terminal this view is showing, when it was
+    /// opened from one. Lets a caller holding only a `TerminalId` find the
+    /// live view instead of spawning a second shell for the same entry.
+    terminal_id: Option<TerminalId>,
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
     focus_handle: FocusHandle,
@@ -211,6 +217,16 @@ impl Focusable for TerminalView {
 }
 
 impl TerminalView {
+    /// Ties this view to a stored terminal entry, so later activations find
+    /// it rather than opening a duplicate.
+    pub fn set_terminal_id(&mut self, terminal_id: TerminalId) {
+        self.terminal_id = Some(terminal_id);
+    }
+
+    pub fn terminal_id(&self) -> Option<TerminalId> {
+        self.terminal_id
+    }
+
     ///Create a new Terminal in the current working directory or the user's home directory
     pub fn deploy(
         workspace: &mut Workspace,
@@ -279,6 +295,7 @@ impl TerminalView {
 
         Self {
             terminal,
+            terminal_id: None,
             workspace: workspace_handle,
             project,
             has_bell: false,
@@ -413,6 +430,14 @@ impl TerminalView {
         self.has_bell
     }
 
+    /// Raises the bell without a PTY behind it, so notification behaviour can
+    /// be tested deterministically.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_has_bell_for_test(&mut self, has_bell: bool, cx: &mut Context<Self>) {
+        self.has_bell = has_bell;
+        cx.notify();
+    }
+
     pub fn custom_title(&self) -> Option<&str> {
         self.custom_title.as_deref()
     }
@@ -520,19 +545,10 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let assistant_enabled = self
-            .workspace
-            .upgrade()
-            .and_then(|workspace| workspace.read(cx).panel::<TerminalPanel>(cx))
-            .is_some_and(|terminal_panel| terminal_panel.read(cx).assistant_enabled());
         let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
             menu.context(self.focus_handle.clone())
                 .when(self.shows_workspace_actions(), |menu| {
                     menu.action("New Terminal", Box::new(NewTerminal::default()))
-                        .action(
-                            "New Center Terminal",
-                            Box::new(NewCenterTerminal::default()),
-                        )
                         .separator()
                 })
                 .action("Copy", Box::new(Copy))
@@ -548,14 +564,17 @@ impl TerminalView {
                     !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| menu.action("Clear", Box::new(Clear)),
                 )
+                // ponytail: was also gated on TerminalPanel::assistant_enabled, which died
+                // with the inline-assist subsystem. This whole entry goes in the agent-removal stage.
                 .when(
-                    assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
+                    !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
-                        menu.separator()
-                            .action("Inline Assist", Box::new(InlineAssist::default()))
-                            .when(has_selection && self.shows_workspace_actions(), |menu| {
+                        menu.separator().when(
+                            has_selection && self.shows_workspace_actions(),
+                            |menu| {
                                 menu.action("Add to Agent Thread", Box::new(AddSelectionToThread))
-                            })
+                            },
+                        )
                     },
                 )
                 .when(self.shows_workspace_actions(), |menu| {
@@ -1463,6 +1482,9 @@ impl Item for TerminalView {
             .filter(|title| !title.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| terminal.title(true));
+        let hide_play_icon = terminal.task().is_some_and(|task| {
+            task.spawned_task.id.is_ade_session() && task.status == TaskStatus::Running
+        });
 
         let (icon, icon_color, rerun_button) = match terminal.task() {
             Some(terminal_task) => match &terminal_task.status {
@@ -1503,6 +1525,7 @@ impl Item for TerminalView {
             })
             .child(
                 h_flex()
+                    .when(hide_play_icon, |this| this.hidden())
                     .group("term-tab-icon")
                     .child(
                         div()
@@ -1773,6 +1796,13 @@ impl Item for TerminalView {
 
     fn is_dirty(&self, cx: &App) -> bool {
         match self.terminal.read(cx).task() {
+            // **An ADE session's attach client is not unsaved work.** It is
+            // running by design and always will be — the session lives in the
+            // daemon and outlives the window — so Zed's "a running task is
+            // something you could lose" rule reads every one of them as dirty,
+            // and closing a window full of daemon terminals asks the user
+            // whether to save changes in files that are not files.
+            Some(task) if task.spawned_task.id.is_ade_session() => false,
             Some(task) => task.status == TaskStatus::Running,
             None => self.has_bell(),
         }

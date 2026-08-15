@@ -1430,7 +1430,9 @@ fn test_enclosing_bracket_ranges(cx: &mut App) {
 }
 
 #[gpui::test]
-fn test_bracket_colorization_indices_remain_stable_across_row_chunks(cx: &mut App) {
+fn test_bracket_colorization_indices_remain_stable_across_row_chunks(
+    cx: &mut gpui::TestAppContext,
+) {
     let mut text = String::from("{\n  \"theme\": {\n");
     let mut property_object_open_offsets = Vec::new();
     for index in 0..500 {
@@ -1445,6 +1447,7 @@ fn test_bracket_colorization_indices_remain_stable_across_row_chunks(cx: &mut Ap
     );
 
     let buffer = cx.new(|cx| Buffer::local(text.clone(), cx).with_language(json_lang(), cx));
+    cx.run_until_parked();
     let snapshot = buffer.update(cx, |buffer, _| buffer.snapshot());
 
     let late_open_offset = property_object_open_offsets[400];

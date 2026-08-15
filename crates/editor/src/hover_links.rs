@@ -2278,6 +2278,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree observe the new file: `find_file` resolves relative
+        // paths against worktree entries, not against the file system.
+        cx.run_until_parked();
 
         // file2.rs:5:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2354,6 +2357,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree observe the new file: `find_file` resolves relative
+        // paths against worktree entries, not against the file system.
+        cx.run_until_parked();
 
         // file2.rs:3 should be highlighted and clickable
         cx.set_state(indoc! {"
@@ -2411,6 +2417,9 @@ Sentence ending file2.rs.
                 "line 1\nline 2\nline 3\n".as_bytes().to_vec(),
             )
             .await;
+        // Let the worktree observe the new file: `find_file` resolves relative
+        // paths against worktree entries, not against the file system.
+        cx.run_until_parked();
 
         // file2.rs:2:in should resolve to file2.rs line 2 (like Ruby backtraces)
         cx.set_state(indoc! {"
@@ -2469,6 +2478,9 @@ Sentence ending file2.rs.
                     .to_vec(),
             )
             .await;
+        // Let the worktree observe the new file: `find_file` resolves relative
+        // paths against worktree entries, not against the file system.
+        cx.run_until_parked();
 
         // Markdown link [text](file2.rs:3:2) should highlight only the inner link,
         // not the surrounding markdown syntax.

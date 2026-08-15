@@ -27,6 +27,17 @@ fn main() {
         let git_sha = git_sha.trim();
 
         println!("cargo:rustc-env=ZED_COMMIT_SHA={git_sha}");
+        let source_is_dirty = Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=no"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+            .unwrap_or(true);
+        println!(
+            "cargo:rustc-env=ZED_SOURCE_DIRTY={}",
+            if source_is_dirty { 1 } else { 0 }
+        );
     }
     if let Some(build_identifier) = option_env!("GITHUB_RUN_NUMBER") {
         println!("cargo:rustc-env=ZED_BUILD_ID={build_identifier}");

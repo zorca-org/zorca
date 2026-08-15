@@ -40,6 +40,15 @@ pub struct SecurityModal {
     trust_path_input: Entity<InputField>,
 }
 
+/// Whether a refresh may replace the prompt's restricted paths.
+///
+/// Emptying the set makes `Render` dismiss the prompt, so doing it before the
+/// user has answered closes the question on their behalf — which is exactly
+/// what a trust prompt must never do.
+fn refresh_may_apply(new_is_empty: bool, answered: bool) -> bool {
+    answered || !new_is_empty
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct RestrictedPath {
     abs_path: Arc<Path>,
@@ -79,6 +88,12 @@ impl ModalView for SecurityModal {
 impl Render for SecurityModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.restricted_paths.is_empty() {
+            // Only reachable once the user has answered — `refresh_restricted_paths`
+            // refuses to empty an unanswered prompt — so recording the answer here
+            // is safe and is what lets `on_before_dismiss` through.
+            if self.trusted.is_none() {
+                self.trusted = Some(true);
+            }
             self.dismiss(cx);
             return v_flex().into_any_element();
         }
@@ -460,6 +475,14 @@ impl SecurityModal {
         projects.next().is_none().then_some(only)
     }
 
+    /// Answers the prompt as the user would. The buttons are the only other
+    /// way in, and `on_before_dismiss` refuses to let an unanswered prompt go.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn answer_for_test(&mut self, trusted: bool, cx: &mut Context<Self>) {
+        self.trusted = Some(trusted);
+        self.dismiss(cx);
+    }
+
     pub fn refresh_restricted_paths(&mut self, cx: &mut Context<Self>) {
         if let Some(trusted_worktrees) = TrustedWorktrees::try_get_global(cx) {
             if let Some(worktree_store) = self.worktree_store.upgrade() {
@@ -479,6 +502,10 @@ impl SecurityModal {
                         ))
                     })
                     .collect::<HashMap<_, _>>();
+
+                if !refresh_may_apply(new_restricted_worktrees.is_empty(), self.trusted.is_some()) {
+                    return;
+                }
 
                 if self.restricted_paths != new_restricted_worktrees {
                     self.trust_parents = false;
@@ -530,6 +557,28 @@ fn validate_trust_scope(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_an_unanswered_prompt_is_not_emptied_by_a_refresh() {
+        // A trust propagation landing after the prompt was shown empties the
+        // restricted set, and `Render` dismisses on an empty set — so the
+        // prompt answered itself. It held on a main checkout, where nothing
+        // empties the set, and vanished on a new worktree, where propagation
+        // resolves later.
+        assert!(
+            !refresh_may_apply(true, false),
+            "emptying an unanswered prompt decides the question for the user"
+        );
+        assert!(
+            refresh_may_apply(true, true),
+            "once answered, an empty refresh is how the prompt goes away"
+        );
+        assert!(
+            refresh_may_apply(false, false),
+            "a refresh that still has something to ask about must be applied"
+        );
+        assert!(refresh_may_apply(false, true));
+    }
 
     #[test]
     fn accepts_ancestor_or_equal() {

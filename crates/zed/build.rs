@@ -46,7 +46,8 @@ fn main() {
         std::env::var("TARGET").unwrap()
     );
 
-    let git_sha = match std::env::var("ZED_COMMIT_SHA").ok() {
+    let injected_git_sha = std::env::var("ZED_COMMIT_SHA").ok();
+    let git_sha = match injected_git_sha.clone() {
         Some(git_sha) => {
             // In deterministic build environments such as Nix, we inject the commit sha into the build script.
             Some(git_sha)
@@ -68,6 +69,18 @@ fn main() {
 
     if let Some(git_sha) = git_sha {
         println!("cargo:rustc-env=ZED_COMMIT_SHA={git_sha}");
+        let source_is_dirty = injected_git_sha.is_none()
+            && Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=no"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+                .unwrap_or(true);
+        println!(
+            "cargo:rustc-env=ZED_SOURCE_DIRTY={}",
+            if source_is_dirty { 1 } else { 0 }
+        );
 
         if let Some(build_identifier) = option_env!("GITHUB_RUN_NUMBER") {
             println!("cargo:rustc-env=ZED_BUILD_ID={build_identifier}");

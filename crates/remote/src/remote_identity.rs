@@ -30,6 +30,22 @@ impl RemoteConnectionIdentity {
     /// A stable string form of this identity, suitable for use in
     /// persistence keys (e.g. database keys scoped to a remote host).
     pub fn persistence_key(&self) -> String {
+        fn component(value: &str) -> String {
+            value
+                .replace('%', "%25")
+                .replace('+', "%2B")
+                .replace('@', "%40")
+                .replace(':', "%3A")
+        }
+
+        fn optional_component(value: Option<&str>) -> String {
+            match value {
+                None => String::new(),
+                Some("") => "+".to_string(),
+                Some(value) => component(value),
+            }
+        }
+
         match self {
             Self::Ssh {
                 host,
@@ -37,20 +53,25 @@ impl RemoteConnectionIdentity {
                 port,
             } => format!(
                 "ssh:{}@{}:{}",
-                username.as_deref().unwrap_or_default(),
-                host,
-                port.map(|port| port.to_string()).unwrap_or_default()
+                optional_component(username.as_deref()),
+                component(host),
+                component(&port.map(|port| port.to_string()).unwrap_or_default())
             ),
             Self::Wsl { distro_name, user } => format!(
                 "wsl:{}@{}",
-                user.as_deref().unwrap_or_default(),
-                distro_name
+                optional_component(user.as_deref()),
+                component(distro_name)
             ),
             Self::Docker {
                 container_id,
                 name,
                 remote_user,
-            } => format!("docker:{remote_user}@{name}:{container_id}"),
+            } => format!(
+                "docker:{}@{}:{}",
+                component(remote_user),
+                component(name),
+                component(container_id)
+            ),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
@@ -148,6 +169,71 @@ mod tests {
         });
 
         assert!(!same_remote_connection_identity(Some(&left), Some(&right),));
+    }
+
+    #[test]
+    fn persistence_key_is_unambiguous_when_components_contain_delimiters() {
+        let left = RemoteConnectionIdentity::Ssh {
+            host: "c".to_string(),
+            username: Some("a@b".to_string()),
+            port: None,
+        };
+        let right = RemoteConnectionIdentity::Ssh {
+            host: "b@c".to_string(),
+            username: Some("a".to_string()),
+            port: None,
+        };
+
+        assert_ne!(left.persistence_key(), right.persistence_key());
+        assert_eq!(
+            RemoteConnectionIdentity::Ssh {
+                host: "example.com".to_string(),
+                username: Some("user".to_string()),
+                port: Some(22),
+            }
+            .persistence_key(),
+            "ssh:user@example.com:22"
+        );
+        assert_ne!(
+            RemoteConnectionIdentity::Ssh {
+                host: "example.com".to_string(),
+                username: None,
+                port: None,
+            }
+            .persistence_key(),
+            RemoteConnectionIdentity::Ssh {
+                host: "example.com".to_string(),
+                username: Some(String::new()),
+                port: None,
+            }
+            .persistence_key()
+        );
+        assert_ne!(
+            RemoteConnectionIdentity::Ssh {
+                host: "example.com".to_string(),
+                username: Some(String::new()),
+                port: None,
+            }
+            .persistence_key(),
+            RemoteConnectionIdentity::Ssh {
+                host: "example.com".to_string(),
+                username: Some("+".to_string()),
+                port: None,
+            }
+            .persistence_key()
+        );
+        assert_ne!(
+            RemoteConnectionIdentity::Wsl {
+                distro_name: "Ubuntu".to_string(),
+                user: None,
+            }
+            .persistence_key(),
+            RemoteConnectionIdentity::Wsl {
+                distro_name: "Ubuntu".to_string(),
+                user: Some(String::new()),
+            }
+            .persistence_key()
+        );
     }
 
     #[test]

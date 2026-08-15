@@ -1,12 +1,22 @@
-use std::path::PathBuf;
+use std::{
+    cell::Cell,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use super::*;
 use crate::item::test::TestItem;
 use agent_settings::AgentSettings;
-use client::proto;
+use client::{Client, UserStore, proto};
+use clock::FakeSystemClock;
 use fs::{FakeFs, Fs};
 use gpui::{TestAppContext, VisualTestContext};
+use http_client::FakeHttpClient;
+use language::LanguageRegistry;
+use node_runtime::NodeRuntime;
 use project::DisableAiSettings;
+use remote::{RemoteClient, RemoteConnectionOptions, SshConnectionOptions};
 use serde_json::json;
 use settings::{Settings, SettingsStore};
 use util::path;
@@ -20,8 +30,608 @@ fn init_test(cx: &mut TestAppContext) {
     });
 }
 
+async fn test_remote_project(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) -> (Entity<Project>, RemoteConnectionOptions) {
+    cx.update(|cx| release_channel::init("0.0.0".parse().expect("valid test version"), cx));
+    server_cx.update(|cx| release_channel::init("0.0.0".parse().expect("valid test version"), cx));
+    let (host, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+    let ping_handler = server_cx.new(|_| ());
+    server_session.add_request_handler::<rpc::proto::Ping, _, _, _>(
+        ping_handler.downgrade(),
+        |_entity, _envelope, _cx| async { Ok(rpc::proto::Ack {}) },
+    );
+    drop(connect_guard);
+    let remote_client = RemoteClient::connect_mock(host.clone(), cx).await;
+    let client = cx.update(|cx| {
+        Client::new(
+            Arc::new(FakeSystemClock::new()),
+            FakeHttpClient::with_404_response(),
+            cx,
+        )
+    });
+    let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+    let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+    let fs = FakeFs::new(cx.executor());
+    cx.update(|cx| Project::init(&client, cx));
+    let project = cx.update(|cx| {
+        Project::remote(
+            remote_client,
+            client,
+            NodeRuntime::unavailable(),
+            user_store,
+            languages,
+            fs,
+            false,
+            cx,
+        )
+    });
+    (project, host)
+}
+
 #[gpui::test]
-async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
+async fn test_restored_remote_groups_ignore_runtime_connection_fields(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    let persisted_host = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+        host: "example.com".into(),
+        username: Some("user".to_string()),
+        nickname: Some("persisted nickname".to_string()),
+        ..Default::default()
+    });
+    let runtime_host = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+        host: "example.com".into(),
+        username: Some("user".to_string()),
+        password: Some("runtime password".to_string()),
+        args: Some(vec!["-v".to_string()]),
+        nickname: Some("runtime nickname".to_string()),
+        ..Default::default()
+    });
+    let persisted_key = ProjectGroupKey::new(
+        Some(persisted_host),
+        PathList::new(&[PathBuf::from("/repo")]),
+    );
+    let runtime_key =
+        ProjectGroupKey::new(Some(runtime_host), PathList::new(&[PathBuf::from("/repo")]));
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_project_groups(
+            vec![
+                SerializedProjectGroupState {
+                    key: persisted_key.clone(),
+                    expanded: false,
+                },
+                SerializedProjectGroupState {
+                    key: runtime_key.clone(),
+                    expanded: true,
+                },
+            ],
+            cx,
+        );
+    });
+
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        let groups = multi_workspace.project_group_keys();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].matches(&persisted_key));
+    });
+}
+
+#[gpui::test]
+async fn test_restored_active_workspace_uses_persisted_project_identity_before_discovery(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/repo/.worktrees/feature", cx)
+    });
+    cx.run_until_parked();
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let identity_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/repo")]));
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(identity_key.clone(), true, cx);
+    });
+
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .project_group_key(cx)
+                .matches(&identity_key)
+        );
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![identity_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace
+                .workspaces_for_project_group(&identity_key, cx)
+                .unwrap(),
+            vec![multi_workspace.workspace().clone()]
+        );
+        multi_workspace
+            .assert_project_group_key_integrity(cx)
+            .unwrap();
+    });
+}
+
+#[gpui::test]
+async fn test_project_group_follows_workspace_root_move(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/old-project", json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree("/moved-project", json!({ "file.txt": "" }))
+        .await;
+    let project = Project::test(fs, ["/old-project".as_ref()], cx).await;
+    let worktree_id = project.read_with(cx, |project, cx| {
+        project.visible_worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(
+            ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/old-project")])),
+            true,
+            cx,
+        );
+    });
+
+    let paths_changed = Rc::new(Cell::new(false));
+    project.update(cx, |_, cx| {
+        let paths_changed = paths_changed.clone();
+        cx.subscribe(&project, move |_, _, event: &project::Event, _| {
+            if matches!(event, project::Event::WorktreePathsChanged { .. }) {
+                paths_changed.set(true);
+            }
+        })
+        .detach();
+    });
+
+    project.update(cx, |project, cx| {
+        assert!(project.update_worktree_abs_path(worktree_id, Path::new("/moved-project"), cx));
+    });
+
+    assert!(paths_changed.get());
+
+    let moved_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/moved-project")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![moved_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace
+                .workspaces_for_project_group(&moved_key, cx)
+                .unwrap(),
+            vec![multi_workspace.workspace().clone()]
+        );
+        multi_workspace
+            .assert_project_group_key_integrity(cx)
+            .unwrap();
+    });
+}
+
+#[gpui::test]
+async fn test_git_discovery_replaces_a_stale_restored_project_identity(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let remote_worktree = project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/linked", cx)
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let stale_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/stale-main")]));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(stale_key, false, cx);
+    });
+
+    let worktree_id = remote_worktree.read_with(cx, |worktree, _cx| worktree.id().to_proto());
+    remote_worktree.update(cx, |worktree, _cx| {
+        worktree
+            .as_remote()
+            .unwrap()
+            .update_from_remote(proto::UpdateWorktree {
+                project_id: 0,
+                worktree_id,
+                abs_path: "/linked".to_string(),
+                root_name: "linked".to_string(),
+                updated_entries: Vec::new(),
+                removed_entries: Vec::new(),
+                scan_id: 1,
+                is_last_update: true,
+                updated_repositories: Vec::new(),
+                removed_repositories: Vec::new(),
+                root_repo_common_dir: Some("/actual-main/.git".to_string()),
+                root_repo_is_linked_worktree: true,
+            });
+    });
+    cx.run_until_parked();
+
+    let actual_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/actual-main")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![actual_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace.workspace().read(cx).project_group_key(cx),
+            actual_key
+        );
+        multi_workspace
+            .assert_project_group_key_integrity(cx)
+            .unwrap();
+    });
+}
+
+#[gpui::test]
+async fn test_stale_restored_identity_cannot_replace_already_discovered_git_identity(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    project.update(cx, |project, cx| {
+        project.add_test_remote_worktree_with_repository("/linked", Some("/actual-main/.git"), cx)
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let stale_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/stale-main")]));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(stale_key, false, cx);
+    });
+
+    let actual_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/actual-main")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![actual_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace.workspace().read(cx).project_group_key(cx),
+            actual_key
+        );
+        multi_workspace
+            .assert_project_group_key_integrity(cx)
+            .unwrap();
+    });
+}
+
+#[gpui::test]
+async fn test_known_main_worktree_metadata_rejects_stale_restored_paths(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    project.update(cx, |project, cx| {
+        project.add_test_remote_worktree_with_repository(
+            "/actual-main",
+            Some("/actual-main/.git"),
+            cx,
+        )
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let stale_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/stale-main")]));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(stale_key, false, cx);
+    });
+
+    let actual_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/actual-main")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![actual_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace.workspace().read(cx).project_group_key(cx),
+            actual_key
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_completed_non_git_worktree_rejects_stale_restored_paths(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let remote_worktree = project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/actual-main", cx)
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let stale_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/stale-main")]));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(stale_key, false, cx);
+    });
+
+    let worktree_id = remote_worktree.read_with(cx, |worktree, _cx| worktree.id().to_proto());
+    remote_worktree.update(cx, |worktree, _cx| {
+        worktree
+            .as_remote()
+            .expect("test worktree should be remote")
+            .update_from_remote(proto::UpdateWorktree {
+                project_id: 0,
+                worktree_id,
+                abs_path: "/actual-main".to_string(),
+                root_name: "actual-main".to_string(),
+                updated_entries: Vec::new(),
+                removed_entries: Vec::new(),
+                scan_id: 1,
+                is_last_update: true,
+                updated_repositories: Vec::new(),
+                removed_repositories: Vec::new(),
+                root_repo_common_dir: None,
+                root_repo_is_linked_worktree: false,
+            });
+    });
+    cx.run_until_parked();
+
+    let actual_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/actual-main")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(
+            multi_workspace.project_group_keys(),
+            vec![actual_key.clone()]
+        );
+        assert_eq!(
+            multi_workspace.workspace().read(cx).project_group_key(cx),
+            actual_key
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_stale_restored_host_cannot_replace_a_live_workspace_host(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let (project, live_host) = test_remote_project(cx, server_cx).await;
+    project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/repo", cx)
+    });
+    cx.run_until_parked();
+
+    let stale_host = RemoteConnectionOptions::Mock(remote::MockConnectionOptions { id: u64::MAX });
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.restore_active_workspace_project_group(
+            ProjectGroupKey::new(Some(stale_host), PathList::new(&[PathBuf::from("/repo")])),
+            false,
+            cx,
+        );
+    });
+
+    let expected = ProjectGroupKey::new(Some(live_host), PathList::new(&[PathBuf::from("/repo")]));
+    multi_workspace.read_with(cx, |multi_workspace, cx| {
+        assert_eq!(multi_workspace.project_group_keys(), vec![expected.clone()]);
+        assert!(
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .project_group_key(cx)
+                .matches(&expected)
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_open_mode_add_reuses_a_racing_workspace_without_activating_it(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/projects",
+        json!({
+            "source": { "source.txt": "" },
+            "target": { "target.txt": "" },
+        }),
+    )
+    .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let source_project = Project::test(fs.clone(), ["/projects/source".as_ref()], cx).await;
+    let target_project = Project::test(fs, ["/projects/target".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(source_project, window, cx));
+    let source_workspace =
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone());
+    multi_workspace.update(cx, |workspace, cx| workspace.retain_active_workspace(cx));
+
+    let open_task = multi_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_or_create_local_workspace(
+            PathList::new(&[PathBuf::from("/projects/target")]),
+            None,
+            &[],
+            None,
+            OpenMode::Add,
+            window,
+            cx,
+        )
+    });
+    let target_workspace = multi_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.test_add_workspace(target_project, window, cx)
+    });
+    multi_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate(source_workspace.clone(), None, window, cx);
+    });
+
+    let opened_workspace = open_task
+        .await
+        .expect("the workspace added during the open should be reused");
+    assert_eq!(opened_workspace, target_workspace);
+    assert_eq!(
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone()),
+        source_workspace,
+        "OpenMode::Add must not activate a workspace discovered while opening"
+    );
+}
+
+#[gpui::test]
+async fn test_remote_open_mode_add_returns_the_exact_background_workspace(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let (project, host) = test_remote_project(cx, server_cx).await;
+    project.update(cx, |project, cx| {
+        project.add_test_remote_worktree("/remote/source", cx);
+        project.add_test_remote_worktree("/remote/created", cx);
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let source_workspace =
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone());
+    let source_focus = cx.update(|window, cx| {
+        window
+            .focused(cx)
+            .expect("the source workspace should start focused")
+    });
+    let app_state = source_workspace.read_with(cx, |workspace, _cx| workspace.app_state().clone());
+    let window_handle = cx.update(|window, _cx| {
+        window
+            .window_handle()
+            .downcast::<MultiWorkspace>()
+            .expect("test window should contain a MultiWorkspace")
+    });
+    let open_task = cx.update(|_window, cx| {
+        cx.spawn(async move |cx| {
+            crate::open_remote_project_with_existing_connection_in_mode(
+                host,
+                project,
+                vec![PathBuf::from("/remote/created")],
+                app_state,
+                window_handle,
+                None,
+                None,
+                OpenMode::Add,
+                cx,
+            )
+            .await
+        })
+    });
+
+    let (opened_workspace, _) = open_task
+        .await
+        .expect("the remote workspace should open in the background");
+    assert_ne!(opened_workspace, source_workspace);
+    assert_eq!(
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone()),
+        source_workspace,
+        "opening a remote background workspace must not change the active workspace"
+    );
+    cx.update(|window, _cx| {
+        assert!(
+            source_focus.is_focused(window),
+            "opening a remote background workspace must preserve focus"
+        );
+    });
+    assert!(
+        opened_workspace
+            .read_with(cx, |workspace, cx| workspace.root_paths(cx))
+            .iter()
+            .any(|path| path.as_ref() == Path::new("/remote/created")),
+        "the returned workspace must contain the requested remote worktree"
+    );
+}
+
+#[gpui::test]
+async fn test_remote_open_reuses_a_workspace_added_while_connecting(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let (remote_project, host) = test_remote_project(cx, server_cx).await;
+    let open_client = remote_project.read_with(cx, |project, _cx| {
+        project
+            .remote_client()
+            .expect("the remote test project should have a client")
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        "/",
+        json!({
+            "local": { "source.txt": "" },
+            "remote": { "created": { "target.txt": "" } },
+        }),
+    )
+    .await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let source_project = Project::test(fs.clone(), ["/local".as_ref()], cx).await;
+    let target_project = Project::test(fs, ["/remote/created".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(source_project, window, cx));
+    let source_workspace =
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone());
+    multi_workspace.update(cx, |workspace, cx| workspace.retain_active_workspace(cx));
+
+    let open_task = multi_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.find_or_create_workspace(
+            PathList::new(&[PathBuf::from("/remote/created")]),
+            Some(host.clone()),
+            None,
+            move |_options, _window, _cx| Task::ready(Ok(Some(open_client))),
+            &[],
+            None,
+            OpenMode::Add,
+            window,
+            cx,
+        )
+    });
+    let target_workspace = multi_workspace.update_in(cx, |workspace, window, cx| {
+        let target_workspace = workspace.test_add_workspace(target_project, window, cx);
+        target_workspace.update(cx, |target_workspace, _cx| {
+            target_workspace.test_set_project_group_key_hint(ProjectGroupKey::new(
+                Some(host.clone()),
+                PathList::new(&[PathBuf::from("/remote/created")]),
+            ));
+        });
+        target_workspace
+    });
+    multi_workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate(source_workspace.clone(), None, window, cx);
+    });
+
+    let opened_workspace = open_task
+        .await
+        .expect("the workspace added during remote connection should be reused");
+    assert_eq!(opened_workspace, target_workspace);
+    assert_eq!(
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspace().clone()),
+        source_workspace,
+        "reusing a remote background workspace must not activate it"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |workspace, _cx| workspace.workspaces().count()),
+        2,
+        "a concurrent remote open must not duplicate the workspace"
+    );
+}
+
+#[gpui::test]
+async fn test_sidebar_stays_enabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
     let project = Project::test(fs, [], cx).await;
@@ -45,12 +655,12 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
 
     multi_workspace.read_with(cx, |mw, cx| {
         assert!(
-            !mw.sidebar_open(),
-            "Sidebar should be closed when disable_ai is true"
+            mw.sidebar_open(),
+            "ZOrca's sidebar navigates worktrees and terminals, so disable_ai must not close it"
         );
         assert!(
-            !mw.multi_workspace_enabled(cx),
-            "Multi-workspace should be disabled when disable_ai is true"
+            mw.multi_workspace_enabled(cx),
+            "Multi-workspace must stay enabled when disable_ai is true"
         );
     });
 
@@ -210,10 +820,10 @@ async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut 
 
     let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
 
+    // ZOrca opens the sidebar by default, so close it first: the invariant under test
+    // is that opening a project elsewhere does not force it back open.
     window
-        .read_with(cx, |mw, _cx| {
-            assert!(!mw.sidebar_open(), "sidebar should start closed",);
-        })
+        .update(cx, |mw, window, cx| mw.close_sidebar(window, cx))
         .unwrap();
 
     cx.update(|cx| {
@@ -263,10 +873,10 @@ async fn test_open_directory_in_empty_workspace_does_not_open_sidebar(cx: &mut T
         mw
     });
 
+    // ZOrca opens the sidebar by default, so close it first: the invariant under test
+    // is that opening a project elsewhere does not force it back open.
     window
-        .read_with(cx, |mw, _cx| {
-            assert!(!mw.sidebar_open(), "sidebar should start closed");
-        })
+        .update(cx, |mw, window, cx| mw.close_sidebar(window, cx))
         .unwrap();
 
     // Simulate what open_workspace_for_paths does for an empty workspace:
@@ -502,6 +1112,53 @@ async fn test_find_or_create_workspace_uses_project_group_key_when_paths_are_mis
             mw.workspaces().count(),
             1,
             "falling back to the project group key should not create a second workspace"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_find_or_create_workspace_rejects_missing_project_group_path(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/project", json!({ ".git": {} })).await;
+    cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+    let project = Project::test(fs, ["/project".as_ref()], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let missing_paths = PathList::new(&[PathBuf::from("/missing-worktree")]);
+    let project_groups = [
+        None,
+        Some(ProjectGroupKey::new(None, missing_paths.clone())),
+        Some(ProjectGroupKey::new(
+            None,
+            PathList::new(&[PathBuf::from("/missing-main-worktree")]),
+        )),
+    ];
+
+    for project_group in project_groups {
+        let result = multi_workspace
+            .update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.find_or_create_workspace(
+                    missing_paths.clone(),
+                    None,
+                    project_group,
+                    |_options, _window, _cx| Task::ready(Ok(None)),
+                    &[],
+                    None,
+                    OpenMode::Activate,
+                    window,
+                    cx,
+                )
+            })
+            .await;
+
+        assert!(result.is_err(), "a missing project path must not be opened");
+    }
+    multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        assert_eq!(
+            multi_workspace.workspaces().count(),
+            1,
+            "rejecting a missing path must not create a workspace"
         );
     });
 }
@@ -765,6 +1422,76 @@ async fn test_switching_projects_with_sidebar_closed_retains_old_active_workspac
         workspace_a.read_with(cx, |workspace, _cx| workspace.session_id().is_some()),
         "the previous active workspace should remain attached when switching away with the sidebar closed"
     );
+}
+
+#[gpui::test]
+async fn test_activating_workspace_with_source_keeps_items_scoped(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/worktree-a", json!({ "a.txt": "" })).await;
+    fs.insert_tree("/worktree-b", json!({ "b.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/worktree-a".as_ref()], cx).await;
+    let project_b = Project::test(fs, ["/worktree-b".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let workspace_a = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let item_a = cx.new(|cx| TestItem::new(cx).with_label("workspace-a"));
+    workspace_a.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item_a.clone()), None, true, window, cx);
+    });
+
+    let workspace_b = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        let workspace_b = cx.new(|cx| Workspace::test_new(project_b, window, cx));
+        multi_workspace.activate(
+            workspace_b.clone(),
+            Some(workspace_a.downgrade()),
+            window,
+            cx,
+        );
+        workspace_b
+    });
+
+    workspace_b.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace.items(cx).count(),
+            0,
+            "activating a workspace with a source must not copy the source's tabs"
+        );
+    });
+
+    let item_b = cx.new(|cx| TestItem::new(cx).with_label("workspace-b"));
+    workspace_b.update_in(cx, |workspace, window, cx| {
+        workspace.add_item_to_active_pane(Box::new(item_b.clone()), None, true, window, cx);
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(workspace_a.clone(), None, window, cx);
+    });
+    workspace_a.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace
+                .items(cx)
+                .map(|item| item.item_id())
+                .collect::<Vec<_>>(),
+            vec![item_a.item_id()]
+        );
+    });
+
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.activate(workspace_b.clone(), None, window, cx);
+    });
+    workspace_b.read_with(cx, |workspace, cx| {
+        assert_eq!(
+            workspace
+                .items(cx)
+                .map(|item| item.item_id())
+                .collect::<Vec<_>>(),
+            vec![item_b.item_id()]
+        );
+    });
 }
 
 #[gpui::test]

@@ -1,0 +1,84 @@
+name: PR checks
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, zorca, Linux, X64]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          clean: false
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Install Linux dependencies
+        run: ./script/linux
+      - name: Install WASI SDK
+        run: ./script/download-wasi-sdk
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install nextest
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9
+        with:
+          tool: nextest
+      - name: Lint
+        run: ./script/clippy
+      - name: Test full workspace
+        run: cargo nextest run --workspace --no-fail-fast --no-tests=warn -- --skip sidebar_tests::test_click_clears_selection_and_focus_in_restores_it
+
+  windows:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, zorca, Windows, X64]
+    timeout-minutes: 60
+    env:
+      CARGO_HOME: C:\Rust\cargo
+      RUSTUP_HOME: C:\Rust\rustup
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          clean: false
+          persist-credentials: false
+      - name: Install MSVC Rust target
+        run: |
+          "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "C:\Rust\cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          C:\Rust\cargo\bin\rustup.exe target add x86_64-pc-windows-msvc
+      - name: Expose CMake
+        # The `wasmtime-c-api-impl` build script spawns `cmake`. The self-hosted
+        # runner gets CMake from the Visual Studio Build Tools, which do not put
+        # it on PATH. `zorca-ci.yml` adds the same directory.
+        run: |
+          if (Get-Command cmake -ErrorAction SilentlyContinue) { exit 0 }
+          $cmakeBin = "C:\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin"
+          if (-not (Test-Path (Join-Path $cmakeBin "cmake.exe"))) {
+            throw "cmake is not on PATH and cmake.exe is not in $cmakeBin"
+          }
+          $cmakeBin | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Install Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install nextest
+        uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9
+        with:
+          tool: nextest
+      - name: Test full workspace
+        run: cargo nextest run --target x86_64-pc-windows-msvc --workspace --no-fail-fast --no-tests=warn

@@ -175,7 +175,6 @@ pub enum HighlightKey {
     HighlightsTreeView(usize),
     HoverState,
     HoveredLinkState,
-    InlineAssist,
     InputComposition,
     MatchingBracket,
     NavigationOverlay(NavigationOverlayKey),

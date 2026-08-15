@@ -17,7 +17,8 @@ use filter::{FilterData, FilteredServer};
 use futures::{FutureExt, StreamExt as _, channel::oneshot, future::Shared};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, PromptLevel, Subscription, Task, TaskExt, WeakEntity, Window,
+    FocusHandle, Focusable, PromptLevel, StatefulInteractiveElement, Subscription, Task, TaskExt,
+    WeakEntity, Window, actions, px,
 };
 use log::{debug, info};
 use open_path_prompt::OpenPathDelegate;
@@ -34,9 +35,10 @@ use settings::{
 };
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::{Arc, atomic::AtomicBool},
+    time::Duration,
 };
 
 use ui::{
@@ -45,20 +47,675 @@ use ui::{
 };
 use util::{
     ResultExt,
+    command::new_command,
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
 };
 use workspace::{
     AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
+    dock::{DockPosition, Panel, PanelEvent},
     notifications::{DetachAndPromptErr, NotificationId},
     open_remote_project_with_existing_connection,
 };
+
+actions!(ports, [ToggleFocus]);
+
+pub struct PortsPanel {
+    // Deliberately holds no `WeakEntity<Workspace>`: `Panel::enabled` and
+    // `Panel::icon_label` run inside `Workspace::toggle_dock`, which already
+    // leases the Workspace entity, so reading it here aborts GPUI.
+    project: WeakEntity<Project>,
+    focus_handle: FocusHandle,
+    add_port_editor: Entity<Editor>,
+    adding_port: bool,
+    add_port_error: Option<SharedString>,
+    listening_processes: BTreeMap<u16, SharedString>,
+    local_listening_ports: BTreeSet<u16>,
+    refresh_task: Task<()>,
+    port_action_task: Task<()>,
+    _settings_subscription: Subscription,
+}
+
+impl PortsPanel {
+    pub async fn load(
+        workspace: WeakEntity<Workspace>,
+        mut cx: gpui::AsyncWindowContext,
+    ) -> anyhow::Result<Entity<Self>> {
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let project = workspace.project().downgrade();
+            cx.new(|cx| Self::new(project, window, cx))
+        })?;
+        panel.update(&mut cx, |panel, cx| panel.refresh(cx));
+        Ok(panel)
+    }
+
+    fn new(project: WeakEntity<Project>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let add_port_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Port number or address (for example 3000)", window, cx);
+            editor
+        });
+        Self {
+            project,
+            focus_handle: cx.focus_handle(),
+            add_port_editor,
+            adding_port: false,
+            add_port_error: None,
+            listening_processes: BTreeMap::new(),
+            local_listening_ports: BTreeSet::new(),
+            refresh_task: Task::ready(()),
+            port_action_task: Task::ready(()),
+            _settings_subscription: cx.observe_global::<SettingsStore>(|this, cx| {
+                this.refresh(cx);
+                cx.notify();
+            }),
+        }
+    }
+
+    fn active_server(&self, cx: &App) -> Option<(SshServerIndex, SshConnection)> {
+        let project = self.project.upgrade()?;
+        let RemoteConnectionOptions::Ssh(connection) =
+            project.read(cx).remote_connection_options(cx)?
+        else {
+            return None;
+        };
+        let index = ssh_server_index(&connection, cx)?;
+        let saved = RemoteSettings::get_global(cx)
+            .ssh_connections()
+            .nth(index.0)?;
+        Some((index, saved))
+    }
+
+    fn begin_adding_port(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_server(cx).is_none() {
+            return;
+        }
+        self.adding_port = true;
+        self.add_port_error = None;
+        self.add_port_editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    fn add_port(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((index, _)) = self.active_server(cx) else {
+            return;
+        };
+        let input = self.add_port_editor.read(cx).text(cx);
+        let forward = match parse_quick_port_forward(&input) {
+            Ok(forward) => forward,
+            Err(error) => {
+                self.add_port_error = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        self.add_port_error = None;
+        let fs = project.read(cx).fs().clone();
+        let command = project
+            .read(cx)
+            .remote_client()
+            .ok_or_else(|| anyhow::anyhow!("SSH connection is unavailable"))
+            .and_then(|client| ssh_forward_control_command(client.read(cx), &forward, "forward"));
+        self.port_action_task = cx.spawn_in(window, async move |this, cx| {
+            let result = async {
+                let command = command?;
+                let output = new_command(command.program)
+                    .args(command.args)
+                    .envs(command.env)
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to forward port: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                anyhow::Ok(())
+            }
+            .await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    update_settings_file(fs, cx, move |settings, _| {
+                        let Some(connection) = settings
+                            .remote
+                            .ssh_connections
+                            .as_mut()
+                            .and_then(|connections| connections.get_mut(index.0))
+                        else {
+                            return;
+                        };
+                        connection
+                            .port_forwards
+                            .get_or_insert_default()
+                            .push(forward);
+                    });
+                    this.add_port_editor
+                        .update(cx, |editor, cx| editor.set_text("", window, cx));
+                    this.adding_port = false;
+                    this.add_port_error = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.add_port_error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
+
+    fn remove_port(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((server_index, _)) = self.active_server(cx) else {
+            return;
+        };
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let fs = project.read(cx).fs().clone();
+        let Some(forward) = self
+            .active_server(cx)
+            .and_then(|(_, server)| server.port_forwards?.get(index).cloned())
+        else {
+            return;
+        };
+        let command = project
+            .read(cx)
+            .remote_client()
+            .ok_or_else(|| anyhow::anyhow!("SSH connection is unavailable"))
+            .and_then(|client| ssh_forward_control_command(client.read(cx), &forward, "cancel"));
+        self.port_action_task = cx.spawn(async move |this, cx| {
+            let result = async {
+                let command = command?;
+                let output = new_command(command.program)
+                    .args(command.args)
+                    .envs(command.env)
+                    .output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to stop forwarding port: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                anyhow::Ok(())
+            }
+            .await;
+            this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    update_settings_file(fs, cx, move |settings, _| {
+                        let Some(forwards) = settings
+                            .remote
+                            .ssh_connections
+                            .as_mut()
+                            .and_then(|connections| connections.get_mut(server_index.0))
+                            .and_then(|connection| connection.port_forwards.as_mut())
+                        else {
+                            return;
+                        };
+                        if index < forwards.len() {
+                            forwards.remove(index);
+                        }
+                    });
+                    this.add_port_error = None;
+                    cx.notify();
+                }
+                Err(error) => {
+                    this.add_port_error = Some(error.to_string().into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        });
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.upgrade() else {
+            self.listening_processes.clear();
+            self.local_listening_ports.clear();
+            return;
+        };
+        if project.read(cx).remote_client().is_none() {
+            self.listening_processes.clear();
+            self.local_listening_ports.clear();
+            return;
+        }
+        let command = project.update(cx, |project, cx| {
+            project.exec_in_shell(
+                "if command -v ss >/dev/null 2>&1; then ss -ltnpH; elif command -v lsof >/dev/null 2>&1; then lsof -nP -iTCP -sTCP:LISTEN; fi"
+                    .to_owned(),
+                cx,
+            )
+        });
+        let local_ports = self
+            .active_server(cx)
+            .and_then(|(_, server)| server.port_forwards)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|forward| forward.local_port)
+            .collect::<Vec<_>>();
+        let local_listeners = cx.background_spawn(async move {
+            local_ports
+                .into_iter()
+                .filter(|port| {
+                    std::net::TcpStream::connect_timeout(
+                        &std::net::SocketAddr::from(([127, 0, 0, 1], *port)),
+                        Duration::from_millis(100),
+                    )
+                    .is_ok()
+                })
+                .collect::<BTreeSet<_>>()
+        });
+        self.refresh_task = cx.spawn(async move |this, cx| {
+            let processes = match command.await {
+                Ok(mut command) => match command.output().await {
+                    Ok(output) if output.status.success() => {
+                        parse_listening_processes(&String::from_utf8_lossy(&output.stdout))
+                    }
+                    Ok(output) => {
+                        log::warn!(
+                            "failed to inspect remote listening ports: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                        BTreeMap::new()
+                    }
+                    Err(error) => {
+                        log::warn!("failed to inspect remote listening ports: {error:#}");
+                        BTreeMap::new()
+                    }
+                },
+                Err(error) => {
+                    log::warn!("failed to build remote port inspection command: {error:#}");
+                    BTreeMap::new()
+                }
+            };
+            let local_listening_ports = local_listeners.await;
+            this.update(cx, |this, cx| {
+                this.listening_processes = processes;
+                this.local_listening_ports = local_listening_ports;
+                cx.notify();
+            })
+            .ok();
+            cx.background_executor().timer(Duration::from_secs(2)).await;
+            this.update(cx, |this, cx| this.refresh(cx)).ok();
+        });
+    }
+}
+
+fn parse_listening_processes(output: &str) -> BTreeMap<u16, SharedString> {
+    let mut processes = BTreeMap::new();
+    for line in output.lines().filter(|line| !line.starts_with("COMMAND")) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let (address, process) = if fields.first() == Some(&"LISTEN") {
+            let Some(address) = fields.get(3) else {
+                continue;
+            };
+            let process = line
+                .split_once("users:")
+                .map(|(_, process)| process.trim().trim_matches(['(', ')']))
+                .unwrap_or_default()
+                .to_owned();
+            ((*address).to_owned(), process)
+        } else {
+            let Some(address) = fields.iter().find(|field| field.contains(':')) else {
+                continue;
+            };
+            let process = match (fields.first(), fields.get(1)) {
+                (Some(command), Some(pid)) => format!("{command} (PID {pid})"),
+                _ => String::new(),
+            };
+            ((*address).to_owned(), process)
+        };
+        let Some(port) = address
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let process = if let Some(name) = process
+            .strip_prefix('"')
+            .and_then(|process| process.split_once("\"").map(|(name, _)| name))
+        {
+            let pid = process
+                .split_once("pid=")
+                .and_then(|(_, pid)| pid.split_once(',').map(|(pid, _)| pid));
+            pid.map_or_else(|| name.to_owned(), |pid| format!("{name} (PID {pid})"))
+        } else {
+            process
+        };
+        processes.entry(port).or_insert_with(|| process.into());
+    }
+    processes
+}
+
+fn parse_quick_port_forward(input: &str) -> anyhow::Result<remote::SshPortForwardOption> {
+    let input = input.trim();
+    let (host, port) = match input.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => (host.trim_matches(['[', ']']), port),
+        _ => ("localhost", input),
+    };
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("Enter a valid port from 1 to 65535"))?;
+    anyhow::ensure!(port > 0, "Enter a valid port from 1 to 65535");
+    Ok(remote::SshPortForwardOption {
+        local_host: Some("localhost".to_owned()),
+        local_port: port,
+        remote_host: Some(host.to_owned()),
+        remote_port: port,
+    })
+}
+
+fn ssh_forward_control_command(
+    client: &RemoteClient,
+    forward: &remote::SshPortForwardOption,
+    operation: &str,
+) -> anyhow::Result<remote::CommandTemplate> {
+    let mut command = client.build_forward_ports_command(vec![(
+        forward.local_port,
+        forward
+            .remote_host
+            .clone()
+            .unwrap_or_else(|| "localhost".to_owned()),
+        forward.remote_port,
+    )])?;
+    let forward_option_index = command
+        .args
+        .iter()
+        .rposition(|argument| argument == "-L")
+        .ok_or_else(|| anyhow::anyhow!("SSH forwarding command is missing -L"))?;
+    let forward_specification = command
+        .args
+        .get_mut(forward_option_index + 1)
+        .ok_or_else(|| anyhow::anyhow!("SSH forwarding command is missing the -L value"))?;
+    *forward_specification = format_port_forward_specification(forward);
+    set_ssh_control_operation(&mut command, operation)?;
+    Ok(command)
+}
+
+fn format_port_forward_specification(forward: &remote::SshPortForwardOption) -> String {
+    fn bracket_ipv6(host: &str) -> Cow<'_, str> {
+        if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]").into()
+        } else {
+            host.into()
+        }
+    }
+
+    let local_host = forward.local_host.as_deref().unwrap_or("localhost");
+    let remote_host = forward.remote_host.as_deref().unwrap_or("localhost");
+    format!(
+        "{}:{}:{}:{}",
+        bracket_ipv6(local_host),
+        forward.local_port,
+        bracket_ipv6(remote_host),
+        forward.remote_port
+    )
+}
+
+fn set_ssh_control_operation(
+    command: &mut remote::CommandTemplate,
+    operation: &str,
+) -> anyhow::Result<()> {
+    let option_index = command
+        .args
+        .iter()
+        .rposition(|argument| argument == "-N")
+        .ok_or_else(|| anyhow::anyhow!("SSH forwarding command is missing -N"))?;
+    command.args.splice(
+        option_index..=option_index,
+        ["-O".to_owned(), operation.to_owned()],
+    );
+    Ok(())
+}
+
+impl Render for PortsPanel {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let server = self.active_server(cx);
+        let forwards = server
+            .as_ref()
+            .and_then(|(_, server)| server.port_forwards.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let listening_processes = self.listening_processes.clone();
+        let local_listening_ports = self.local_listening_ports.clone();
+        let has_server = server.is_some();
+
+        v_flex()
+            .id("ports-panel")
+            .size_full()
+            .track_focus(&self.focus_handle)
+            .child(
+                h_flex()
+                    .h_9()
+                    .px_3()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(Label::new("Ports").size(LabelSize::Small)),
+                    )
+                    .child(
+                        Button::new("add-port", "Add Port")
+                            .label_size(LabelSize::Small)
+                            .disabled(!has_server)
+                            .tooltip(Tooltip::text(if has_server {
+                                "Forward a port"
+                            } else {
+                                "Open an SSH workspace to forward ports"
+                            }))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.begin_adding_port(window, cx)
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h_8()
+                    .px_3()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(div().w_4())
+                    .child(
+                        div()
+                            .w_24()
+                            .child(Label::new("Port").size(LabelSize::Small)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Label::new("Forwarded Address").size(LabelSize::Small)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(Label::new("Running Process").size(LabelSize::Small)),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .id("ports-list")
+                    .flex_1()
+                    .overflow_y_scroll()
+                    .when(forwards.is_empty(), |this| {
+                        this.child(
+                            h_flex().p_4().child(
+                                Label::new(if has_server {
+                                    "No forwarded ports. Select Add Port to create one."
+                                } else {
+                                    "Port forwarding is available in SSH workspaces."
+                                })
+                                .color(Color::Muted),
+                            ),
+                        )
+                    })
+                    .children(forwards.into_iter().enumerate().map(|(index, forward)| {
+                        let local_host = forward.local_host.as_deref().unwrap_or("localhost");
+                        let address = format!("{local_host}:{}", forward.local_port);
+                        let address_for_open = address.clone();
+                        let process = listening_processes.get(&forward.remote_port).cloned();
+                        let is_listening = local_listening_ports.contains(&forward.local_port)
+                            && process.is_some();
+                        h_flex()
+                            .id(("port-forward-row", index))
+                            .group("port-forward-row")
+                            .h_8()
+                            .px_3()
+                            .gap_3()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(div().w_4().child(
+                                Icon::new(IconName::Circle).size(IconSize::XSmall).color(
+                                    if is_listening {
+                                        Color::Success
+                                    } else {
+                                        Color::Muted
+                                    },
+                                ),
+                            ))
+                            .child(div().w_24().child(forward.local_port.to_string()))
+                            .child(
+                                div().flex_1().child(
+                                    h_flex()
+                                        .justify_between()
+                                        .child(Label::new(address).color(Color::Accent))
+                                        .child(
+                                            h_flex()
+                                                .visible_on_hover("port-forward-row")
+                                                .child(
+                                                    IconButton::new(
+                                                        ("open-forwarded-port", index),
+                                                        IconName::ToolWeb,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text("Open in Browser"))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.open_url(&format!(
+                                                            "http://{address_for_open}"
+                                                        ));
+                                                    }),
+                                                )
+                                                .child(
+                                                    IconButton::new(
+                                                        ("remove-forwarded-port", index),
+                                                        IconName::Close,
+                                                    )
+                                                    .icon_size(IconSize::Small)
+                                                    .tooltip(Tooltip::text("Stop Forwarding Port"))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.remove_port(index, cx)
+                                                    })),
+                                                ),
+                                        ),
+                                ),
+                            )
+                            .child(div().flex_1().when_some(process, |this, process| {
+                                this.child(Label::new(process).truncate())
+                            }))
+                    }))
+                    .when(self.adding_port, |this| {
+                        this.child(
+                            h_flex()
+                                .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                                    this.add_port(window, cx)
+                                }))
+                                .h_8()
+                                .px_3()
+                                .gap_3()
+                                .bg(cx.theme().colors().element_background)
+                                .child(div().w_4())
+                                .child(div().w_24().child(self.add_port_editor.clone())),
+                        )
+                    }),
+            )
+            .when_some(self.add_port_error.clone(), |this, error| {
+                this.child(
+                    h_flex()
+                        .px_3()
+                        .py_1()
+                        .child(Label::new(error).size(LabelSize::Small).color(Color::Error)),
+                )
+            })
+    }
+}
+
+impl Focusable for PortsPanel {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<PanelEvent> for PortsPanel {}
+
+impl Panel for PortsPanel {
+    fn persistent_name() -> &'static str {
+        "Ports Panel"
+    }
+
+    fn panel_key() -> &'static str {
+        "PortsPanel"
+    }
+
+    fn position(&self, _: &Window, _: &App) -> DockPosition {
+        DockPosition::Bottom
+    }
+
+    fn position_is_valid(&self, position: DockPosition) -> bool {
+        position == DockPosition::Bottom
+    }
+
+    fn set_position(&mut self, _: DockPosition, _: &mut Window, _: &mut Context<Self>) {}
+
+    fn default_size(&self, _: &Window, _: &App) -> Pixels {
+        px(260.)
+    }
+
+    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
+        Some(IconName::Server)
+    }
+
+    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
+        Some("Ports")
+    }
+
+    fn toggle_action(&self) -> Box<dyn Action> {
+        ToggleFocus.boxed_clone()
+    }
+
+    fn icon_label(&self, _window: &Window, cx: &App) -> Option<String> {
+        self.active_server(cx)
+            .and_then(|(_, server)| server.port_forwards)
+            .map(|forwards| forwards.len().to_string())
+    }
+
+    fn activation_priority(&self) -> u32 {
+        6
+    }
+
+    fn enabled(&self, cx: &App) -> bool {
+        self.active_server(cx).is_some()
+    }
+}
+
+pub(crate) fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+            workspace.toggle_panel_focus::<PortsPanel>(window, cx);
+        });
+    })
+    .detach();
+}
 
 pub struct RemoteServerProjects {
     mode: Mode,
     focus_handle: FocusHandle,
     default_picker: Entity<Picker<RemoteServerPickerDelegate>>,
     workspace: WeakEntity<Workspace>,
+    #[cfg(target_os = "windows")]
     retained_connections: Vec<Entity<RemoteClient>>,
     ssh_config_updates: Task<()>,
     ssh_config_servers: BTreeSet<SharedString>,
@@ -176,6 +833,17 @@ struct ProjectPicker {
 struct EditNicknameState {
     index: SshServerIndex,
     editor: Entity<Editor>,
+}
+
+fn ssh_server_index(connection: &SshConnectionOptions, cx: &App) -> Option<SshServerIndex> {
+    RemoteSettings::get_global(cx)
+        .ssh_connections()
+        .position(|saved| {
+            saved.host == connection.host.to_string()
+                && saved.username == connection.username
+                && saved.port == connection.port
+        })
+        .map(SshServerIndex)
 }
 
 struct DevContainerPickerDelegate {
@@ -1205,7 +1873,13 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                         let index = *index;
                         remote_server_projects
                             .update(cx, |this, cx| {
-                                this.create_remote_project(index, connection.into(), window, cx);
+                                this.create_remote_project(
+                                    index,
+                                    connection.into(),
+                                    None,
+                                    window,
+                                    cx,
+                                );
                             })
                             .ok();
                     }
@@ -1218,6 +1892,7 @@ impl PickerDelegate for RemoteServerPickerDelegate {
                                 this.create_remote_project(
                                     new_ix.into(),
                                     connection.into(),
+                                    None,
                                     window,
                                     cx,
                                 );
@@ -1535,6 +2210,7 @@ impl RemoteServerProjects {
             focus_handle,
             default_picker,
             workspace,
+            #[cfg(target_os = "windows")]
             retained_connections: Vec::new(),
             ssh_config_updates,
             ssh_config_servers: BTreeSet::new(),
@@ -1622,11 +2298,7 @@ impl RemoteServerProjects {
                     .update_in(cx, |this, window, cx| {
                         info!("ssh server created");
                         telemetry::event!("SSH Server Created");
-                        this.retained_connections.push(client);
-                        this.add_ssh_server(connection_options, cx);
-                        this.mode = Mode::default_mode(&this.ssh_config_servers, cx);
-                        this.focus_handle(cx).focus(window, cx);
-                        cx.notify()
+                        this.finish_create_ssh_server(connection_options, client, window, cx);
                     })
                     .log_err(),
                 _ => this
@@ -1656,6 +2328,24 @@ impl RemoteServerProjects {
             ssh_prompt: Some(ssh_prompt),
             _creating: Some(creating),
         });
+    }
+
+    fn finish_create_ssh_server(
+        &mut self,
+        connection_options: SshConnectionOptions,
+        client: Entity<RemoteClient>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = SshServerIndex(RemoteSettings::get_global(cx).ssh_connections().count());
+        self.add_ssh_server(connection_options.clone(), cx);
+        self.create_remote_project(
+            index.into(),
+            connection_options.into(),
+            Some(client),
+            window,
+            cx,
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -1775,6 +2465,7 @@ impl RemoteServerProjects {
         &mut self,
         index: ServerIndex,
         connection_options: RemoteConnectionOptions,
+        session: Option<Entity<RemoteClient>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1795,13 +2486,16 @@ impl RemoteServerProjects {
                 };
                 let prompt = modal.read(cx).prompt.clone();
 
-                let connect = connect(
-                    ConnectionIdentifier::setup(),
-                    connection_options.clone(),
-                    prompt,
-                    window,
-                    cx,
-                )
+                let connect = match session {
+                    Some(session) => Task::ready(Ok(Some(session))),
+                    None => connect(
+                        ConnectionIdentifier::setup(),
+                        connection_options.clone(),
+                        prompt,
+                        window,
+                        cx,
+                    ),
+                }
                 .prompt_err("Failed to connect", window, cx, |_, _, _| None);
 
                 cx.spawn_in(window, async move |workspace, cx| {
@@ -3146,12 +3840,84 @@ mod filter_tests {
         state.filter_sync("");
         assert!(state.filtered_servers.is_none());
     }
+
+    #[test]
+    fn parses_quick_port_forward() {
+        let forward = parse_quick_port_forward("127.0.0.1:3000").expect("valid port");
+        assert_eq!(forward.local_host.as_deref(), Some("localhost"));
+        assert_eq!(forward.local_port, 3000);
+        assert_eq!(forward.remote_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(forward.remote_port, 3000);
+        assert!(parse_quick_port_forward("70000").is_err());
+    }
+
+    #[test]
+    fn builds_ssh_control_commands() {
+        let mut command = remote::CommandTemplate {
+            program: "ssh".to_owned(),
+            args: vec![
+                "-N".to_owned(),
+                "-L".to_owned(),
+                "3000:localhost:3000".to_owned(),
+                "server".to_owned(),
+            ],
+            env: Default::default(),
+        };
+
+        set_ssh_control_operation(&mut command, "forward").expect("valid SSH command");
+        assert_eq!(
+            command.args,
+            ["-O", "forward", "-L", "3000:localhost:3000", "server"]
+        );
+    }
+
+    #[test]
+    fn formats_ssh_forward_specifications() {
+        let forward = remote::SshPortForwardOption {
+            local_host: Some("::1".to_owned()),
+            local_port: 3000,
+            remote_host: Some("2001:db8::1".to_owned()),
+            remote_port: 4000,
+        };
+
+        assert_eq!(
+            format_port_forward_specification(&forward),
+            "[::1]:3000:[2001:db8::1]:4000"
+        );
+    }
+
+    #[test]
+    fn parses_remote_listening_processes() {
+        let output = concat!(
+            "LISTEN 0 511 127.0.0.1:5001 0.0.0.0:* users:((\"node\",pid=123,fd=20))\n",
+            "LISTEN 0 4096 0.0.0.0:3002 0.0.0.0:*\n",
+            "python 456 user 3u IPv4 0t0 TCP *:8000 (LISTEN)\n",
+        );
+        let processes = parse_listening_processes(output);
+        assert_eq!(
+            processes.get(&5001).map(AsRef::as_ref),
+            Some("node (PID 123)")
+        );
+        assert_eq!(
+            processes.get(&8000).map(AsRef::as_ref),
+            Some("python (PID 456)")
+        );
+        assert_eq!(processes.get(&3002).map(AsRef::as_ref), Some(""));
+        assert!(!processes.contains_key(&1111));
+    }
 }
 
 #[cfg(test)]
 mod create_host_tests {
     use super::*;
+    use extension::ExtensionHostProxy;
+    use fs::FakeFs;
     use gpui::TestAppContext;
+    use http_client::BlockedHttpClient;
+    use node_runtime::NodeRuntime;
+    use remote_server::{HeadlessAppState, HeadlessProject};
+    use serde_json::json;
+    use util::path;
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
@@ -3160,6 +3926,216 @@ mod create_host_tests {
             editor::init(cx);
             state
         })
+    }
+
+    #[gpui::test]
+    async fn ports_panel_is_disabled_for_local_workspaces(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let project = workspace.project().downgrade();
+            cx.new(|cx| PortsPanel::new(project, window, cx))
+        });
+
+        assert!(!panel.read_with(cx, |panel, cx| panel.enabled(cx)));
+    }
+
+    /// The weak project handle must fail closed: a dropped project means
+    /// disabled, not a panic.
+    #[gpui::test]
+    async fn ports_panel_is_disabled_once_the_project_is_dropped(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        // A project the workspace does not hold, so dropping it really drops it.
+        let orphan = Project::test(app_state.fs.clone(), [], cx).await;
+        let orphan_weak = orphan.downgrade();
+        let panel = workspace.update_in(cx, |_, window, cx| {
+            cx.new(|cx| PortsPanel::new(orphan_weak, window, cx))
+        });
+        drop(orphan);
+        cx.run_until_parked();
+
+        assert!(panel.read_with(cx, |panel, _| panel.project.upgrade().is_none()));
+        assert!(!panel.read_with(cx, |panel, cx| panel.enabled(cx)));
+        assert!(panel.read_with(cx, |panel, cx| panel.active_server(cx).is_none()));
+        // The other weak-handle users must not panic either.
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.icon_label(window, cx).is_none());
+            panel.refresh(cx);
+            panel.add_port(window, cx);
+            panel.remove_port(0, cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn toggling_the_bottom_dock_does_not_lease_the_workspace_twice(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let project = workspace.project().downgrade();
+            cx.new(|cx| PortsPanel::new(project, window, cx))
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace.bottom_dock().read(cx).is_open()
+        }));
+    }
+
+    /// Every path that reaches `Panel::enabled` while the Workspace entity is
+    /// leased: all three dock positions, open and close, and the ToggleFocus
+    /// action. Any of these double-leasing aborts the process.
+    #[gpui::test]
+    async fn panel_trait_methods_never_read_the_leased_workspace(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let project = Project::test(app_state.fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let project = workspace.project().downgrade();
+            cx.new(|cx| PortsPanel::new(project, window, cx))
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        for position in [
+            DockPosition::Left,
+            DockPosition::Bottom,
+            DockPosition::Right,
+        ] {
+            for _ in 0..2 {
+                workspace.update_in(cx, |workspace, window, cx| {
+                    workspace.toggle_dock(position, window, cx);
+                });
+                cx.run_until_parked();
+            }
+            // Back where it started after open + close.
+            assert!(!workspace.read_with(cx, |workspace, cx| {
+                workspace.dock_at_position(position).read(cx).is_open()
+            }));
+        }
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<PortsPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        // `icon_label` also calls `active_server`; the status bar reads it.
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.icon_label(window, cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn new_ssh_server_opens_folder_picker(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+        let (mock_options, server_session, connect_guard) =
+            RemoteClient::fake_server(cx, server_cx);
+        let server_executor = server_cx.executor();
+        let remote_fs = FakeFs::new(server_executor.clone());
+        remote_fs
+            .insert_tree(
+                path!("/home/user"),
+                json!({
+                    "project": {},
+                }),
+            )
+            .await;
+
+        server_cx.update(HeadlessProject::init);
+        let _headless_project = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: remote_fs,
+                    http_client: Arc::new(BlockedHttpClient),
+                    node_runtime: NodeRuntime::unavailable(),
+                    languages: Arc::new(language::LanguageRegistry::new(server_executor)),
+                    extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        drop(connect_guard);
+        let client = RemoteClient::connect_mock(mock_options, cx).await;
+
+        let fs: Arc<dyn Fs> = app_state.fs.clone();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let modal = workspace.update_in(cx, |workspace, window, cx| {
+            let weak = cx.entity().downgrade();
+            workspace.toggle_modal(window, cx, |window, cx| {
+                RemoteServerProjects::new(false, fs, window, weak, cx)
+            });
+            workspace
+                .active_modal::<RemoteServerProjects>(cx)
+                .expect("remote server modal should be active")
+        });
+
+        modal.update_in(cx, |modal, window, cx| {
+            modal.finish_create_ssh_server(
+                SshConnectionOptions {
+                    host: "new.example".into(),
+                    ..Default::default()
+                },
+                client,
+                window,
+                cx,
+            );
+        });
+        drop(modal);
+        cx.run_until_parked();
+
+        let active_modal = workspace
+            .update(cx, |workspace, cx| {
+                workspace.active_modal::<RemoteServerProjects>(cx)
+            })
+            .expect("remote server modal should remain active");
+        let connection_string = active_modal.update(cx, |modal, cx| {
+            let picker = match &modal.mode {
+                Mode::ProjectPicker(picker) => picker,
+                _ => panic!("new SSH server should proceed to folder selection"),
+            };
+            match &picker.read(cx).data {
+                ProjectPickerData::Ssh {
+                    connection_string, ..
+                } => connection_string.clone(),
+                ProjectPickerData::Wsl { .. } => panic!("expected SSH folder picker"),
+            }
+        });
+        assert_eq!(connection_string.as_ref(), "new.example");
+
+        let connections = cx.update(|_, cx| {
+            RemoteSettings::get_global(cx)
+                .ssh_connections()
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].host, "new.example");
     }
 
     #[gpui::test]

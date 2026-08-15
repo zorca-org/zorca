@@ -1,0 +1,38 @@
+[package]
+name = "ade_session"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/ade_session.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+async-process.workspace = true
+futures.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `deploy` only: the binary-identity hash both ends of the wire compare.
+sha2.workspace = true
+# `source` only: finding `zig`/`rustup`/`cargo-zigbuild` before shelling out to
+# them. Still a leaf dependency — no executor, no Zed crate.
+which.workspace = true
+
+# Windows only, and deliberately so: `ssh` only needs a job object and a stable
+# current directory on the platform where a child outlives its parent and pins
+# the directory it sits in. Keeping the dependency behind `cfg(windows)` leaves
+# the daemon's own Linux/macOS builds the leaf crate they were.
+[target.'cfg(windows)'.dependencies]
+util.workspace = true
+
+[dev-dependencies]
+piper.workspace = true
+smol.workspace = true
+tempfile.workspace = true

@@ -49,7 +49,8 @@ pub use agent_server_store::{AgentId, AgentServerStore, AgentServersUpdated, Ext
 pub use git_store::{
     ConflictRegion, ConflictSet, ConflictSetSnapshot, ConflictSetUpdate,
     git_traversal::{ChildEntriesGitIter, GitEntry, GitEntryRef, GitTraversal},
-    linked_worktree_short_name, repo_identity_path, worktrees_directory_for_repo,
+    linked_worktree_short_name, repo_identity_path, worktree_display_name,
+    worktrees_directory_for_repo,
 };
 pub use manifest_tree::ManifestTree;
 pub use project_search::{Search, SearchResults};
@@ -2143,6 +2144,16 @@ impl Project {
         abs_path: &str,
         cx: &mut Context<Self>,
     ) -> Entity<Worktree> {
+        self.add_test_remote_worktree_with_repository(abs_path, None, cx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_test_remote_worktree_with_repository(
+        &mut self,
+        abs_path: &str,
+        root_repo_common_dir: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> Entity<Worktree> {
         use rpc::NoopProtoClient;
         use util::paths::PathStyle;
 
@@ -2160,7 +2171,7 @@ impl Project {
                 root_name,
                 visible: true,
                 abs_path: abs_path.to_string(),
-                root_repo_common_dir: None,
+                root_repo_common_dir: root_repo_common_dir.map(str::to_owned),
                 root_repo_is_linked_worktree: false,
             },
             client,
@@ -6138,7 +6149,9 @@ impl Project {
     ) -> Result<()> {
         self.worktree_store.update(cx, |worktree_store, cx| {
             worktree_store.set_worktrees_from_proto(worktrees, self.replica_id(), cx)
-        })
+        })?;
+        self.emit_group_key_changed_if_needed(cx);
+        Ok(())
     }
 
     fn set_collaborators_from_proto(
@@ -6376,6 +6389,21 @@ impl Project {
         self.worktree_store.read(cx).paths(cx)
     }
 
+    pub fn update_worktree_abs_path(
+        &mut self,
+        worktree_id: WorktreeId,
+        new_path: &Path,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.worktree_store.update(cx, |worktree_store, cx| {
+            worktree_store.update_worktree_abs_path(worktree_id, new_path, cx)
+        }) {
+            return false;
+        }
+        self.emit_group_key_changed_if_needed(cx);
+        true
+    }
+
     pub fn project_group_key(&self, cx: &App) -> ProjectGroupKey {
         ProjectGroupKey::from_project(self, cx)
     }
@@ -6404,18 +6432,21 @@ impl ProjectGroupKey {
     pub fn from_project(project: &Project, cx: &App) -> Self {
         let paths = project.worktree_paths(cx);
         let host = project.remote_connection_options(cx);
-        Self {
-            paths: paths.main_worktree_path_list().clone(),
-            host,
-        }
+        Self::from_worktree_paths(&paths, host)
     }
 
     pub fn from_worktree_paths(
         paths: &WorktreePaths,
         host: Option<RemoteConnectionOptions>,
     ) -> Self {
+        let main_paths = paths
+            .main_worktree_path_list()
+            .ordered_paths()
+            .unique()
+            .cloned()
+            .collect::<Vec<_>>();
         Self {
-            paths: paths.main_worktree_path_list().clone(),
+            paths: PathList::new(&main_paths),
             host,
         }
     }

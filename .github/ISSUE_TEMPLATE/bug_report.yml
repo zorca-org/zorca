@@ -1,0 +1,47 @@
+name: Report a bug
+description: Report a problem with ZOrca.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ZOrca is a pre-alpha fork of [Zed](https://github.com/zed-industries/zed).
+
+        If the problem also happens in upstream Zed, it belongs in
+        [zed-industries/zed](https://github.com/zed-industries/zed/issues) —
+        fixing it there fixes it here too.
+  - type: textarea
+    attributes:
+      label: Reproduction steps
+      description: How to reproduce the problem, starting from a fresh launch.
+      placeholder: |
+        1. Start ZOrca
+        2. Add a project group
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened instead
+      description: Include the panic message and backtrace if the app crashed.
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse --short HEAD` for the build you ran.
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+    validations:
+      required: true

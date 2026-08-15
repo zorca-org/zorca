@@ -1,0 +1,31 @@
+name: Clean old artifacts
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [zorca-ci, release, Deploy website]
+    types: [completed]
+
+permissions:
+  actions: write
+
+concurrency:
+  group: artifact-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Keep only the newest artifact of each name
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.name, .created_at, .id] | @tsv' |
+            sort -t $'\t' -k1,1 -k2,2r |
+            awk -F '\t' 'seen[$1]++ { print $3 }' |
+            while IFS= read -r artifact_id; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"
+            done

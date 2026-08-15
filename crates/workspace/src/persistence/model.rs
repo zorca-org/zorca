@@ -59,7 +59,18 @@ pub struct SessionWorkspace {
     pub workspace_id: WorkspaceId,
     pub location: SerializedWorkspaceLocation,
     pub paths: PathList,
+    pub identity_paths: PathList,
     pub window_id: Option<WindowId>,
+}
+
+impl SessionWorkspace {
+    pub fn project_group_key(&self) -> ProjectGroupKey {
+        let host = match &self.location {
+            SerializedWorkspaceLocation::Local => None,
+            SerializedWorkspaceLocation::Remote(options) => Some(options.clone()),
+        };
+        ProjectGroupKey::new(host, self.identity_paths.clone())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

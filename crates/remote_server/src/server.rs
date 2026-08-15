@@ -644,7 +644,8 @@ pub fn execute_run(
             .detach();
         }
         settings::init(cx);
-        let app_commit_sha = option_env!("ZED_COMMIT_SHA").map(|s| AppCommitSha::new(s.to_owned()));
+        let app_commit_sha = option_env!("ZED_COMMIT_SHA")
+            .map(|s| AppCommitSha::new(s.to_owned(), option_env!("ZED_SOURCE_DIRTY") == Some("1")));
         let app_version = AppVersion::load(
             env!("ZED_PKG_VERSION"),
             option_env!("ZED_BUILD_ID"),

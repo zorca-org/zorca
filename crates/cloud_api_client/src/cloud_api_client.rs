@@ -295,21 +295,6 @@ impl CloudApiClient {
             .await?;
         Ok(())
     }
-
-    pub async fn submit_edit_prediction_feedback(
-        &self,
-        body: SubmitEditPredictionFeedbackBody,
-    ) -> Result<()> {
-        let request = Request::builder().method(Method::POST).uri(
-            self.http_client
-                .build_zed_cloud_url("/client/feedback/edit_prediction")?
-                .as_ref(),
-        );
-
-        self.send_authenticated_request(request, AsyncBody::from(serde_json::to_string(&body)?))
-            .await?;
-        Ok(())
-    }
 }
 
 fn build_request(

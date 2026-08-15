@@ -34,7 +34,7 @@ use picker::{
 };
 use project::{Worktree, git_store::Repository};
 pub use remote_connections::RemoteSettings;
-pub use remote_servers::RemoteServerProjects;
+pub use remote_servers::{PortsPanel, RemoteServerProjects};
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
@@ -284,6 +284,7 @@ pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
 }
 
 pub fn init(cx: &mut App) {
+    remote_servers::init(cx);
     #[cfg(target_os = "windows")]
     cx.on_action(|open_wsl: &zed_actions::wsl_actions::OpenFolderInWsl, cx| {
         let create_new_window = open_wsl
@@ -2392,7 +2393,7 @@ impl RecentProjectsDelegate {
             .delegate
             .window_project_groups
             .iter_mut()
-            .find(|key| **key == old_key)
+            .find(|key| key.matches(&old_key))
         {
             *entry = new_key;
         }
@@ -2421,7 +2422,7 @@ impl RecentProjectsDelegate {
             });
         }
 
-        self.window_project_groups.retain(|k| k != &key);
+        self.window_project_groups.retain(|k| !k.matches(&key));
     }
 
     fn is_current_workspace(
@@ -2441,7 +2442,7 @@ impl RecentProjectsDelegate {
 
     fn is_active_project_group(&self, key: &ProjectGroupKey, cx: &App) -> bool {
         if let Some(workspace) = self.workspace.upgrade() {
-            return workspace.read(cx).project_group_key(cx) == *key;
+            return workspace.read(cx).project_group_key(cx).matches(key);
         }
         false
     }
@@ -2542,6 +2543,47 @@ mod tests {
                 "/this-window/remote-project-{index}"
             ))]),
         )
+    }
+
+    #[gpui::test]
+    fn removing_a_remote_group_ignores_runtime_ssh_fields(cx: &mut TestAppContext) {
+        init_test(cx);
+        let persisted = ProjectGroupKey::new(
+            Some(RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+                host: "example.com".into(),
+                username: Some("user".into()),
+                ..Default::default()
+            })),
+            PathList::new(&[PathBuf::from("/project")]),
+        );
+        let runtime = ProjectGroupKey::new(
+            Some(RemoteConnectionOptions::Ssh(remote::SshConnectionOptions {
+                host: "example.com".into(),
+                username: Some("user".into()),
+                password: Some("secret".into()),
+                nickname: Some("work".into()),
+                ..Default::default()
+            })),
+            PathList::new(&[PathBuf::from("/project")]),
+        );
+        let delegate = RecentProjectsDelegate::new(
+            WeakEntity::new_invalid(),
+            false,
+            cx.update(|cx| cx.focus_handle()),
+            Vec::new(),
+            vec![persisted],
+            ProjectPickerStyle::Modal,
+        );
+
+        let (picker, cx) =
+            cx.add_window_view(|window, cx| Picker::uniform_list(delegate, window, cx));
+        picker.update_in(cx, |picker, window, cx| {
+            picker.delegate.remove_project_group(runtime, window, cx);
+        });
+
+        picker.read_with(cx, |picker, _| {
+            assert!(picker.delegate.window_project_groups.is_empty());
+        });
     }
 
     fn recent_workspace(index: usize) -> RecentWorkspace {

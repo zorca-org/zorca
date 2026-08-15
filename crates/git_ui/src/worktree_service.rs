@@ -18,9 +18,7 @@ use project::trusted_worktrees::{PathTrust, TrustedWorktrees};
 use remote::RemoteConnectionOptions;
 use settings::Settings;
 use ui::prelude::*;
-use workspace::{
-    MultiWorkspace, OpenMode, PreviousWorkspaceState, ToastView, Workspace, dock::DockPosition,
-};
+use workspace::{MultiWorkspace, OpenMode, ToastView, Workspace, dock::DockPosition};
 use zed_actions::NewWorktreeBranchTarget;
 
 use git::repository::{FetchOptions, Remote};
@@ -57,13 +55,26 @@ impl RemoteBranchName {
     }
 }
 
+fn parse_default_remote_branch(name: &str) -> Option<RemoteBranchName> {
+    // `Repository::default_branch(true)` qualifies only these remote HEADs;
+    // any other slash-containing value can be a local branch such as release/stable.
+    if name.starts_with("refs/remotes/")
+        || name.starts_with("origin/")
+        || name.starts_with("upstream/")
+    {
+        RemoteBranchName::parse(name)
+    } else {
+        None
+    }
+}
+
 /// A "create new worktree" option offered to the user. The set of targets is
 /// derived from repository state by [`worktree_create_targets`] so that the
 /// worktree picker and the sidebar's new-thread menu stay in sync.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorktreeCreateTarget {
     CurrentBranch,
-    DefaultBranch(RemoteBranchName),
+    DefaultBranch(String),
 }
 
 impl WorktreeCreateTarget {
@@ -71,9 +82,18 @@ impl WorktreeCreateTarget {
         match self {
             WorktreeCreateTarget::CurrentBranch => NewWorktreeBranchTarget::CurrentBranch,
             WorktreeCreateTarget::DefaultBranch(default_branch) => {
-                NewWorktreeBranchTarget::RemoteBranch {
-                    remote_name: default_branch.remote_name.clone(),
-                    branch_name: default_branch.branch_name.clone(),
+                if let Some(default_branch) = parse_default_remote_branch(default_branch) {
+                    NewWorktreeBranchTarget::RemoteBranch {
+                        remote_name: default_branch.remote_name,
+                        branch_name: default_branch.branch_name,
+                    }
+                } else {
+                    NewWorktreeBranchTarget::ExistingBranch {
+                        name: default_branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(default_branch)
+                            .to_string(),
+                    }
                 }
             }
         }
@@ -85,7 +105,16 @@ impl WorktreeCreateTarget {
         current_branch_name: Option<&str>,
     ) -> String {
         match self {
-            WorktreeCreateTarget::DefaultBranch(default_branch) => default_branch.display_name(),
+            WorktreeCreateTarget::DefaultBranch(default_branch) => {
+                parse_default_remote_branch(default_branch)
+                    .map(|branch| branch.display_name())
+                    .unwrap_or_else(|| {
+                        default_branch
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(default_branch)
+                            .to_string()
+                    })
+            }
             WorktreeCreateTarget::CurrentBranch => {
                 if has_multiple_repositories {
                     "current branches".to_string()
@@ -98,11 +127,11 @@ impl WorktreeCreateTarget {
 }
 
 /// Determines which "create new worktree" options to surface for the given
-/// repository state: prefer the remote default branch when it differs from the
+/// repository state: prefer the default branch when it differs from the
 /// current branch, and otherwise offer the current branch.
 pub fn worktree_create_targets(
     has_multiple_repositories: bool,
-    default_branch: Option<RemoteBranchName>,
+    default_branch: Option<String>,
     current_branch_name: Option<&str>,
 ) -> Vec<WorktreeCreateTarget> {
     if has_multiple_repositories {
@@ -111,8 +140,15 @@ pub fn worktree_create_targets(
     let Some(default_branch) = default_branch else {
         return vec![WorktreeCreateTarget::CurrentBranch];
     };
-    let is_different =
-        current_branch_name.is_none_or(|current| current != default_branch.branch_name);
+    let default_branch_name = parse_default_remote_branch(&default_branch)
+        .map(|branch| branch.branch_name)
+        .unwrap_or_else(|| {
+            default_branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&default_branch)
+                .to_string()
+        });
+    let is_different = current_branch_name.is_none_or(|current| current != default_branch_name);
     let mut targets = vec![WorktreeCreateTarget::DefaultBranch(default_branch)];
     if is_different {
         targets.push(WorktreeCreateTarget::CurrentBranch);
@@ -121,8 +157,7 @@ pub fn worktree_create_targets(
 }
 
 /// Whether a worktree operation is creating a new one or switching to an
-/// existing one. Controls whether the source workspace's state (dock layout,
-/// open files, agent panel draft) is inherited by the destination.
+/// existing one.
 enum WorktreeOperation {
     Create,
     Switch,
@@ -629,11 +664,29 @@ fn maybe_propagate_worktree_trust(
         if ProjectSettings::get_global(cx).session.trust_all_worktrees {
             return;
         }
+        // `has_restricted_worktrees` reads only the restricted map, which is
+        // empty both for "explicitly trusted" and for "never evaluated". Taking
+        // it as proof of trust silently propagated trust the user never gave,
+        // which is why no prompt ever appeared. `can_trust` is the only call
+        // that consults the trusted paths.
         let source_is_trusted = source_workspace
             .upgrade()
-            .map(|workspace| {
+            .and_then(|workspace| {
                 let source_worktree_store = workspace.read(cx).project().read(cx).worktree_store();
-                !TrustedWorktrees::has_restricted_worktrees(&source_worktree_store, cx)
+                let worktree_ids: Vec<_> = source_worktree_store
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .map(|worktree| worktree.read(cx).id())
+                    .collect();
+                if worktree_ids.is_empty() {
+                    return Some(false);
+                }
+                let trusted_store = TrustedWorktrees::try_get_global(cx)?;
+                Some(trusted_store.update(cx, |trusted_store, cx| {
+                    worktree_ids.into_iter().all(|worktree_id| {
+                        trusted_store.can_trust(&source_worktree_store, worktree_id, cx)
+                    })
+                }))
             })
             .unwrap_or(false);
 
@@ -670,11 +723,80 @@ fn maybe_propagate_worktree_trust(
     .ok();
 }
 
-/// Handles the `CreateWorktree` action generically, without any agent panel involvement.
-/// Creates a new git worktree, opens the workspace, restores layout and files.
-/// Errors are surfaced to the user via toasts; the new workspace handle is
-/// discarded. Use [`create_worktree_workspace`] when you need the resulting
-/// workspace (e.g., the `create_thread` agent tool spawns a thread in it).
+/// Removes a linked worktree, offering a force retry when Git refuses because
+/// the worktree is dirty or its checkout metadata is stale. Git runs from the
+/// repository's main worktree, so the handle may belong to the worktree being
+/// removed.
+///
+/// Shared with the worktree picker so the two entry points cannot disagree
+/// about when a force delete is offered.
+pub fn remove_worktree(
+    repository: Entity<Repository>,
+    path: PathBuf,
+    display_name: String,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<anyhow::Result<bool>> {
+    window.spawn(cx, async move |cx| {
+        let mut force = false;
+        let first_attempt = repository
+            .update(cx, |repository, _| {
+                repository.remove_worktree(path.clone(), force)
+            })
+            .await?;
+
+        let result = match first_attempt {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                match crate::worktree_picker::force_delete_prompt_for_worktree_remove_error(
+                    &error,
+                    &display_name,
+                ) {
+                    Some(prompt) => {
+                        let answer = cx.update(|window, cx| {
+                            window.prompt(
+                                gpui::PromptLevel::Warning,
+                                &prompt,
+                                None,
+                                &["Force Delete", "Cancel"],
+                                cx,
+                            )
+                        })?;
+                        if answer.await != Ok(0) {
+                            return Ok(false);
+                        }
+                        force = true;
+                        repository
+                            .update(cx, |repository, _| {
+                                repository.remove_worktree(path.clone(), true)
+                            })
+                            .await?
+                    }
+                    None => Err(error),
+                }
+            }
+        };
+
+        if let Err(error) = result {
+            if let Some(workspace) = workspace.upgrade() {
+                cx.update(|_window, cx| {
+                    crate::git_panel::show_error_toast(
+                        workspace,
+                        crate::worktree_picker::remove_worktree_command(&path, force),
+                        error,
+                        cx,
+                    )
+                })?;
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    })
+}
+
+/// Creates a new worktree, activates its independent workspace, and reports
+/// failures through the source workspace.
 pub fn handle_create_worktree(
     workspace: &mut Workspace,
     action: &zed_actions::CreateWorktree,
@@ -682,17 +804,8 @@ pub fn handle_create_worktree(
     fallback_focused_dock: Option<DockPosition>,
     cx: &mut gpui::Context<Workspace>,
 ) {
-    let task = create_worktree_workspace_inner(
-        workspace,
-        action,
-        window,
-        fallback_focused_dock,
-        RemoteBranchFetchMode::Fetch,
-        // The user explicitly asked to create a worktree, so foreground it.
-        true,
-        cx,
-    );
-    task.detach_and_log_err(cx);
+    create_and_activate_worktree_workspace(workspace, action, window, fallback_focused_dock, cx)
+        .detach_and_log_err(cx);
 }
 
 /// Outcome of [`create_worktree_workspace`].
@@ -705,6 +818,25 @@ pub struct CreatedWorktreeWorkspace {
     /// that care — like the `create_thread` agent tool — can use this to warn
     /// that the result may not reflect every source worktree's state.
     pub consolidated_worktrees: bool,
+}
+
+/// Creates a worktree and activates its workspace when setup completes.
+pub fn create_and_activate_worktree_workspace(
+    workspace: &mut Workspace,
+    action: &zed_actions::CreateWorktree,
+    window: &mut gpui::Window,
+    fallback_focused_dock: Option<DockPosition>,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    create_worktree_workspace_inner(
+        workspace,
+        action,
+        window,
+        fallback_focused_dock,
+        RemoteBranchFetchMode::Fetch,
+        true,
+        cx,
+    )
 }
 
 /// Same as [`handle_create_worktree`], but returns a `Task` that resolves to
@@ -772,8 +904,9 @@ fn create_worktree_workspace_inner(
         return Task::ready(Err(anyhow!("A worktree creation is already in progress")));
     }
 
-    let previous_state =
-        workspace.capture_state_for_worktree_switch(window, fallback_focused_dock, cx);
+    let focused_dock = workspace
+        .focused_dock_position(window, cx)
+        .or(fallback_focused_dock);
     let workspace_handle = workspace.weak_handle();
     let window_handle = window.window_handle().downcast::<MultiWorkspace>();
     let remote_connection_options = project.read(cx).remote_connection_options(cx);
@@ -847,7 +980,7 @@ fn create_worktree_workspace_inner(
             branch_target.clone(),
             fetch_askpass_delegates,
             remote_branch_fetch_mode,
-            previous_state,
+            focused_dock,
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
@@ -907,18 +1040,14 @@ pub fn handle_switch_worktree(
         return;
     }
 
-    let previous_state =
-        workspace.capture_state_for_worktree_switch(window, fallback_focused_dock, cx);
+    let focused_dock = workspace
+        .focused_dock_position(window, cx)
+        .or(fallback_focused_dock);
     let workspace_handle = workspace.weak_handle();
     let window_handle = window.window_handle().downcast::<MultiWorkspace>();
     let remote_connection_options = project.read(cx).remote_connection_options(cx);
 
-    let (git_repos, non_git_paths) = classify_worktrees(project.read(cx), cx);
-
-    let git_repo_work_dirs: Vec<PathBuf> = git_repos
-        .iter()
-        .map(|repo| repo.read(cx).work_directory_abs_path.to_path_buf())
-        .collect();
+    let (_, non_git_paths) = classify_worktrees(project.read(cx), cx);
 
     let display_name: SharedString = action.display_name.clone().into();
 
@@ -929,9 +1058,8 @@ pub fn handle_switch_worktree(
     cx.spawn_in(window, async move |_workspace_entity, mut cx| {
         let result = do_switch_worktree(
             worktree_path,
-            git_repo_work_dirs,
             non_git_paths,
-            previous_state,
+            focused_dock,
             workspace_handle.clone(),
             window_handle,
             remote_connection_options,
@@ -961,7 +1089,7 @@ async fn do_create_worktree(
     branch_target: NewWorktreeBranchTarget,
     fetch_askpass_delegates: Vec<AskPassDelegate>,
     remote_branch_fetch_mode: RemoteBranchFetchMode,
-    previous_state: PreviousWorkspaceState,
+    focused_dock: Option<DockPosition>,
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
@@ -1079,10 +1207,8 @@ async fn do_create_worktree(
 
     let workspace = open_worktree_workspace(
         all_paths,
-        path_remapping,
-        non_git_paths,
         has_non_git,
-        previous_state,
+        focused_dock,
         workspace,
         window_handle,
         remote_connection_options,
@@ -1100,29 +1226,21 @@ async fn do_create_worktree(
 
 async fn do_switch_worktree(
     worktree_path: PathBuf,
-    git_repo_work_dirs: Vec<PathBuf>,
     non_git_paths: Vec<PathBuf>,
-    previous_state: PreviousWorkspaceState,
+    focused_dock: Option<DockPosition>,
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Entity<Workspace>> {
-    let path_remapping: Vec<(PathBuf, PathBuf)> = git_repo_work_dirs
-        .iter()
-        .map(|work_dir| (work_dir.clone(), worktree_path.clone()))
-        .collect();
-
     let mut all_paths = vec![worktree_path];
     let has_non_git = !non_git_paths.is_empty();
     all_paths.extend(non_git_paths.iter().cloned());
 
     open_worktree_workspace(
         all_paths,
-        path_remapping,
-        non_git_paths,
         has_non_git,
-        previous_state,
+        focused_dock,
         workspace,
         window_handle,
         remote_connection_options,
@@ -1139,10 +1257,8 @@ async fn do_switch_worktree(
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
     all_paths: Vec<PathBuf>,
-    path_remapping: Vec<(PathBuf, PathBuf)>,
-    non_git_paths: Vec<PathBuf>,
     has_non_git: bool,
-    previous_state: PreviousWorkspaceState,
+    focused_dock: Option<DockPosition>,
     workspace: WeakEntity<Workspace>,
     window_handle: Option<gpui::WindowHandle<MultiWorkspace>>,
     remote_connection_options: Option<RemoteConnectionOptions>,
@@ -1153,22 +1269,7 @@ async fn open_worktree_workspace(
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
-    let focused_dock = previous_state.focused_dock;
-
     let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
-
-    // When `activate` is false the new workspace is opened in the background
-    // (e.g. the agent's `create_thread` tool), so it should be a clean
-    // checkout rather than inheriting the source workspace's open files and
-    // dock layout. The state transfer only applies when we're foregrounding
-    // a freshly-created worktree for the user.
-    let transfer_state = is_creating_new_worktree && activate;
-
-    let source_for_transfer = if transfer_state {
-        Some(workspace.clone())
-    } else {
-        None
-    };
 
     let (workspace_task, modal_workspace) =
         window_handle.update(cx, |multi_workspace, window, cx| {
@@ -1176,25 +1277,7 @@ async fn open_worktree_workspace(
             let active_workspace = multi_workspace.workspace().clone();
             let modal_workspace = active_workspace.clone();
 
-            let init: Option<
-                Box<
-                    dyn FnOnce(&mut Workspace, &mut gpui::Window, &mut gpui::Context<Workspace>)
-                        + Send,
-                >,
-            > = if transfer_state {
-                let dock_structure = previous_state.dock_structure;
-                Some(Box::new(
-                    move |workspace: &mut Workspace,
-                          window: &mut gpui::Window,
-                          cx: &mut gpui::Context<Workspace>| {
-                        workspace.set_dock_structure(dock_structure, window, cx);
-                    },
-                ))
-            } else {
-                None
-            };
-
-            let task = multi_workspace.find_or_create_workspace_with_source_workspace(
+            let task = multi_workspace.find_or_create_workspace(
                 path_list,
                 remote_connection_options,
                 None,
@@ -1207,9 +1290,8 @@ async fn open_worktree_workspace(
                     )
                 },
                 &[],
-                init,
+                None,
                 OpenMode::Add,
-                source_for_transfer.clone(),
                 window,
                 cx,
             );
@@ -1251,92 +1333,20 @@ async fn open_worktree_workspace(
 
     maybe_propagate_worktree_trust(&workspace, &new_workspace, &all_paths, cx);
 
-    if transfer_state {
-        window_handle.update(cx, |_multi_workspace, window, cx| {
+    if is_creating_new_worktree && activate && has_non_git {
+        window_handle.update(cx, |_multi_workspace, _window, cx| {
             new_workspace.update(cx, |workspace, cx| {
-                if has_non_git {
-                    struct WorktreeCreationToast;
-                    let toast_id =
-                        workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
-                    workspace.show_toast(
-                        workspace::Toast::new(
-                            toast_id,
-                            "Some project folders are not git repositories. \
-                             They were included as-is without creating a worktree.",
-                        ),
-                        cx,
-                    );
-                }
-
-                // Remap every previously-open file path into the new worktree.
-                let remap_path = |original_path: PathBuf| -> Option<PathBuf> {
-                    let best_match = path_remapping
-                        .iter()
-                        .filter_map(|(old_root, new_root)| {
-                            original_path.strip_prefix(old_root).ok().map(|relative| {
-                                (old_root.components().count(), new_root.join(relative))
-                            })
-                        })
-                        .max_by_key(|(depth, _)| *depth);
-
-                    if let Some((_, remapped_path)) = best_match {
-                        return Some(remapped_path);
-                    }
-
-                    for non_git in &non_git_paths {
-                        if original_path.starts_with(non_git) {
-                            return Some(original_path);
-                        }
-                    }
-                    None
-                };
-
-                let remapped_active_path =
-                    previous_state.active_file_path.and_then(|p| remap_path(p));
-
-                let mut paths_to_open: Vec<PathBuf> = Vec::new();
-                let mut seen = HashSet::default();
-                for path in previous_state.open_file_paths {
-                    if let Some(remapped) = remap_path(path) {
-                        if remapped_active_path.as_ref() != Some(&remapped)
-                            && seen.insert(remapped.clone())
-                        {
-                            paths_to_open.push(remapped);
-                        }
-                    }
-                }
-
-                if let Some(active) = &remapped_active_path {
-                    if seen.insert(active.clone()) {
-                        paths_to_open.push(active.clone());
-                    }
-                }
-
-                if !paths_to_open.is_empty() {
-                    let should_focus_center = focused_dock.is_none();
-                    let open_task = workspace.open_paths(
-                        paths_to_open,
-                        workspace::OpenOptions {
-                            focus: Some(false),
-                            ..Default::default()
-                        },
-                        None,
-                        window,
-                        cx,
-                    );
-                    cx.spawn_in(window, async move |workspace, cx| {
-                        for item in open_task.await.into_iter().flatten() {
-                            item.log_err();
-                        }
-                        if should_focus_center {
-                            workspace.update_in(cx, |workspace, window, cx| {
-                                workspace.focus_center_pane(window, cx);
-                            })?;
-                        }
-                        anyhow::Ok(())
-                    })
-                    .detach_and_log_err(cx);
-                }
+                struct WorktreeCreationToast;
+                let toast_id =
+                    workspace::notifications::NotificationId::unique::<WorktreeCreationToast>();
+                workspace.show_toast(
+                    workspace::Toast::new(
+                        toast_id,
+                        "Some project folders are not git repositories. \
+                         They were included as-is without creating a worktree.",
+                    ),
+                    cx,
+                );
             });
         })?;
     }
@@ -1351,7 +1361,15 @@ async fn open_worktree_workspace(
 
     window_handle.update(cx, |multi_workspace, window, cx| {
         if activate {
-            multi_workspace.activate(new_workspace.clone(), source_for_transfer, window, cx);
+            multi_workspace.activate(new_workspace.clone(), None, window, cx);
+            // Only the active workspace's modal layer is rendered
+            // (`MultiWorkspace::render`), and every other place that offers the
+            // trust modal fires while this workspace is still a background tab,
+            // so the prompt was built but never drawn. This is the first point
+            // on this path where it can actually be seen.
+            new_workspace.update(cx, |workspace, cx| {
+                workspace.show_worktree_trust_security_modal(false, window, cx);
+            });
         } else {
             // Background open: register the new workspace as a retained tab
             // but leave the user where they are.
@@ -1360,11 +1378,35 @@ async fn open_worktree_workspace(
 
         if is_creating_new_worktree {
             new_workspace.update(cx, |workspace, cx| {
-                // Run create-worktree setup hooks regardless of foreground vs
-                // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
+                // Setup hooks run commands from the worktree. Wait for the
+                // folder-trust answer and skip them entirely if the user chose
+                // Restricted Mode — otherwise a `CreateWorktree` task template
+                // executes in a directory they declined to vouch for.
+                let trust_answered = workspace.worktree_trust_answered(window, cx);
+                cx.spawn_in(window, async move |workspace, cx| {
+                    trust_answered.await;
+                    workspace.update_in(cx, |workspace, window, cx| {
+                        let restricted = TrustedWorktrees::has_restricted_worktrees(
+                            &workspace.project().read(cx).worktree_store(),
+                            cx,
+                        );
+                        if restricted {
+                            log::info!(
+                                "skipping create-worktree setup tasks: worktree is restricted"
+                            );
+                            return;
+                        }
+                        workspace.run_create_worktree_tasks(window, cx);
+                    })
+                })
+                .detach_and_log_err(cx);
 
-                if activate && let Some(dock_position) = focused_dock {
+                // Restoring dock focus would dismiss the folder-trust prompt
+                // shown just above, and the user would never get to answer it.
+                if activate
+                    && !workspace.has_active_modal(window, cx)
+                    && let Some(dock_position) = focused_dock
+                {
                     let dock = workspace.dock_at_position(dock_position);
                     if let Some(panel) = dock.read(cx).active_panel() {
                         panel.panel_focus_handle(cx).focus(window, cx);
@@ -1381,7 +1423,7 @@ async fn open_worktree_workspace(
 mod tests {
     use super::*;
     use fs::Fs;
-    use gpui::{App, Task, TestAppContext};
+    use gpui::{App, Task, TestAppContext, VisualTestContext};
     use language::language_settings::AllLanguageSettings;
     use project::project_settings::ProjectSettings;
     use project::task_store::{TaskSettingsLocation, TaskStore};
@@ -1429,6 +1471,524 @@ mod tests {
             WorkspaceSettings::register(cx);
             TaskStore::init(None);
         });
+    }
+
+    async fn init_create_worktree_test(
+        cx: &mut TestAppContext,
+    ) -> (Arc<FakeFs>, Entity<Project>, PathBuf) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "source.txt": "source",
+                },
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/root/project/.git").as_ref(),
+            &[("source.txt", "source".to_string())],
+            "deadbeef",
+        );
+
+        let main_project_root = PathBuf::from(path!("/root/project"));
+        let project = Project::test(fs.clone(), [main_project_root.as_path()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        (fs, project, main_project_root)
+    }
+
+    #[gpui::test]
+    async fn test_foreground_create_activates_clean_worktree_and_preserves_source_tabs(
+        cx: &mut TestAppContext,
+    ) {
+        let (_fs, project, main_project_root) = init_create_worktree_test(cx).await;
+        let main_worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("main worktree should exist")
+                .read(cx)
+                .id()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let source_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        source_workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (main_worktree_id, rel_path("source.txt")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("source file should open");
+        source_workspace.update_in(cx, |workspace, window, cx| {
+            handle_create_worktree(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("feature".to_string()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let created_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        assert_ne!(created_workspace, source_workspace);
+        assert!(
+            created_workspace
+                .read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx))
+                .is_empty(),
+            "a new worktree must not inherit the source worktree's tabs"
+        );
+        assert_eq!(
+            source_workspace.read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx)),
+            [main_project_root.join("source.txt")]
+        );
+
+        let (created_root, created_worktree_id) =
+            created_workspace.read_with(cx, |workspace, cx| {
+                let created_root = workspace
+                    .root_paths(cx)
+                    .into_iter()
+                    .next()
+                    .expect("created worktree should have a root")
+                    .to_path_buf();
+                let created_worktree_id = workspace
+                    .project()
+                    .read(cx)
+                    .worktrees(cx)
+                    .next()
+                    .expect("created worktree should exist")
+                    .read(cx)
+                    .id();
+                (created_root, created_worktree_id)
+            });
+        created_workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (created_worktree_id, rel_path("source.txt")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("created worktree file should open");
+
+        created_workspace.update_in(cx, |workspace, window, cx| {
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: main_project_root.clone(),
+                    display_name: "project".to_string(),
+                },
+                window,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone()),
+            source_workspace
+        );
+        assert_eq!(
+            source_workspace.read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx)),
+            [main_project_root.join("source.txt")]
+        );
+
+        source_workspace.update_in(cx, |workspace, window, cx| {
+            handle_switch_worktree(
+                workspace,
+                &zed_actions::SwitchWorktree {
+                    path: created_root.clone(),
+                    display_name: "feature".to_string(),
+                },
+                window,
+                None,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone()),
+            created_workspace
+        );
+        assert_eq!(
+            created_workspace.read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx)),
+            [created_root.join("source.txt")]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_background_create_keeps_source_active_and_starts_clean(cx: &mut TestAppContext) {
+        let (_fs, project, _main_project_root) = init_create_worktree_test(cx).await;
+        let main_worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("main worktree should exist")
+                .read(cx)
+                .id()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.retain_active_workspace(cx);
+        });
+        let source_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        source_workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (main_worktree_id, rel_path("source.txt")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("source file should open");
+        let source_focus = cx.update(|window, cx| {
+            window
+                .focused(cx)
+                .expect("the source file should be focused")
+        });
+
+        let create = source_workspace.update_in(cx, |workspace, window, cx| {
+            create_worktree_workspace(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("background-feature".to_string()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                None,
+                cx,
+            )
+        });
+        let created_workspace = create
+            .await
+            .expect("background worktree creation should succeed")
+            .workspace;
+        cx.run_until_parked();
+
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone()),
+            source_workspace
+        );
+        cx.update(|window, _cx| {
+            assert!(
+                source_focus.is_focused(window),
+                "background worktree creation must preserve source focus"
+            );
+        });
+        assert!(
+            created_workspace
+                .read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx))
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_failed_create_preserves_active_workspace_and_tabs(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    "source.txt": "source",
+                },
+            }),
+        )
+        .await;
+        let source_root = PathBuf::from(path!("/root/project"));
+        let project = Project::test(fs, [source_root.as_path()], cx).await;
+        let source_worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("source worktree should exist")
+                .read(cx)
+                .id()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let source_workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        source_workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(
+                    (source_worktree_id, rel_path("source.txt")),
+                    None,
+                    true,
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("source file should open");
+
+        let create = source_workspace.update_in(cx, |workspace, window, cx| {
+            create_worktree_workspace(
+                workspace,
+                &zed_actions::CreateWorktree {
+                    worktree_name: Some("feature".to_string()),
+                    branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                },
+                window,
+                None,
+                cx,
+            )
+        });
+        assert!(create.await.is_err());
+
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone()),
+            source_workspace
+        );
+        assert_eq!(
+            source_workspace.read_with(cx, |workspace, cx| workspace.open_item_abs_paths(cx)),
+            [source_root.join("source.txt")]
+        );
+    }
+
+    async fn init_remove_worktree_test(
+        cx: &mut TestAppContext,
+        dirty: bool,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<Repository>,
+        PathBuf,
+        Entity<Workspace>,
+        VisualTestContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "project": {
+                    ".git": {},
+                    "file.txt": "content",
+                },
+                "worktrees": {},
+            }),
+        )
+        .await;
+        fs.set_head_for_repo(
+            path!("/root/project/.git").as_ref(),
+            &[("file.txt", "content".to_string())],
+            "deadbeef",
+        );
+
+        let project = Project::test(fs.clone(), [path!("/root/project").as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .expect("project should have a repository")
+                .clone()
+        });
+        let worktree_path = PathBuf::from(path!("/root/worktrees/feature"));
+        cx.update(|cx| {
+            repository.update(cx, |repository, _| {
+                repository.create_worktree(
+                    git::repository::CreateWorktreeTarget::NewBranch {
+                        branch_name: "feature".to_string(),
+                        base_sha: Some("deadbeef".to_string()),
+                    },
+                    worktree_path.clone(),
+                )
+            })
+        })
+        .await
+        .expect("create worktree job should complete")
+        .expect("worktree should be created");
+
+        if dirty {
+            fs.with_git_state(path!("/root/project/.git").as_ref(), true, |state| {
+                state
+                    .worktrees_requiring_force_delete
+                    .insert(worktree_path.clone());
+            })
+            .expect("failed to mark worktree as requiring force delete");
+        }
+
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("test window should be available");
+        let cx = VisualTestContext::from_window(window_handle.into(), cx);
+        (fs, repository, worktree_path, workspace, cx)
+    }
+
+    #[gpui::test]
+    async fn test_shared_remove_worktree_retries_with_force_after_confirmation(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, repository, worktree_path, workspace, mut cx) =
+            init_remove_worktree_test(cx, true).await;
+
+        let delete = cx.update(|window, cx| {
+            remove_worktree(
+                repository.clone(),
+                worktree_path.clone(),
+                "feature".to_string(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        assert!(fs.is_dir(&worktree_path).await);
+
+        cx.simulate_prompt_answer("Force Delete");
+        cx.run_until_parked();
+
+        assert!(delete.await.expect("delete task should complete"));
+        assert!(!fs.is_dir(&worktree_path).await);
+        let worktrees = repository
+            .update(&mut cx, |repository, _| repository.worktrees())
+            .await
+            .expect("worktree listing job should complete")
+            .expect("worktrees should be listed");
+        assert!(
+            worktrees
+                .iter()
+                .all(|worktree| worktree.path != worktree_path)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_shared_remove_worktree_cancel_preserves_worktree(cx: &mut TestAppContext) {
+        let (fs, repository, worktree_path, workspace, mut cx) =
+            init_remove_worktree_test(cx, true).await;
+
+        let delete = cx.update(|window, cx| {
+            remove_worktree(
+                repository.clone(),
+                worktree_path.clone(),
+                "feature".to_string(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+
+        cx.simulate_prompt_answer("Cancel");
+        cx.run_until_parked();
+
+        assert!(!delete.await.expect("delete task should complete"));
+        assert!(fs.is_dir(&worktree_path).await);
+        let worktrees = repository
+            .update(&mut cx, |repository, _| repository.worktrees())
+            .await
+            .expect("worktree listing job should complete")
+            .expect("worktrees should be listed");
+        assert!(
+            worktrees
+                .iter()
+                .any(|worktree| worktree.path == worktree_path)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_shared_remove_stale_worktree_cleans_up_git_metadata(cx: &mut TestAppContext) {
+        let (fs, repository, worktree_path, workspace, mut cx) =
+            init_remove_worktree_test(cx, false).await;
+        let dot_git_path = worktree_path.join(".git");
+        let dot_git = fs
+            .load(&dot_git_path)
+            .await
+            .expect("linked worktree should have a .git file");
+        let admin_path = PathBuf::from(
+            dot_git
+                .strip_prefix("gitdir:")
+                .expect("linked worktree .git file should name its admin directory")
+                .trim(),
+        );
+        assert!(fs.is_dir(&admin_path).await);
+        fs.remove_file(
+            &dot_git_path,
+            fs::RemoveOptions {
+                recursive: false,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .expect("should remove only the linked worktree .git file");
+
+        let delete = cx.update(|window, cx| {
+            remove_worktree(
+                repository.clone(),
+                worktree_path.clone(),
+                "feature".to_string(),
+                workspace.downgrade(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.pending_prompt().map(|prompt| prompt.0),
+            Some("Worktree \"feature\" has stale Git metadata. Force clean it up?".to_string())
+        );
+        assert!(fs.is_dir(&worktree_path).await);
+        assert!(!fs.is_file(&dot_git_path).await);
+
+        cx.simulate_prompt_answer("Force Delete");
+        cx.run_until_parked();
+
+        assert!(delete.await.expect("delete task should complete"));
+        assert!(!fs.is_dir(&worktree_path).await);
+        assert!(!fs.is_dir(&admin_path).await);
+        let worktrees = repository
+            .update(&mut cx, |repository, _| repository.worktrees())
+            .await
+            .expect("worktree listing job should complete")
+            .expect("worktrees should be listed");
+        assert!(
+            worktrees
+                .iter()
+                .all(|worktree| worktree.path != worktree_path)
+        );
     }
 
     fn install_counting_provider_and_worktree_hook(
@@ -1688,16 +2248,6 @@ mod tests {
             !new_has_restricted,
             "linked worktree should inherit trust from the main worktree"
         );
-
-        // The security modal should not be showing
-        let has_modal = new_workspace.read_with(cx, |ws, cx| {
-            ws.active_modal::<workspace::security_modal::SecurityModal>(cx)
-                .is_some()
-        });
-        assert!(
-            !has_modal,
-            "security modal should not show for a linked worktree created from a trusted main worktree"
-        );
     }
 
     #[test]
@@ -1722,30 +2272,27 @@ mod tests {
 
     #[test]
     fn test_worktree_create_targets() {
-        let origin_main = RemoteBranchName {
-            remote_name: "origin".to_string(),
-            branch_name: "main".to_string(),
-        };
+        let origin_primary = "origin/trunk".to_string();
 
         // Multiple repositories: only the current branch, regardless of default.
         assert_eq!(
-            worktree_create_targets(true, Some(origin_main.clone()), Some("feature")),
+            worktree_create_targets(true, Some(origin_primary.clone()), Some("feature")),
             vec![WorktreeCreateTarget::CurrentBranch]
         );
 
         // Default branch differs from current: offer both, default first.
         assert_eq!(
-            worktree_create_targets(false, Some(origin_main.clone()), Some("feature")),
+            worktree_create_targets(false, Some(origin_primary.clone()), Some("feature")),
             vec![
-                WorktreeCreateTarget::DefaultBranch(origin_main.clone()),
+                WorktreeCreateTarget::DefaultBranch(origin_primary.clone()),
                 WorktreeCreateTarget::CurrentBranch,
             ]
         );
 
         // Current branch matches the default: only the default branch entry.
         assert_eq!(
-            worktree_create_targets(false, Some(origin_main.clone()), Some("main")),
-            vec![WorktreeCreateTarget::DefaultBranch(origin_main)]
+            worktree_create_targets(false, Some(origin_primary.clone()), Some("trunk")),
+            vec![WorktreeCreateTarget::DefaultBranch(origin_primary)]
         );
 
         // No default branch resolved: fall back to the current branch.
@@ -1757,13 +2304,22 @@ mod tests {
 
     #[test]
     fn test_worktree_create_target_branch_label() {
-        let origin_main = RemoteBranchName {
-            remote_name: "origin".to_string(),
-            branch_name: "main".to_string(),
-        };
         assert_eq!(
-            WorktreeCreateTarget::DefaultBranch(origin_main).branch_label(false, Some("feature")),
-            "origin/main"
+            WorktreeCreateTarget::DefaultBranch("origin/trunk".to_string())
+                .branch_label(false, Some("feature")),
+            "origin/trunk"
+        );
+        assert_eq!(
+            WorktreeCreateTarget::DefaultBranch("trunk".to_string()).branch_target(),
+            NewWorktreeBranchTarget::ExistingBranch {
+                name: "trunk".to_string(),
+            }
+        );
+        assert_eq!(
+            WorktreeCreateTarget::DefaultBranch("release/stable".to_string()).branch_target(),
+            NewWorktreeBranchTarget::ExistingBranch {
+                name: "release/stable".to_string(),
+            }
         );
         assert_eq!(
             WorktreeCreateTarget::CurrentBranch.branch_label(false, Some("feature")),

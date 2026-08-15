@@ -404,6 +404,31 @@ pub fn has_active_connection(opts: &RemoteConnectionOptions, cx: &App) -> bool {
     })
 }
 
+pub async fn invalidate_connection(
+    opts: &RemoteConnectionOptions,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let connection = cx.update_global(|pool: &mut ConnectionPool, _| {
+        if matches!(
+            pool.connections.get(opts),
+            Some(ConnectionPoolEntry::Connected(_))
+        ) {
+            match pool.connections.remove(opts) {
+                Some(ConnectionPoolEntry::Connected(connection)) => connection.upgrade(),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    });
+
+    if let Some(connection) = connection {
+        connection.kill().await?;
+    }
+
+    Ok(())
+}
+
 impl RemoteClient {
     pub fn new(
         unique_identifier: ConnectionIdentifier,
@@ -998,6 +1023,11 @@ impl RemoteClient {
         self.connection_options.clone()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn test_set_connection_options(&mut self, options: RemoteConnectionOptions) {
+        self.connection_options = options;
+    }
+
     pub fn connection(&self) -> Option<Arc<dyn RemoteConnection>> {
         if let State::Connected {
             remote_connection, ..
@@ -1369,6 +1399,7 @@ impl RemoteConnectionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MockDelegate;
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
 
@@ -1423,6 +1454,34 @@ mod tests {
             .connection_type(),
             "podman"
         );
+    }
+
+    #[gpui::test]
+    async fn test_invalidate_connection_replaces_pooled_connection(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (options, _, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        drop(connect_guard);
+
+        let mut async_cx = cx.to_async();
+        let first = connect(options.clone(), Arc::new(MockDelegate), &mut async_cx)
+            .await
+            .unwrap();
+        assert!(cx.update(|cx| has_active_connection(&options, cx)));
+
+        invalidate_connection(&options, &mut async_cx)
+            .await
+            .unwrap();
+        assert!(!cx.update(|cx| has_active_connection(&options, cx)));
+
+        let (_, connect_guard) = RemoteClient::fake_server_with_opts(&options, cx, server_cx);
+        drop(connect_guard);
+        let second = connect(options, Arc::new(MockDelegate), &mut async_cx)
+            .await
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[gpui::test]
@@ -1605,6 +1664,9 @@ pub trait RemoteConnection: Send + Sync {
     ) -> Task<Result<()>>;
     async fn kill(&self) -> Result<()>;
     fn has_been_killed(&self) -> bool;
+    async fn is_usable(&self) -> bool {
+        !self.has_been_killed()
+    }
     fn shares_network_interface(&self) -> bool {
         false
     }

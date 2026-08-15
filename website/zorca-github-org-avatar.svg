@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="navy" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0" stop-color="#10378f" />
+      <stop offset="1" stop-color="#04185b" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0" stop-color="#a631b7" />
+      <stop offset="1" stop-color="#ff505b" />
+    </linearGradient>
+    <clipPath id="rounded-square">
+      <rect width="1024" height="1024" rx="178" />
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#rounded-square)">
+    <rect width="1024" height="1024" fill="url(#navy)" />
+    <path d="M1024 173V1024H194Z" fill="url(#accent)" />
+
+    <g fill="#fff">
+      <path fill-rule="evenodd" d="
+        M198 307H562Q568 307 568 313V367
+        C568 376 556 378 549 386C535 400 527 418 527 439V615
+        C527 643 541 659 558 665Q568 668 568 678V729
+        Q568 735 562 735H198Q192 735 192 729V683
+        Q192 678 196 673L442 382Q447 376 439 376H198
+        Q192 376 192 370V313Q192 307 198 307Z
+
+        M298 665Q291 665 296 659L459 473
+        Q465 466 465 476V659Q465 665 459 665Z
+      " />
+      <path d="
+        M588 307H735C793 307 832 350 832 410V632
+        C832 692 793 735 735 735H588
+        Q582 735 582 729V675Q582 669 588 669H728
+        C751 669 766 653 766 629V413
+        C766 389 751 376 728 376H588
+        Q582 376 582 370V313Q582 307 588 307Z
+      " />
+    </g>
+  </g>
+</svg>

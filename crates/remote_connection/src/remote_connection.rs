@@ -551,7 +551,31 @@ pub fn connect_with_modal(
     cx: &mut App,
 ) -> Task<Result<Option<Entity<RemoteClient>>>> {
     if remote::has_active_connection(&connection_options, cx) {
-        return connect_reusing_pool(connection_options, cx);
+        let workspace = workspace.clone();
+        let window_handle = window.window_handle();
+        return cx.spawn(async move |cx| {
+            let result = cx
+                .update(|cx| connect_reusing_pool(connection_options.clone(), cx))
+                .await;
+            match result {
+                Ok(client) => return Ok(client),
+                Err(error) => {
+                    log::warn!(
+                        "pooled remote connection failed, reconnecting with a fresh transport: {error:#}"
+                    );
+                }
+            }
+
+            if let Err(error) = remote::invalidate_connection(&connection_options, cx).await {
+                log::warn!("failed to close stale remote connection: {error:#}");
+            }
+
+            window_handle
+                .update(cx, |_, window, cx| {
+                    connect_with_modal(&workspace, connection_options, window, cx)
+                })?
+                .await
+        });
     }
 
     workspace.update(cx, |workspace, cx| {
@@ -602,6 +626,10 @@ pub fn connect_reusing_pool(
 
     cx.spawn(async move |cx| {
         let connection = remote::connect(connection_options, delegate.clone(), cx).await?;
+        anyhow::ensure!(
+            connection.is_usable().await,
+            "the pooled remote connection is no longer usable"
+        );
 
         let (_cancel_guard, cancel_rx) = oneshot::channel::<()>();
         cx.update(|cx| {

@@ -7,7 +7,7 @@
   // - "light": Use the theme indicated by the "light" field
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
-    "mode": "system",
+    "mode": "dark",
     "light": "One Light",
     "dark": "One Dark",
   },
@@ -279,6 +279,8 @@
   // 2. Never reduce motion:
   //    "off"
   "reduce_motion": "off",
+  // The ZOrca icon shown in the macOS Dock and app switcher.
+  "app_icon": "default",
   // Determines whether the focused panel follows the mouse location.
   "focus_follows_mouse": {
     "enabled": false,
@@ -557,11 +559,9 @@
     // Whether to show onboarding banners in the titlebar.
     "show_onboarding_banner": true,
     // Whether to show user picture in the titlebar.
-    "show_user_picture": true,
     // Whether to show the user menu in the titlebar.
     "show_user_menu": true,
     // Whether to show the sign in button in the titlebar.
-    "show_sign_in": true,
     // Whether to show the menus in the titlebar.
     "show_menus": false,
     // The layout of window control buttons in the title bar (Linux only).
@@ -971,14 +971,6 @@
     // Set to 0 to collapse all items that have children, 1 or higher to collapse items at that depth or deeper.
     "expand_outlines_with_depth": 100,
   },
-  "collaboration_panel": {
-    // Whether to show the collaboration panel button in the status bar.
-    "button": true,
-    // Where to dock the collaboration panel. Can be 'left' or 'right'.
-    "dock": "right",
-    // Default width of the collaboration panel.
-    "default_width": 240,
-  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,
@@ -1063,10 +1055,13 @@
     "dock": "left",
     // Whether the agent panel should use flexible (proportional) sizing.
     //
-    // Default: true
-    "flexible": true,
+    // Default: false. Flexible sizing gives the dock flex-grow 1.0 against the
+    // centre's own flex_1, which splits the window 50/50 with an empty editor pane.
+    "flexible": false,
     // Where to position the threads sidebar. Can be 'left' or 'right'.
     "sidebar_side": "left",
+    // Whether the sidebar shows the workspace manager — a tree of project
+    // groups, repositories and worktrees. On by default: it is ZOrca's primary
     // Default width when the agent panel is docked to the left or right.
     "default_width": 640,
     // Default height when the agent panel is docked to the bottom.
@@ -1548,12 +1543,14 @@
   //
   // Default: true
   "word_diff_enabled": true,
-  // Control what info is collected by Zed.
+  // Control what info is collected. Off by default: the endpoints still belong
+  // to Zed, and ZOrca has no telemetry of its own yet, so leaving these on
+  // would send a ZOrca user's data to a project they did not choose.
   "telemetry": {
     // Send debug info like crash reports.
-    "diagnostics": true,
-    // Send anonymized usage data like what languages you're using Zed with.
-    "metrics": true,
+    "diagnostics": false,
+    // Send anonymized usage data like what languages you're using ZOrca with.
+    "metrics": false,
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,
@@ -1562,9 +1559,10 @@
   //
   // Default: false
   "disable_ai": false,
-  // Automatically update Zed. This setting may be ignored on Linux if
-  // installed through a package manager.
-  "auto_update": true,
+  // Automatically update. Off by default: the updater resolves releases from
+  // Zed's servers, so leaving it on would offer to replace ZOrca with a Zed
+  // build. Turn it on only once this fork publishes its own releases.
+  "auto_update": false,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
@@ -1787,31 +1785,6 @@
       "proxy_no_verify": null,
       "enable_next_edit_suggestions": true,
     },
-    "codestral": {
-      "api_url": "https://codestral.mistral.ai",
-      "model": "codestral-latest",
-      "max_tokens": 150,
-    },
-    "ollama": {
-      "api_url": "http://localhost:11434",
-      "model": "qwen2.5-coder:7b-base",
-      "prompt_format": "infer",
-      "max_output_tokens": 64,
-    },
-    "open_ai_compatible_api": {
-      "api_url": "",
-      "model": "",
-      "prompt_format": "infer",
-      "max_output_tokens": 64,
-    },
-    // Controls whether Zed may collect training data when using Zed's Edit Predictions.
-    // Data is only captured when the project is detected as open source.
-    // Possible values:
-    //   - "default": use the preference previously set via the status-bar toggle,
-    //     or false if no preference has been stored.
-    //   - "yes": allow data collection for files in open-source projects.
-    //   - "no": never allow data collection.
-    "allow_data_collection": "default",
   },
   // Settings specific to journaling
   "journal": {
@@ -1937,8 +1910,9 @@
     // instead, and hyperlinks can still be opened with shift-cmd-click
     // (shift-ctrl-click).
     "open_links_in_mouse_mode": true,
-    // Whether to show the terminal button in the status bar
-    "button": true,
+    // Whether to show the terminal button in the status bar. Off in ZOrca:
+    // terminals live in the center pane, so a dock toggle has nothing to show.
+    "button": false,
     // Any key-value pairs added to this list will be added to the terminal's
     // environment. Use `:` to separate multiple values.
     "env": {
@@ -2450,49 +2424,6 @@
       "format_on_save": "on",
       "language_servers": ["zls", "..."],
     },
-  },
-  // Different settings for specific language models.
-  "language_models": {
-    "anthropic": {
-      "api_url": "https://api.anthropic.com",
-    },
-    "anthropic_compatible": {},
-    "bedrock": {},
-    "google": {
-      "api_url": "https://generativelanguage.googleapis.com",
-    },
-    "ollama": {
-      "api_url": "http://localhost:11434",
-    },
-    "llama.cpp": {
-      "api_url": "http://localhost:8080",
-    },
-    "openai": {
-      "api_url": "https://api.openai.com/v1",
-    },
-    "openai_compatible": {},
-    "opencode": {
-      "api_url": "https://opencode.ai/zen",
-    },
-    "open_router": {
-      "api_url": "https://openrouter.ai/api/v1",
-    },
-    "lmstudio": {
-      "api_url": "http://localhost:1234/api/v0",
-    },
-    "deepseek": {
-      "api_url": "https://api.deepseek.com/v1",
-    },
-    "mistral": {
-      "api_url": "https://api.mistral.ai/v1",
-    },
-    "vercel_ai_gateway": {
-      "api_url": "https://ai-gateway.vercel.sh/v1",
-    },
-    "x_ai": {
-      "api_url": "https://api.x.ai/v1",
-    },
-    "zed.dev": {},
   },
   "session": {
     // Whether or not to restore unsaved buffers on restart.

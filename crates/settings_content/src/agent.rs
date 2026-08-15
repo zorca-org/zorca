@@ -205,7 +205,7 @@ pub struct AgentSettingsContent {
     pub dock: Option<DockPosition>,
     /// Whether the agent panel should use flexible (proportional) sizing.
     ///
-    /// Default: true
+    /// Default: false
     pub flexible: Option<bool>,
     /// Where to position the threads sidebar.
     ///

@@ -618,7 +618,7 @@ impl DiffMultibuffer {
 
     #[instrument(skip(this, cx))]
     pub(crate) async fn refresh(this: WeakEntity<Self>, cx: &mut AsyncWindowContext) -> Result<()> {
-        let entries = this.update(cx, |this, cx| {
+        let (pending_entry, entries) = this.update(cx, |this, cx| {
             let (repo, buffers_to_load) = this.branch_diff.update(cx, |branch_diff, cx| {
                 let load_buffers = branch_diff.load_buffers(cx);
                 (branch_diff.repo().cloned(), load_buffers)
@@ -673,12 +673,16 @@ impl DiffMultibuffer {
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
 
-            entries
+            let pending_entry = this
+                .pending_scroll
+                .as_ref()
+                .and_then(|path| entries.remove_entry(path));
+            (pending_entry, entries)
         })?;
 
         let mut buffers_to_fold = Vec::new();
 
-        for (path_key, entry) in entries {
+        for (path_key, entry) in pending_entry.into_iter().chain(entries) {
             if let Some(loaded_buffer) = entry.load.await.log_err() {
                 // We might be lagging behind enough that all future entry.load futures are no longer pending.
                 // If that is the case, this task will never yield, starving the foreground thread of execution time.

@@ -11,7 +11,7 @@ use gpui::{
 use project::project_settings::ProjectSettings;
 use release_channel::ReleaseChannel;
 use settings::Settings as _;
-use ui::{ButtonLike, CommonAnimationExt, ConfiguredApiCard, Vector, VectorName, prelude::*};
+use ui::{ButtonLike, CommonAnimationExt, ConfiguredApiCard, prelude::*};
 use util::ResultExt as _;
 use workspace::{AppState, Toast, Workspace, notifications::NotificationId};
 
@@ -70,7 +70,7 @@ fn open_copilot_code_verification_window(copilot: &Entity<Copilot>, window: &Win
             is_resizable: false,
             is_movable: true,
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Use GitHub Copilot in Zed".into()),
+                title: Some("Use GitHub Copilot in ZOrca".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -118,6 +118,7 @@ pub fn initiate_sign_in_impl(
                 window,
                 cx,
             );
+            open_copilot_code_verification_window(&copilot, window, cx);
 
             window
                 .spawn(cx, async move |cx| {
@@ -131,7 +132,6 @@ pub fn initiate_sign_in_impl(
                             copilot
                                 .update(cx, |copilot, cx| copilot.sign_in(cx))
                                 .detach_and_log_err(cx);
-                            open_copilot_code_verification_window(&copilot, window, cx);
                         }
                     })
                     .log_err();
@@ -194,9 +194,13 @@ impl CopilotCodeVerification {
             _subscription: cx.observe(copilot, |this, copilot, cx| {
                 let status = copilot.read(cx).status();
                 match status {
-                    Status::Authorized | Status::Unauthorized | Status::SigningIn { .. } => {
-                        this.set_status(status, cx)
-                    }
+                    Status::Authorized
+                    | Status::Unauthorized
+                    | Status::Starting { .. }
+                    | Status::SigningIn { .. }
+                    | Status::SignedOut {
+                        awaiting_signing_in: true,
+                    } => this.set_status(status, cx),
                     _ => cx.emit(DismissEvent),
                 }
             }),
@@ -252,7 +256,12 @@ impl CopilotCodeVerification {
             .gap_2p5()
             .items_center()
             .text_center()
-            .child(Headline::new("Use GitHub Copilot in Zed").size(HeadlineSize::Large))
+            .child(
+                Icon::new(IconName::Copilot)
+                    .size(IconSize::XLarge)
+                    .color(Color::Muted),
+            )
+            .child(Headline::new("Use GitHub Copilot in ZOrca").size(HeadlineSize::Large))
             .child(
                 Label::new("Using Copilot requires an active subscription on GitHub.")
                     .color(Color::Muted),
@@ -418,9 +427,19 @@ impl CopilotCodeVerification {
 impl Render for CopilotCodeVerification {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let prompt = match &self.status {
-            Status::SigningIn { prompt: None } => Icon::new(IconName::ArrowCircle)
-                .color(Color::Muted)
-                .with_rotate_animation(2)
+            Status::Starting { .. }
+            | Status::SignedOut {
+                awaiting_signing_in: true,
+            }
+            | Status::SigningIn { prompt: None } => v_flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    Icon::new(IconName::ArrowCircle)
+                        .color(Color::Muted)
+                        .with_rotate_animation(2),
+                )
+                .child(Label::new("Starting GitHub Copilot…").color(Color::Muted))
                 .into_any_element(),
             Status::SigningIn {
                 prompt: Some(prompt),
@@ -458,10 +477,6 @@ impl Render for CopilotCodeVerification {
             .on_any_mouse_down(cx.listener(|this, _: &MouseDownEvent, window, cx| {
                 window.focus(&this.focus_handle, cx);
             }))
-            .child(
-                Vector::new(VectorName::ZedXCopilot, rems(8.), rems(4.))
-                    .color(Color::Custom(cx.theme().colors().icon)),
-            )
             .child(prompt)
     }
 }
@@ -670,7 +685,7 @@ impl ConfigurationView {
     }
 
     fn render_for_chat(&self) -> impl IntoElement {
-        let start_label = "To use Zed's agent with GitHub Copilot, you need to be logged in to GitHub. Note that your GitHub account must have an active Copilot Chat subscription.";
+        let start_label = "To use ZOrca's agent with GitHub Copilot, you need to be logged in to GitHub. Note that your GitHub account must have an active Copilot Chat subscription.";
         let no_status_label = "Copilot Chat requires an active GitHub Copilot subscription. Please ensure Copilot is configured and try again, or use a different LLM provider.";
 
         let (label, button) = if let Some(msg) = self.loading_message() {

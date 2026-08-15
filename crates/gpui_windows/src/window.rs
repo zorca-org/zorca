@@ -1259,12 +1259,21 @@ impl ClickState {
 
     /// update self and return the needed click count
     pub fn update(&self, button: MouseButton, new_position: Point<DevicePixels>) -> usize {
-        if self.button.get() == button && self.is_double_click(new_position) {
+        self.update_at(button, new_position, Instant::now())
+    }
+
+    fn update_at(
+        &self,
+        button: MouseButton,
+        new_position: Point<DevicePixels>,
+        now: Instant,
+    ) -> usize {
+        if self.button.get() == button && self.is_double_click(new_position, now) {
             self.current_count.update(|it| it + 1);
         } else {
             self.current_count.set(1);
         }
-        self.last_click.set(Instant::now());
+        self.last_click.set(now);
         self.last_position.set(new_position);
         self.button.set(button);
 
@@ -1290,10 +1299,10 @@ impl ClickState {
     }
 
     #[inline]
-    fn is_double_click(&self, new_position: Point<DevicePixels>) -> bool {
+    fn is_double_click(&self, new_position: Point<DevicePixels>, now: Instant) -> bool {
         let diff = self.last_position.get() - new_position;
 
-        self.last_click.get().elapsed() < self.double_click_interval.get()
+        now.duration_since(self.last_click.get()) < self.double_click_interval.get()
             && diff.x.0.abs() <= self.double_click_spatial_tolerance_width.get()
             && diff.y.0.abs() <= self.double_click_spatial_tolerance_height.get()
     }
@@ -1621,53 +1630,96 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 mod tests {
     use super::ClickState;
     use gpui::{DevicePixels, MouseButton, point};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    fn test_click_state() -> (ClickState, Instant) {
+        let state = ClickState::new();
+        state.double_click_interval.set(Duration::from_millis(500));
+        state.double_click_spatial_tolerance_width.set(4);
+        state.double_click_spatial_tolerance_height.set(4);
+        let now = Instant::now();
+        state.last_click.set(now);
+        (state, now)
+    }
 
     #[test]
     fn test_double_click_interval() {
-        let state = ClickState::new();
+        let (state, now) = test_click_state();
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(0), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(0), DevicePixels(0)),
+                now + Duration::from_millis(10),
+            ),
             1
         );
         assert_eq!(
-            state.update(MouseButton::Right, point(DevicePixels(0), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Right,
+                point(DevicePixels(0), DevicePixels(0)),
+                now + Duration::from_millis(20),
+            ),
             1
         );
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(0), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(0), DevicePixels(0)),
+                now + Duration::from_millis(30),
+            ),
             1
         );
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(0), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(0), DevicePixels(0)),
+                now + Duration::from_millis(40),
+            ),
             2
         );
-        state
-            .last_click
-            .update(|it| it - Duration::from_millis(700));
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(0), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(0), DevicePixels(0)),
+                now + Duration::from_millis(700),
+            ),
             1
         );
     }
 
     #[test]
     fn test_double_click_spatial_tolerance() {
-        let state = ClickState::new();
+        let (state, now) = test_click_state();
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(-3), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(-3), DevicePixels(0)),
+                now + Duration::from_millis(10),
+            ),
             1
         );
         assert_eq!(
-            state.update(MouseButton::Left, point(DevicePixels(0), DevicePixels(3))),
+            state.update_at(
+                MouseButton::Left,
+                point(DevicePixels(0), DevicePixels(3)),
+                now + Duration::from_millis(20),
+            ),
             2
         );
         assert_eq!(
-            state.update(MouseButton::Right, point(DevicePixels(3), DevicePixels(2))),
+            state.update_at(
+                MouseButton::Right,
+                point(DevicePixels(3), DevicePixels(2)),
+                now + Duration::from_millis(30),
+            ),
             1
         );
         assert_eq!(
-            state.update(MouseButton::Right, point(DevicePixels(10), DevicePixels(0))),
+            state.update_at(
+                MouseButton::Right,
+                point(DevicePixels(10), DevicePixels(0)),
+                now + Duration::from_millis(40),
+            ),
             1
         );
     }

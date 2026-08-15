@@ -20,6 +20,17 @@ pub mod mock;
 pub mod ssh;
 pub mod wsl;
 
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn running_status(status: &str, elapsed: std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let elapsed = if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    };
+    format!("Running ({elapsed} elapsed): {status}")
+}
+
 /// Parses the output of `uname -sm` to determine the remote platform.
 /// Takes the last line to skip possible shell initialization output.
 fn parse_platform(output: &str) -> Result<RemotePlatform> {
@@ -239,14 +250,21 @@ fn handle_rpc_messages_over_child_process_stdio(
 }
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+/// `reuse_existing` says the caller's binary name identifies the source it was
+/// built from — ssh's `zed-remote-server-dev-build-<sha>` on a clean worktree.
+/// Then a binary already on the host under that name *is* this build, and
+/// rebuilding it would only upload the same bytes again. Callers whose names
+/// are not source-versioned (wsl, docker) pass false and keep building.
 async fn build_remote_server_from_source(
     platform: &crate::RemotePlatform,
     delegate: &dyn crate::RemoteClientDelegate,
     binary_exists_on_server: bool,
+    reuse_existing: bool,
     cx: &mut AsyncApp,
 ) -> Result<Option<std::path::PathBuf>> {
     use std::env::VarError;
     use std::path::Path;
+    use std::time::{Duration, Instant};
     use util::command::{Command, Stdio, new_command};
 
     if let Ok(path) = std::env::var("ZED_COPY_REMOTE_SERVER") {
@@ -259,6 +277,17 @@ async fn build_remote_server_from_source(
                 path.display()
             );
         }
+    }
+
+    // Only skip the build when the user did not ask for one: an explicit
+    // ZED_BUILD_REMOTE_SERVER keeps every meaning it has below, including
+    // "always build".
+    if reuse_existing
+        && binary_exists_on_server
+        && std::env::var("ZED_BUILD_REMOTE_SERVER").is_err()
+    {
+        log::info!("remote server binary for this build already exists on the host, reusing it");
+        return Ok(None);
     }
 
     // By default, we make building remote server from source opt-out and we do not force artifact compression
@@ -275,18 +304,63 @@ async fn build_remote_server_from_source(
         log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
     }
 
-    async fn run_cmd(command: &mut Command) -> Result<()> {
-        let output = command
-            .kill_on_drop(true)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .output()
-            .await?;
-        anyhow::ensure!(
-            output.status.success(),
-            "Failed to run command: {command:?}: output: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    /// Last `max` chars of `s`, sliced on a char boundary so a truncated cargo
+    /// log stays valid UTF-8.
+    fn tail_chars(s: &str, max: usize) -> String {
+        let mut tail = s.chars().rev().take(max).collect::<Vec<_>>();
+        tail.reverse();
+        tail.into_iter().collect()
+    }
+
+    async fn run_cmd(
+        command: &mut Command,
+        status: &str,
+        delegate: &dyn crate::RemoteClientDelegate,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        // Both streams are piped rather than inherited: an inherited stream is
+        // never captured, so the failure message below used to be empty and the
+        // user got "output: ." with nothing to diagnose. The cost is that live
+        // build progress no longer streams to the parent's stderr; elapsed-time
+        // status updates show that the command is still running instead.
+        delegate.set_status(Some(status), cx);
+        let started_at = Instant::now();
+        let output = {
+            let output = command
+                .kill_on_drop(true)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .fuse();
+            futures::pin_mut!(output);
+            loop {
+                let timer = cx
+                    .background_executor()
+                    .timer(Duration::from_secs(1))
+                    .fuse();
+                futures::pin_mut!(timer);
+                futures::select_biased! {
+                    output = output => break output?,
+                    () = timer => delegate.set_status(
+                        Some(&running_status(status, started_at.elapsed())),
+                        cx,
+                    ),
+                }
+            }
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            log::error!("Failed to run command: {command:?}\nstderr:\n{stderr}");
+            // The dialog only gets the tail — that is where the actual error
+            // lives, and a full cargo log would blow the dialog up. Zed.log
+            // above has the whole thing.
+            anyhow::bail!(
+                "Failed to run command: {command:?}\nstderr:\n{}\nstdout:\n{}",
+                tail_chars(&stderr, 4000),
+                tail_chars(&stdout, 1000)
+            );
+        }
         Ok(())
     }
 
@@ -324,7 +398,6 @@ async fn build_remote_server_from_source(
     if platform.arch.as_str() == std::env::consts::ARCH
         && platform.os.as_str() == std::env::consts::OS
     {
-        delegate.set_status(Some("Building remote server binary from source"), cx);
         log::info!("building remote server binary from source");
         run_cmd(
             new_command("cargo")
@@ -341,6 +414,9 @@ async fn build_remote_server_from_source(
                     &triple,
                 ])
                 .env("RUSTFLAGS", &rust_flags),
+            "Building remote server binary from source",
+            delegate,
+            cx,
         )
         .await?;
     } else {
@@ -355,22 +431,30 @@ async fn build_remote_server_from_source(
         let rustup = which("rustup", cx)
             .await?
             .context("rustup not found on $PATH, install rustup (see https://rustup.rs/)")?;
-        delegate.set_status(Some("Adding rustup target for cross-compilation"), cx);
         log::info!("adding rustup target");
-        run_cmd(new_command(rustup).args(["target", "add"]).arg(&triple)).await?;
+        run_cmd(
+            new_command(rustup)
+                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .args(["target", "add"])
+                .arg(&triple),
+            "Adding rustup target for cross-compilation",
+            delegate,
+            cx,
+        )
+        .await?;
 
         if which("cargo-zigbuild", cx).await?.is_none() {
-            delegate.set_status(Some("Installing cargo-zigbuild for cross-compilation"), cx);
             log::info!("installing cargo-zigbuild");
-            run_cmd(new_command("cargo").args(["install", "--locked", "cargo-zigbuild"])).await?;
+            run_cmd(
+                new_command("cargo").args(["install", "--locked", "cargo-zigbuild"]),
+                "Installing cargo-zigbuild for cross-compilation",
+                delegate,
+                cx,
+            )
+            .await?;
         }
 
-        delegate.set_status(
-            Some(&format!(
-                "Building remote binary from source for {triple} with Zig"
-            )),
-            cx,
-        );
+        let status = format!("Building remote binary from source for {triple} with Zig");
         log::info!("building remote binary from source for {triple} with Zig");
         run_cmd(
             new_command("cargo")
@@ -387,6 +471,9 @@ async fn build_remote_server_from_source(
                     &triple,
                 ])
                 .env("RUSTFLAGS", &rust_flags),
+            &status,
+            delegate,
+            cx,
         )
         .await?;
     };
@@ -399,11 +486,15 @@ async fn build_remote_server_from_source(
         .with_extension(if platform.os.is_windows() { "exe" } else { "" });
 
     let path = if !build_remote_server.contains("nocompress") {
-        delegate.set_status(Some("Compressing binary"), cx);
-
         #[cfg(not(target_os = "windows"))]
         let archive_path = {
-            run_cmd(new_command("gzip").arg("-f").arg(&bin_path)).await?;
+            run_cmd(
+                new_command("gzip").arg("-f").arg(&bin_path),
+                "Compressing binary",
+                delegate,
+                cx,
+            )
+            .await?;
             bin_path.with_extension("gz")
         };
 
@@ -418,11 +509,12 @@ async fn build_remote_server_from_source(
                 bin_path.display(),
                 zip_path.display(),
             );
-            run_cmd(new_command("powershell.exe").args([
-                "-NoProfile",
-                "-Command",
-                &compress_command,
-            ]))
+            run_cmd(
+                new_command("powershell.exe").args(["-NoProfile", "-Command", &compress_command]),
+                "Compressing binary",
+                delegate,
+                cx,
+            )
             .await?;
             zip_path
         };
@@ -457,6 +549,21 @@ async fn which(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_status_keeps_elapsed_time_visible() {
+        assert_eq!(
+            running_status("Building remote binary", std::time::Duration::from_secs(12)),
+            "Running (12s elapsed): Building remote binary"
+        );
+        assert_eq!(
+            running_status(
+                "Building remote binary",
+                std::time::Duration::from_secs(125)
+            ),
+            "Running (2m 5s elapsed): Building remote binary"
+        );
+    }
 
     #[test]
     fn test_parse_platform() {
