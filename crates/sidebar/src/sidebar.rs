@@ -1855,6 +1855,10 @@ impl Sidebar {
         if self.finish_thread_rename(window, cx) {
             return;
         }
+        if self.renaming_worktree.is_some() {
+            self.commit_worktree_rename(window, cx);
+            return;
+        }
 
         let Some(ix) = self.selection else { return };
         let tree = self.workspace_tree(cx);

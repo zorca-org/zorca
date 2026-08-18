@@ -2392,7 +2392,10 @@ async fn test_rename_linked_worktree_does_not_create_phantom_project_group(
         sidebar.worktree_rename_editor.update(cx, |editor, cx| {
             editor.set_text("renamed", window, cx);
         });
-        sidebar.commit_worktree_rename(window, cx);
+    });
+    cx.run_until_parked();
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.confirm(&Confirm, window, cx);
     });
     cx.run_until_parked();
 
