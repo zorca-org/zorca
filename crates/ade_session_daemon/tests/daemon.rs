@@ -2343,6 +2343,32 @@ fn attach_replays_output_produced_before_attaching() {
     });
 }
 
+#[test]
+fn attach_replays_history_beyond_the_visible_screen() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+
+        write_to(&mut connection, &session.id, b"oldest-marker\n").await;
+        wait_for_ring(server.socket_path(), &session.id, b"oldest-marker").await;
+
+        let output = (1..=40)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        write_to(&mut connection, &session.id, output.as_bytes()).await;
+        wait_for_ring(server.socket_path(), &session.id, b"line-40").await;
+
+        let mut viewer = client(server.socket_path()).await;
+        let (replayed, truncated) = attach(&mut viewer, &session.id).await;
+        assert!(
+            contains(&replayed, b"oldest-marker"),
+            "history outside the visible screen was not replayed: {replayed:?}"
+        );
+        assert!(!truncated, "the 2 MiB scrollback ring did not wrap");
+    });
+}
+
 /// A late attach gets the terminal ending after its replay. This is what lets
 /// a client reconnect after an outage in which the child exited.
 #[test]
@@ -2398,10 +2424,9 @@ fn attach_streams_live_output() {
 /// live stream covers everything after it, and nothing is dropped or repeated
 /// at the seam.
 ///
-/// The replay being a repaint rather than raw bytes does not weaken this â€” it
-/// is why the repaint is synthesized under the same lock that fans out live
-/// output. `alpha` was on the screen when the attach happened and appears once,
-/// in the repaint; `beta` arrived after and appears once, live.
+/// The history and repaint are built under the same lock that fans out live
+/// output. `alpha` is entirely in the replay and `beta` entirely in the live
+/// stream; neither crosses the seam.
 #[test]
 fn replay_and_live_output_neither_gap_nor_duplicate() {
     let (dir, server) = server();
@@ -2418,19 +2443,10 @@ fn replay_and_live_output_neither_gap_nor_duplicate() {
         write_to(&mut connection, &session.id, b"beta\n").await;
         let live = output_until(&mut connection, &session.id, b"beta\r\n").await;
 
-        let mut seen = replayed;
-        seen.extend_from_slice(&live);
-        assert_eq!(occurrences(&seen, b"alpha"), 1, "{seen:?}");
-        assert_eq!(occurrences(&seen, b"beta"), 1, "{seen:?}");
-        let alpha = seen
-            .windows(5)
-            .position(|window| window == b"alpha")
-            .expect("alpha");
-        let beta = seen
-            .windows(4)
-            .position(|window| window == b"beta")
-            .expect("beta");
-        assert!(alpha < beta, "replay must precede live output");
+        assert!(contains(&replayed, b"alpha"), "{replayed:?}");
+        assert!(!contains(&replayed, b"beta"), "{replayed:?}");
+        assert!(!contains(&live, b"alpha"), "{live:?}");
+        assert_eq!(occurrences(&live, b"beta"), 1, "{live:?}");
     });
 }
 
@@ -2522,11 +2538,8 @@ fn dropping_a_connection_detaches_but_never_kills() {
 
         let mut reconnected = client(server.socket_path()).await;
         let (replayed, _) = attach(&mut reconnected, &session.id).await;
-        // The repaint paints rows with `CUP`, so what survives is the text on
-        // the screen rather than the line ending that put it there.
         assert!(contains(&replayed, b"before"), "{replayed:?}");
-        assert_eq!(occurrences(&replayed, b"before"), 1, "{replayed:?}");
-        assert_eq!(occurrences(&replayed, b"while-away"), 1, "{replayed:?}");
+        assert!(contains(&replayed, b"while-away"), "{replayed:?}");
 
         let mut observer = client(server.socket_path()).await;
         let sessions = list(&mut observer).await;
@@ -2582,7 +2595,7 @@ fn attach_repaints_at_the_last_resized_size() {
         );
         // The newest output is what survives a shrink, and the screen says so.
         assert!(contains(&replayed, b"line12"), "{replayed:?}");
-        assert!(truncated, "content scrolled off the top to make room");
+        assert!(!truncated, "the scrollback ring still contains every byte");
     });
 }
 
@@ -2626,27 +2639,30 @@ fn the_alternate_screen_is_replayed_and_then_given_back() {
         wait_for_ring(server.socket_path(), &session.id, b"primary-output").await;
 
         let (after, _) = attach(&mut viewer, &session.id).await;
+        let repaint_start = after
+            .windows(b"\x1b[?2026h".len())
+            .rposition(|window| window == b"\x1b[?2026h")
+            .expect("the current-screen repaint");
+        let repaint = &after[repaint_start..];
         assert!(
-            !contains(&after, b"\x1b[?1049h"),
-            "back on the primary screen: {after:?}"
+            !contains(repaint, b"\x1b[?1049h"),
+            "back on the primary screen: {repaint:?}"
         );
         assert!(
-            contains(&after, b"primary-output"),
-            "the primary screen survived the app: {after:?}"
+            contains(repaint, b"primary-output"),
+            "the primary screen survived the app: {repaint:?}"
         );
         assert!(
-            !contains(&after, b"ALTSCREEN"),
-            "and none of the app is left on it: {after:?}"
+            !contains(repaint, b"ALTSCREEN"),
+            "and none of the app is left on it: {repaint:?}"
         );
     });
 }
 
 /// A session that printed more than fits keeps the newest of it and says so.
 ///
-/// `truncated` is now either half of "this is not everything the session
-/// printed": the ring dropped bytes, or the screen scrolled. Here both are
-/// true, and what comes back is the last screenful â€” the head is what a
-/// terminal can afford to lose.
+/// Once the ring wraps, attach reports truncation and falls back to the safe
+/// repaint because the retained byte tail may begin inside an escape sequence.
 #[test]
 fn scrollback_wraps_to_the_tail_and_reports_truncation() {
     let (dir, server) = server();
@@ -2661,10 +2677,7 @@ fn scrollback_wraps_to_the_tail_and_reports_truncation() {
 
         let mut viewer = client(server.socket_path()).await;
         let (replayed, truncated) = replay_containing(&mut viewer, &session.id, b"500").await;
-        assert!(
-            truncated,
-            "500 lines cannot fit in 64 bytes or on one screen"
-        );
+        assert!(truncated, "500 lines cannot fit in 64 bytes");
         // The newest lines are on the screen; the ones that scrolled past the
         // top of it are gone, and 250 went long before the end.
         assert!(!contains(&replayed, b"250"), "{replayed:?}");

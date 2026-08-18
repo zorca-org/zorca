@@ -252,14 +252,8 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// The whole point of attaching: the session's screen arrives first, as data,
-/// and the client writes it out untouched.
-///
-/// What leads the stream is a *repaint* of the session's screen rather than its
-/// raw scrollback — correct at whatever size the session is now, where raw
-/// bytes are only correct at the width they were produced at. So the first
-/// thing on the wire is the repaint's synchronized-output opener, and the
-/// session's output is inside it, painted at the position it occupies.
+/// The whole point of attaching: the session's history and current screen
+/// arrive as data, and the client writes them out untouched.
 #[test]
 fn attaching_replays_the_sessions_output_first() {
     let (dir, server) = server();
@@ -274,12 +268,12 @@ fn attaching_replays_the_sessions_output_first() {
         let mut stdout = client.stdout.take().expect("piped stdout");
         let seen = read_until(&mut stdout, b"HELLO").await;
         assert!(
-            seen.starts_with(b"\x1b[?2026h"),
-            "the replay leads the stream, got {seen:?}"
+            seen.starts_with(b"HELLO"),
+            "history leads the screen repaint: {seen:?}"
         );
         assert!(
             contains(&seen, b"\x1b[1;1HHELLO"),
-            "painted where the session put it, got {seen:?}"
+            "the current screen was repainted where the session put it: {seen:?}"
         );
 
         kill(&mut control, &session.id).await;

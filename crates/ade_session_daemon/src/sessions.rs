@@ -399,9 +399,6 @@ fn default_workspace_name(root: &str) -> String {
 }
 
 /// A bounded window of the raw bytes a pty has produced.
-///
-/// Raw, not screen state: the daemon never interprets terminal output, so a
-/// replay is just "the last N bytes" handed back to the client's emulator.
 struct Ring {
     bytes: VecDeque<u8>,
     capacity: usize,
@@ -430,11 +427,8 @@ impl Ring {
 
     /// The whole window, oldest byte first.
     ///
-    /// No longer what an attach replays — that is a repaint synthesized from
-    /// the screen (see [`OutputHub::attach`]) — but the ring is still the
-    /// honest record of what a session actually printed, which is what a
-    /// history or log view would want and what `truncated` is derived from.
-    #[allow(dead_code, reason = "the record the ring exists to be; see above")]
+    /// The whole history can be replayed safely only while its beginning is
+    /// still present; a wrapped ring may start in the middle of an escape.
     fn snapshot(&self) -> Vec<u8> {
         let (head, tail) = self.bytes.as_slices();
         let mut out = Vec::with_capacity(self.bytes.len());
@@ -447,12 +441,9 @@ impl Ring {
 /// One session's scrollback and screen, plus the connections streaming from it.
 ///
 /// Ring, grid and subscriber list share a single mutex deliberately:
-/// [`Self::attach`] synthesizes the repaint, queues the [`Frame::Replay`] and
-/// registers the subscriber in one critical section, while [`Self::publish`]
-/// appends, advances the screen and fans out in another. So no byte can slip
-/// between the repaint and the live stream, and none can be delivered twice —
-/// the property that used to hold for the ring snapshot alone now has to hold
-/// for the screen the snapshot was taken of.
+/// [`Self::attach`] builds the replay and registers the subscriber in one
+/// critical section, while [`Self::publish`] records and fans out in another.
+/// So no output can slip between the replay and the live stream.
 struct OutputHub {
     ring: Ring,
     /// The screen these bytes have painted. `None` for a lost session, which
@@ -506,24 +497,24 @@ impl OutputHub {
     /// Queue the replay and subscribe. Re-attaching replaces the previous
     /// subscription rather than doubling it.
     ///
-    /// The replay is a **repaint synthesized from the screen**, not the ring's
-    /// bytes: raw scrollback only renders correctly at the width it was
-    /// produced at, and a client that re-mounts a terminal view is exactly the
-    /// case where that width is wrong. A lost session has no screen and
-    /// replays empty. The ring stays as the honest record of what the session
-    /// printed, and still supplies half of `truncated`.
+    /// A complete ring is replayed first to restore scrollback, followed by a
+    /// screen repaint so the visible rows are correct at the current size. A
+    /// wrapped ring may begin inside an escape sequence, so only the safe
+    /// repaint is sent once history has truncated.
     fn attach(&mut self, session_id: &SessionId, subscriber: SubscriberId, sender: &Sender<Frame>) {
         self.subscribers.retain(|(id, _)| *id != subscriber);
-        let (bytes, scrolled) = match self.grid.as_ref() {
-            Some(grid) => (grid.repaint(), grid.scrolled()),
-            None => (Vec::new(), false),
+        let mut bytes = if self.ring.truncated {
+            Vec::new()
+        } else {
+            self.ring.snapshot()
         };
+        if let Some(grid) = self.grid.as_ref() {
+            bytes.extend(grid.repaint());
+        }
         let replay = Frame::Replay {
             session_id: session_id.clone(),
             bytes,
-            // Either the ring dropped bytes or the screen scrolled: both mean
-            // "this is not everything the session printed".
-            truncated: self.ring.truncated || scrolled,
+            truncated: self.ring.truncated,
         };
         if sender.try_send(replay).is_err() {
             return;

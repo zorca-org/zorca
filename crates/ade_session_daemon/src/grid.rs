@@ -42,19 +42,14 @@
 //!
 //! Known gaps, deliberate:
 //!
-//! - **No scrollback history.** A repaint is the visible screen only. The
-//!   daemon has the bytes in the ring but does not synthesize history into the
-//!   client's scrollback, so `truncated` means "something scrolled off the top,
-//!   or the ring wrapped" — still "this is not everything the session printed".
-//! - **The saved primary screen is not painted while an app is on the alt
-//!   screen.** [`Term`] holds it, but only in a private field, and the one
-//!   public door to it ([`Term::swap_alt`]) *resets the alternate screen* on
-//!   the way back — it would destroy the app's own display to read what is
-//!   behind it. So a client that attaches mid-htop and then quits htop lands on
-//!   an empty primary screen until the shell redraws its prompt. What the dual
-//!   buffer does fix, and pyte could not, is the far more visible half: the
-//!   daemon's own primary screen survives the app's exit, so a repaint *after*
-//!   htop quits shows the shell's scrollback instead of htop's leftover rows.
+//! - **A wrapped scrollback ring cannot be replayed.** A complete ring is sent
+//!   before this repaint, but a wrapped one may begin inside an escape sequence;
+//!   in that case attach safely restores only this visible screen.
+//! - **After the ring wraps, the saved primary screen is not painted while an
+//!   app is on the alt screen.** [`Term`] holds it, but only in a private field,
+//!   and the one public door to it ([`Term::swap_alt`]) resets the alternate
+//!   screen on the way back. Until the ring wraps, replaying its complete bytes
+//!   reconstructs both screens before this repaint.
 //! - **No charset-designation state.** `ESC ( 0` line-drawing is not re-emitted;
 //!   cells are stored already translated, so the painted rows are right and only
 //!   an app that leaves G0 non-default mid-stream would be off.
@@ -70,11 +65,8 @@ const CSI: &[u8] = b"\x1b[";
 
 /// Scrollback kept by the emulator, in lines.
 ///
-/// Not a feature: a repaint never replays history. It exists only so that
-/// [`Dimensions::history_size`] can answer "has anything left the top of the
-/// screen", which is what [`SessionGrid::scrolled`] reports and half of what
-/// `Replay.truncated` means. A grid with no history at all would always say no.
-/// The honest record of what a session printed is the ring, which is unchanged.
+/// This lets the primary screen survive alternate-screen applications and
+/// resizes like a real terminal.
 const SCROLLBACK_LINES: usize = 64;
 
 /// alacritty's own floor: a narrower grid panics inside the emulator.
@@ -163,12 +155,6 @@ pub struct SessionGrid {
     term: Term<VoidListener>,
     parser: Processor<StdSyncHandler>,
     scanner: Scanner,
-    /// Sticky: set the first time anything leaves the top of the screen.
-    ///
-    /// Sticky rather than derived per call because the alternate screen has no
-    /// history of its own, so a session that scrolled and *then* launched htop
-    /// would otherwise report that nothing ever had.
-    scrolled: bool,
 }
 
 impl SessionGrid {
@@ -182,7 +168,6 @@ impl SessionGrid {
             term: Term::new(config, &size, VoidListener),
             parser: Processor::default(),
             scanner: Scanner::default(),
-            scrolled: false,
         }
     }
 
@@ -191,9 +176,6 @@ impl SessionGrid {
     pub fn feed(&mut self, data: &[u8]) {
         self.scanner.scan(data);
         self.parser.advance(&mut self.term, data);
-        if self.term.grid().history_size() > 0 {
-            self.scrolled = true;
-        }
     }
 
     /// Resize the screen. Content comes off the bottom and scrolls off the top
@@ -204,16 +186,6 @@ impl SessionGrid {
         // `Term::resize` resets the scroll region to the full screen, so the
         // scanned copy has to follow or a repaint would assert a stale one.
         self.scanner.scroll_region = None;
-        if self.term.grid().history_size() > 0 {
-            self.scrolled = true;
-        }
-    }
-
-    /// Has anything left the top of the screen?
-    ///
-    /// Half of `Replay.truncated`; the ring's own `truncated` is the other.
-    pub fn scrolled(&self) -> bool {
-        self.scrolled
     }
 
     /// The bytes that reproduce this screen on a freshly opened terminal.
@@ -855,14 +827,6 @@ mod tests {
         let grid = grid_with(20, 10, b"\x1b[3;8r\x1b[r");
         assert_eq!(grid.scanner.scroll_region, None);
         assert!(!String::from_utf8_lossy(&grid.repaint()).contains('r'));
-    }
-
-    #[test]
-    fn scrolling_off_the_top_is_reported() {
-        let quiet = grid_with(20, 3, b"one\r\ntwo");
-        assert!(!quiet.scrolled());
-        let scrolled = grid_with(20, 3, b"a\r\nb\r\nc\r\nd\r\ne");
-        assert!(scrolled.scrolled(), "content left the top of the screen");
     }
 
     #[test]
