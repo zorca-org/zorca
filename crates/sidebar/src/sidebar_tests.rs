@@ -5720,6 +5720,26 @@ async fn test_fallback_worktrees_use_main_label(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn test_disconnected_remote_project_does_not_invent_main_branch(cx: &mut TestAppContext) {
+    let closed = ProjectGroupKey::new(
+        Some(remote::RemoteConnectionOptions::Mock(
+            remote::MockConnectionOptions { id: 1 },
+        )),
+        PathList::new(&[PathBuf::from("/remote/project")]),
+    );
+    let tree = cx.update(|cx| {
+        workspace_manager::build_tree(&[], &HashMap::new(), std::slice::from_ref(&closed), cx)
+    });
+    let worktree = &tree.groups[0].projects[0].worktrees[0];
+
+    assert_eq!(worktree.name.as_ref(), "Not connected");
+    assert_eq!(
+        worktree.status,
+        workspace_manager::WorktreeStatus::Disconnected
+    );
+}
+
 /// Offering New Worktree on a project with no repository did nothing at all —
 /// `create_worktree` bails with "no git repository in the project".
 #[gpui::test]

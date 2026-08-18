@@ -124,6 +124,8 @@ pub struct WorktreeId(pub usize);
 pub enum WorktreeStatus {
     /// A terminal is alive in this worktree.
     Active,
+    /// The remote project has no connected workspace to inspect.
+    Disconnected,
     /// Nothing is running here.
     #[default]
     Inactive,
@@ -696,6 +698,11 @@ pub fn build_tree(
             .file_name()
             .map(|name| SharedString::from(name.to_string_lossy().into_owned()))
             .unwrap_or_else(|| SharedString::from("Project"));
+        let (worktree_name, status) = if group_key.host().is_some() {
+            ("Not connected".into(), WorktreeStatus::Disconnected)
+        } else {
+            ("main".into(), WorktreeStatus::Inactive)
+        };
         projects.insert(
             (folder_root.as_path().into(), host_key),
             (
@@ -704,12 +711,12 @@ pub fn build_tree(
                 // no worktree can be created from a repository nobody can see.
                 false,
                 vec![WorktreeRow {
-                    name: "main".into(),
+                    name: worktree_name,
                     group_key: group_key.clone(),
                     folder_root: Some(folder_root),
                     is_primary: false,
                     workspace: None,
-                    status: WorktreeStatus::Inactive,
+                    status,
                 }],
                 vec![group_key.clone()],
             ),
@@ -1031,6 +1038,7 @@ impl WorktreeStatus {
         match self {
             Self::Inactive => Color::Muted,
             Self::Active => Color::Success,
+            Self::Disconnected => Color::Warning,
         }
     }
 }
@@ -1907,5 +1915,9 @@ mod tests {
     fn test_worktree_status_maps_to_indicator_color() {
         assert_eq!(WorktreeStatus::Inactive.indicator_color(), Color::Muted);
         assert_eq!(WorktreeStatus::Active.indicator_color(), Color::Success);
+        assert_eq!(
+            WorktreeStatus::Disconnected.indicator_color(),
+            Color::Warning
+        );
     }
 }
