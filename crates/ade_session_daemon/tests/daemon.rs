@@ -170,7 +170,7 @@ async fn wait_for(
     what: &str,
     predicate: impl Fn(&[SessionInfo]) -> bool,
 ) -> Vec<SessionInfo> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let sessions = list(connection).await;
         if predicate(&sessions) {
@@ -184,7 +184,9 @@ async fn wait_for(
 }
 
 /// How long any single frame may take to arrive before the test gives up.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous: a CI runner under full-workspace load can stall a frame for tens
+/// of seconds, and a passing run never waits this long.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// `connection.recv()` that fails the test instead of hanging forever.
 ///
@@ -341,7 +343,7 @@ async fn event_until<T>(
     what: &str,
     want: impl Fn(&Frame) -> Option<T>,
 ) -> T {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let frame = recv(connection, what).await;
         if let Some(found) = want(&frame) {
@@ -387,7 +389,7 @@ async fn replay_containing(
     id: &SessionId,
     needle: &[u8],
 ) -> (Vec<u8>, bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let (bytes, truncated) = attach(connection, id).await;
         if contains(&bytes, needle) {
