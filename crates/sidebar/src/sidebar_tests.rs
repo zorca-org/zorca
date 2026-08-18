@@ -4709,6 +4709,113 @@ fn test_worktree_info_missing_branch_returns_none() {
 }
 
 #[gpui::test]
+async fn test_disconnected_remote_worktree_deletion_does_not_stay_pending(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+    let app_state = cx.update(|cx| {
+        let app_state = workspace::AppState::test(cx);
+        workspace::init(app_state.clone(), cx);
+        app_state
+    });
+    let server_fs = FakeFs::new(server_cx.executor());
+    server_fs
+        .insert_tree("/project", serde_json::json!({ ".git": {}, "src": {} }))
+        .await;
+    server_fs
+        .insert_tree(
+            "/external-worktree",
+            serde_json::json!({
+                ".git": "gitdir: /project/.git/worktrees/feature-a",
+                "untracked.txt": "keep me",
+            }),
+        )
+        .await;
+    server_fs.set_branch_name(Path::new("/project/.git"), Some("main"));
+    server_fs.insert_branches(Path::new("/project/.git"), &["main", "feature-a"]);
+    server_fs
+        .add_linked_worktree_for_repo(
+            Path::new("/project/.git"),
+            false,
+            git::repository::Worktree {
+                path: PathBuf::from("/external-worktree"),
+                ref_name: Some("refs/heads/feature-a".into()),
+                sha: "abc".into(),
+                is_main: false,
+                is_bare: false,
+            },
+        )
+        .await;
+    server_fs
+        .with_git_state(Path::new("/project/.git"), false, |state| {
+            state
+                .worktrees_requiring_force_delete
+                .insert(PathBuf::from("/external-worktree"));
+        })
+        .expect("remote worktree should be marked dirty");
+
+    let (project, _headless, _remote_connection) = start_remote_project(
+        &server_fs,
+        Path::new("/external-worktree"),
+        &app_state,
+        None,
+        cx,
+        server_cx,
+    )
+    .await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    cx.update(|cx| <dyn fs::Fs>::set_global(app_state.fs.clone(), cx));
+
+    let remote_client = project.read_with(cx, |project, _| {
+        project
+            .remote_client()
+            .expect("remote project should have a client")
+    });
+    let remote_connection = remote_client.read_with(cx, |remote_client, _| {
+        remote_client
+            .connection()
+            .expect("remote client should be connected before the simulated failure")
+    });
+    remote_client.update(cx, |remote_client, cx| {
+        remote_client.force_server_not_running(cx);
+    });
+    remote_connection.simulate_disconnect(&cx.to_async());
+    cx.run_until_parked();
+    project.read_with(cx, |project, cx| assert!(project.is_disconnected(cx)));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.delete_worktree(
+            PathBuf::from("/external-worktree"),
+            None,
+            None,
+            None,
+            window,
+            cx,
+        );
+    });
+    cx.simulate_prompt_answer("Delete");
+    cx.run_until_parked();
+
+    sidebar.read_with(cx, |sidebar, _| {
+        assert!(sidebar.pending_worktree_deletions.is_empty());
+    });
+    assert!(
+        server_fs
+            .is_file(Path::new("/external-worktree/untracked.txt"))
+            .await
+    );
+}
+
+#[gpui::test]
 async fn test_remote_linked_worktree_deletion_uses_remote_connection(
     cx: &mut TestAppContext,
     server_cx: &mut TestAppContext,

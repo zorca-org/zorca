@@ -738,6 +738,22 @@ pub fn remove_worktree(
     window: &mut Window,
     cx: &mut App,
 ) -> Task<anyhow::Result<bool>> {
+    if let Some(error_workspace) = workspace.upgrade()
+        && error_workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .is_disconnected(cx)
+    {
+        show_error_toast(
+            error_workspace,
+            crate::worktree_picker::remove_worktree_command(&path, false),
+            anyhow!("remote connection is unavailable; reconnect and try again"),
+            cx,
+        );
+        return Task::ready(Ok(false));
+    }
+
     window.spawn(cx, async move |cx| {
         let mut force = false;
         let first_attempt = repository
