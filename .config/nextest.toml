@@ -15,9 +15,13 @@ filter = 'package(worktree) and test(test_random_worktree_changes)'
 priority = 100
 slow-timeout = { period = "300s", terminate-after = 1 }
 
+# The test compiles a wasm extension against an internal 300s budget that a
+# saturated runner blows through, so it runs first and alone: every core for
+# ~2 minutes instead of a slice of one for 300s.
 [[profile.default.overrides]]
 filter = 'package(extension_host) and test(test_extension_store_with_test_extension)'
 priority = 99
+threads-required = "num-test-threads"
 
 # Extended timeouts for tests that were timing out at 60s
 [[profile.default.overrides]]
