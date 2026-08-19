@@ -11424,28 +11424,33 @@ fn resize_edge(
     window_size: Size<Pixels>,
     tiling: Tiling,
 ) -> Option<ResizeEdge> {
-    let bounds = Bounds::new(Point::default(), window_size).inset(shadow_size * 1.5);
-    if bounds.contains(&pos) {
-        return None;
-    }
+    // The shadow ring is transparent, and per-pixel-alpha presenters (WSLg
+    // RAIL) never deliver mouse input on transparent pixels — a grab zone
+    // that lives only in the shadow is unusable there. So the zones reach
+    // *into* the opaque content: edges by `inner`, bottom corners further
+    // still because the corner rounding clips their opaque pixels away. The
+    // top edge and top corners stay shadow-only — the title bar owns clicks
+    // there, and it already drags reliably.
+    let inner = px(6.);
+    let top_corner = size(shadow_size * 1.5, shadow_size * 1.5);
+    let bottom_corner = size(shadow_size * 1.5 + px(10.), shadow_size * 1.5 + px(10.));
 
-    let corner_size = size(shadow_size * 1.5, shadow_size * 1.5);
-    let top_left_bounds = Bounds::new(Point::new(px(0.), px(0.)), corner_size);
+    let top_left_bounds = Bounds::new(Point::new(px(0.), px(0.)), top_corner);
     if !tiling.top && top_left_bounds.contains(&pos) {
         return Some(ResizeEdge::TopLeft);
     }
 
     let top_right_bounds = Bounds::new(
-        Point::new(window_size.width - corner_size.width, px(0.)),
-        corner_size,
+        Point::new(window_size.width - top_corner.width, px(0.)),
+        top_corner,
     );
     if !tiling.top && top_right_bounds.contains(&pos) {
         return Some(ResizeEdge::TopRight);
     }
 
     let bottom_left_bounds = Bounds::new(
-        Point::new(px(0.), window_size.height - corner_size.height),
-        corner_size,
+        Point::new(px(0.), window_size.height - bottom_corner.height),
+        bottom_corner,
     );
     if !tiling.bottom && bottom_left_bounds.contains(&pos) {
         return Some(ResizeEdge::BottomLeft);
@@ -11453,10 +11458,10 @@ fn resize_edge(
 
     let bottom_right_bounds = Bounds::new(
         Point::new(
-            window_size.width - corner_size.width,
-            window_size.height - corner_size.height,
+            window_size.width - bottom_corner.width,
+            window_size.height - bottom_corner.height,
         ),
-        corner_size,
+        bottom_corner,
     );
     if !tiling.bottom && bottom_right_bounds.contains(&pos) {
         return Some(ResizeEdge::BottomRight);
@@ -11464,11 +11469,11 @@ fn resize_edge(
 
     if !tiling.top && pos.y < shadow_size {
         Some(ResizeEdge::Top)
-    } else if !tiling.bottom && pos.y > window_size.height - shadow_size {
+    } else if !tiling.bottom && pos.y > window_size.height - shadow_size - inner {
         Some(ResizeEdge::Bottom)
-    } else if !tiling.left && pos.x < shadow_size {
+    } else if !tiling.left && pos.x < shadow_size + inner {
         Some(ResizeEdge::Left)
-    } else if !tiling.right && pos.x > window_size.width - shadow_size {
+    } else if !tiling.right && pos.x > window_size.width - shadow_size - inner {
         Some(ResizeEdge::Right)
     } else {
         None

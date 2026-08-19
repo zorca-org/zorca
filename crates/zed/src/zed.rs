@@ -5779,6 +5779,16 @@ mod tests {
             );
             project::debugger::dap_store::DapStore::init(&app_state.client.clone().into(), cx);
             debugger_ui::init(cx);
+            // A test must never reach a real daemon: on a dev box the shared
+            // target dir holds one, and both the claimed window and the
+            // sidebar's status stream would spawn it — real processes and
+            // foreign-thread wakeups under the test scheduler. The override
+            // makes every transport spawn fail instantly instead, and the
+            // refusal spares the claim path even the attempt.
+            // SAFETY: nextest runs one test per process, and this bootstrap
+            // runs before any thread reads the environment.
+            unsafe { std::env::set_var(ade_workspaces::DAEMON_BIN_ENV, "/nonexistent/ade-daemon") };
+            ade_workspaces::refuse_daemon(None, cx);
             initialize_workspace(app_state.clone(), cx);
             search::init(cx);
             lsp_locations::init(cx);

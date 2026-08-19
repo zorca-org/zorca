@@ -24,25 +24,28 @@ mod terminal_pane;
 mod workspace_sidebar;
 mod workspace_view;
 
-pub use attach::{
-    can_reset_workspace_sessions, kill_and_recreate_workspace_sessions, open_workspace_session,
-};
-pub use connect::{destination_for, open_connection_workspace};
+pub use ade_session::MAX_GENERATION as CLIENT_GENERATION;
+pub use attach::open_workspace_session;
+pub use connect::{destination_for, open_connection_workspace, refuse_daemon};
 pub use create_workspace_modal::{OnWorkspaceCreated, open_create_workspace_modal};
-pub use daemon_backend::{DAEMON_BIN_ENV, DaemonBackend, DaemonUpgradeOutcome};
+pub use daemon_backend::{
+    DAEMON_BIN_ENV, DaemonBackend, DaemonRefusal, DaemonUpgradeOutcome, Outdated, refusal_code,
+};
 pub use layout::{
     AdeLayouts, Arrangement, Broadcast, LayoutSync, Leaf, MIN_SPLIT_RATIO, PUSH_DEBOUNCE,
     arrangement_from_layout, broadcast_action, capture_layout, layout_from_arrangement,
     render_layout, session_task_id, split_flexes,
 };
-pub use lifecycle::{Reconciled, SessionState, WorkspaceLifecycleService};
+pub use lifecycle::{
+    DaemonKey, Reconciled, SessionState, WorkspaceEntry, WorkspaceGone, WorkspaceLifecycleService,
+};
 pub use missing_tab::MissingTab;
 pub use registry::AdeWorkspaceRegistry;
 pub use rename_workspace_modal::open_rename_workspace_modal;
 pub use session_backend::{
     Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, LayoutEvent, SessionBackend,
     SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery, StatusEvent,
-    WorkspaceEvent, WorkspaceLayout,
+    WorkspaceEvent, WorkspaceLayout, WorkspaceListing,
 };
 pub use store::AdeWorkspaceStore;
 pub use terminal_pane::open_workspace_terminal;
@@ -72,6 +75,14 @@ pub fn init(cx: &mut App) {
     layout::init(cx);
     workspace_sidebar::init(cx);
     AdeWorkspaceStore::global(cx);
+    // After the store, which is what a removal updates, and not at the first
+    // layout install: a process with only the sidebar open would otherwise
+    // never hear that a workspace was killed, and the row would linger until
+    // some later reconcile swept it.
+    layout::start_event_stream(cx);
+    // One watcher for the app: a daemon that goes incompatible mid-session owes
+    // the user one dialog, not one per open window.
+    connect::watch_daemon_incompatibility(cx);
     cx.on_app_quit(|cx| {
         if let Some(service) = cx.try_global::<GlobalLifecycleService>() {
             service.0.disconnect();
@@ -114,15 +125,13 @@ pub fn try_lifecycle_service(cx: &App) -> Option<Arc<WorkspaceLifecycleService>>
         .map(|global| global.0.clone())
 }
 
-/// Prefix for every tmux session ADE owns. The product name is not settled
-/// yet, so this is the single place the literal lives.
-pub const SESSION_PREFIX: &str = "ade";
-
-/// Stable, machine-independent workspace identity.
+/// This client's key for one cache row, and nothing else.
 ///
-/// Deliberately a string (a UUID) rather than a sqlite `INTEGER PRIMARY KEY`:
-/// a workspace has to be recognisable as the same workspace from another
-/// client, whose local database would hand out different row ids.
+/// **Not the workspace's identity** — that is the daemon-minted id in
+/// [`AdeWorkspace::terminal_session_id`], which is what goes on the wire, and
+/// what another client would agree with. This one never leaves the local
+/// sqlite: a string (a UUID) rather than a sqlite `INTEGER PRIMARY KEY` only
+/// because the rows are written before their integer keys would be known.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct WorkspaceId(String);
 
@@ -247,9 +256,22 @@ pub struct AdeWorkspace {
     /// `None` means the workspace is local.
     pub remote_host: Option<String>,
     pub remote_workspace_path: Option<PathBuf>,
-    /// The backend's session id — a tmux session name today — once a session
-    /// has been created for this workspace. See [`SessionId`].
+    /// **The workspace's identity**: the id the host's daemon minted when the
+    /// row was created. `None` only for a row whose record has since been
+    /// killed. See [`Self::daemon_workspace_id`].
+    ///
+    /// Named for the column, which predates the daemon owning the identity.
     pub terminal_session_id: Option<String>,
+    /// **Which daemon holds the record**, when one has said: the instance id
+    /// out of its handshake ([`SessionBackend::instance_id`]). One host may be
+    /// spelled several ways, and [`Self::remote_host`] records the spelling
+    /// this row was reached through; this records the daemon behind it, so
+    /// two spellings do not make two rows for one workspace.
+    ///
+    /// `None` for a row written before the daemon reported one, or by a daemon
+    /// too old to — identity then falls back to the spelling, as it always
+    /// did.
+    pub daemon_id: Option<String>,
     pub status: WorkspaceStatus,
     pub created_at: OffsetDateTime,
     pub last_opened_at: OffsetDateTime,
@@ -273,6 +295,7 @@ impl AdeWorkspace {
             remote_host: None,
             remote_workspace_path: None,
             terminal_session_id: None,
+            daemon_id: None,
             status: WorkspaceStatus::Creating,
             created_at: now,
             last_opened_at: now,
@@ -283,57 +306,17 @@ impl AdeWorkspace {
         self.remote_host.is_some()
     }
 
-    /// The tmux session name this workspace's terminal should use.
-    pub fn tmux_session_name(&self) -> String {
-        tmux_session_name(&self.name, &self.id)
-    }
-
-    /// The id the session daemon knows this workspace by.
+    /// The id the host's daemon knows this workspace by — its identity.
     ///
-    /// The *same string* as [`Self::tmux_session_name`] until a session has
-    /// been created, and deliberately so: [`crate::DaemonBackend`] hands the
-    /// seam's session id to the daemon as each session's `workspace_id`, so the
-    /// daemon's workspace record is already keyed by it. Naming it separately is
-    /// what lets the tmux-era name be deleted later without hunting for the
-    /// callers that meant "workspace" rather than "tmux session".
-    ///
-    /// **Once a session has been recorded, that string *is* the identity** and
-    /// the derived name stops being consulted. The derivation reads
-    /// [`Self::name`], which the user can change (see
-    /// [`crate::WorkspaceLifecycleService::rename_workspace`]) — deriving afresh
-    /// after a rename would point at a workspace the daemon has never heard of,
-    /// stranding the sessions, the layout and the scrollback under the old
-    /// string. A rename moves a label; it must never move an identity.
-    ///
-    /// `terminal_session_id` is cleared only by a kill, which ends the daemon's
-    /// record too — so falling back to the derived name there is right: there is
-    /// nothing left to be identical to.
-    pub fn daemon_workspace_id(&self) -> String {
-        self.terminal_session_id
-            .clone()
-            .unwrap_or_else(|| self.tmux_session_name())
+    /// **Read, never derived.** The daemon mints it when the panel row is
+    /// created and it is the only name the sessions, the stored layout, a
+    /// rename and a kill are addressed by. `None` means this row is not linked
+    /// to a daemon record: nothing about it can go on the wire, and a caller
+    /// that needs the wire treats that as the bug it is rather than inventing a
+    /// string.
+    pub fn daemon_workspace_id(&self) -> Option<&str> {
+        self.terminal_session_id.as_deref()
     }
-}
-
-/// `ade-<slug>-<id6>`: the slug is the lowercased name with runs of
-/// non-alphanumerics collapsed to a single `-`, and `id6` is the first six
-/// characters of the id — enough to disambiguate same-named workspaces while
-/// keeping the session name typeable.
-pub fn tmux_session_name(name: &str, id: &WorkspaceId) -> String {
-    let mut slug = String::with_capacity(name.len());
-    for character in name.chars() {
-        if character.is_ascii_alphanumeric() {
-            slug.extend(character.to_lowercase());
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug.trim_matches('-');
-
-    let id = id.as_str();
-    let id6 = &id[..6.min(id.len())];
-
-    format!("{SESSION_PREFIX}-{slug}-{id6}")
 }
 
 /// The project group a checkout belongs to: the last path component.
@@ -360,7 +343,7 @@ pub(crate) fn now_whole_seconds() -> OffsetDateTime {
 
 /// Column order shared by the registry's `SELECT`/`INSERT` statements and by
 /// the [`Bind`]/[`Column`] impls below.
-const COLUMN_COUNT: usize = 11;
+const COLUMN_COUNT: usize = 12;
 
 impl StaticColumnCount for AdeWorkspace {
     fn column_count() -> usize {
@@ -378,6 +361,7 @@ impl Bind for AdeWorkspace {
         let next_index = statement.bind(&self.remote_host, next_index)?;
         let next_index = statement.bind(&self.remote_workspace_path, next_index)?;
         let next_index = statement.bind(&self.terminal_session_id, next_index)?;
+        let next_index = statement.bind(&self.daemon_id, next_index)?;
         let next_index = statement.bind(&self.status, next_index)?;
         let next_index = statement.bind(&self.created_at.unix_timestamp(), next_index)?;
         statement.bind(&self.last_opened_at.unix_timestamp(), next_index)
@@ -394,6 +378,7 @@ impl Column for AdeWorkspace {
         let (remote_host, next_index) = Option::<String>::column(statement, next_index)?;
         let (remote_workspace_path, next_index) = Option::<PathBuf>::column(statement, next_index)?;
         let (terminal_session_id, next_index) = Option::<String>::column(statement, next_index)?;
+        let (daemon_id, next_index) = Option::<String>::column(statement, next_index)?;
         let (status, next_index) = WorkspaceStatus::column(statement, next_index)?;
         let (created_at, next_index) = i64::column(statement, next_index)?;
         let (last_opened_at, next_index) = i64::column(statement, next_index)?;
@@ -407,6 +392,7 @@ impl Column for AdeWorkspace {
             remote_host,
             remote_workspace_path,
             terminal_session_id,
+            daemon_id,
             status,
             created_at: OffsetDateTime::from_unix_timestamp(created_at)?,
             last_opened_at: OffsetDateTime::from_unix_timestamp(last_opened_at)?,
@@ -436,31 +422,16 @@ mod tests {
         assert!("nonsense".parse::<WorkspaceStatus>().is_err());
     }
 
+    /// The identity is read, never derived: a row with no daemon record has no
+    /// id to offer, and a rename does not move the one it has.
     #[test]
-    fn test_tmux_session_name() {
-        let id = WorkspaceId::from("0123456789abcdef");
+    fn test_daemon_workspace_id_is_the_recorded_one() {
+        let mut workspace = AdeWorkspace::new("main", "project-a", "/repo");
+        assert_eq!(workspace.daemon_workspace_id(), None);
 
-        assert_eq!(tmux_session_name("main", &id), "ade-main-012345");
-        assert_eq!(
-            tmux_session_name("feature/auth", &id),
-            "ade-feature-auth-012345"
-        );
-        // Runs of non-alphanumerics collapse, and edges are trimmed.
-        assert_eq!(
-            tmux_session_name("  Investigation: vector DB!  ", &id),
-            "ade-investigation-vector-db-012345"
-        );
-        // Short ids are used whole rather than panicking on the slice.
-        assert_eq!(
-            tmux_session_name("main", &WorkspaceId::from("abc")),
-            "ade-main-abc"
-        );
-
-        let workspace = AdeWorkspace::new("Feature/Auth", "project-a", "/repo");
-        assert_eq!(
-            workspace.tmux_session_name(),
-            tmux_session_name(&workspace.name, &workspace.id)
-        );
+        workspace.terminal_session_id = Some("ws-7f3a".to_owned());
+        workspace.name = "renamed".to_owned();
+        assert_eq!(workspace.daemon_workspace_id(), Some("ws-7f3a"));
     }
 
     #[test]

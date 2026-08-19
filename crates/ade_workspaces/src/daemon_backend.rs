@@ -32,39 +32,38 @@
 //! what it is doing.
 //!
 //! **Two id namespaces, joined here.** The daemon mints its own opaque session
-//! ids (uuids), while everything above this seam names a session by the id the
-//! caller derived from the workspace ([`crate::tmux_session_name`], cached in
-//! the registry). Rather than push the daemon's ids up through the registry —
-//! which would rewrite what a workspace row means — this backend keeps the
-//! caller's id as the seam id and passes it to the daemon as the session's
-//! `workspace_id`. Resolving one to the other is a listing, and the seam's ids
-//! stay exactly as stable as they were under tmux.
+//! ids (uuids), while everything above this seam names a session by its
+//! *workspace* — also daemon-minted, by
+//! [`SessionBackend::create_workspace`], and cached in the registry. This
+//! backend keeps the workspace id as the seam id and passes it to the daemon as
+//! each session's `workspace_id`. Resolving one to the other is a listing.
 //!
-//! **Attach is still an argv**, and deliberately: it names *our own* client,
-//! `ade-daemon attach <id> --socket <path>` (or `--tcp <address>`), which Zed's
-//! terminal spawns the way it used to spawn `tmux attach`. Closing the terminal
-//! kills the client, which is a detach, and the session survives it. See the
-//! seam's module docs for why the stream-shaped attach waits for the remote
-//! transport.
+//! **Attach is still an argv**, and deliberately. Locally, or over a host's
+//! forward, it names *our own* client: `ade-daemon attach <id> --socket <path>`
+//! (or `--tcp <address>`, or on Windows nothing at all — see [`Address`]),
+//! which Zed's terminal spawns the way it used to spawn `tmux attach`. Closing
+//! the terminal kills the client, which is a detach, and the session survives
+//! it. See the seam's module docs for why the stream-shaped attach waits for
+//! the remote transport.
 //!
 //! **A dead process is not a live session.** [`Self::list`] and [`Self::exists`]
 //! report only sessions the daemon has not seen exit, so a workspace whose agent
-//! died reads as disconnected upstairs and gets the sidebar's "gone" row and its
-//! Recreate button — including the `(lost)` rows a restarted daemon reports,
-//! whose ptys really are unrecoverable. Nothing is hidden: the exited row is
-//! still in the daemon's own listing, and [`Self::kill`] takes it with the rest.
+//! died reads as disconnected upstairs — including the `(lost)` rows a
+//! restarted daemon reports, whose ptys really are unrecoverable. Nothing is
+//! hidden: the exited row is still in the daemon's own listing, and
+//! [`Self::kill`] takes it with the rest.
 
 use crate::{
     Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, LayoutEvent, SessionBackend,
     SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery, StatusEvent,
-    WorkspaceLayout, WorkspaceStatus,
+    WorkspaceLayout, WorkspaceListing, WorkspaceStatus,
 };
 use ade_session::{
     EnsureOutcome, LOOPBACK_ADDRESS, LayoutDoc, LocalEndpoint, PRE_CUT_DIAGNOSIS, ReadFrameError,
     deploy::{DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR, DaemonEndpoint},
-    framing::bounded,
+    framing::{bounded, bounded_debug},
     is_handshake_eof,
-    proto::{self, Frame, Hello, SessionStatus},
+    proto::{self, Frame, Hello, HelloAck, SessionStatus},
     rejection_frame,
     transport::ChildConnection,
 };
@@ -77,7 +76,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU8, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -140,6 +139,34 @@ const MAX_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(30);
 /// on only in tests.
 const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(200);
 
+/// The generation a daemon too old for this client is asked to exit at.
+///
+/// Generation 2 is where the envelope — and `Shutdown` with it — shipped, and
+/// the only generation such a daemon serves. Below it there is no frame to
+/// send: a pre-cut daemon cannot decode one at all.
+const RETIRING_GENERATION: u32 = 2;
+
+/// The generation views became addressable at: [`Frame::FocusSession`],
+/// `Attach.view_id`, and the attach client's `--view-id` option.
+///
+/// All three are gated on it, and the third is why the gate cannot be
+/// wire-only: a generation-2 host *binary* rejects an unknown CLI option before
+/// a single frame flows, so an argv shaped for this generation never reaches
+/// the daemon that would have refused the frame.
+const VIEW_GENERATION: u32 = 3;
+
+/// No handshake has answered yet. Distinct from every real generation, and it
+/// reads as the current one: nothing has said otherwise, so nothing is gated.
+const GENERATION_UNKNOWN: u32 = 0;
+
+/// How long a daemon that accepted `Shutdown` has to acknowledge it.
+///
+/// Not [`ANSWER_TIMEOUT`]: the daemon may fsync its ledger on the way out, and
+/// this wait is held under the host lock, so the number is generous but finite.
+/// Waiting forever wedges every later operation on that host behind a daemon
+/// that is never going to answer.
+const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How long a request keeps waiting once the daemon has sent it something that
 /// cannot be its answer.
 ///
@@ -201,6 +228,119 @@ pub enum DaemonUpgradeOutcome {
     UpToDate,
 }
 
+/// The daemon's own "no": the [`Frame::Error`] that answered a request, kept
+/// **typed** so a caller can branch on the code instead of reading prose.
+///
+/// Three decisions depend on which refusal it was — a failed kill that did
+/// happen but could not be recorded, a local daemon too old to talk to, a
+/// layout sync pushing into a workspace that is gone — and every one of them
+/// used to be a substring match on a formatted string. The `Display` is still
+/// `code: message`, which is what the sidebar shows.
+///
+/// The codes are `ade_session::proto::codes`, an open set: an unrecognised one
+/// must read as an ordinary failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonRefusal {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for DaemonRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DaemonRefusal {}
+
+/// A handshake whose two generation windows do not meet, with both ranges kept
+/// as numbers.
+///
+/// Typed for the same reason [`DaemonRefusal`] is: the direction decides
+/// whether the UI may offer to replace the daemon, and the wording is prose the
+/// contract forbids parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GenerationSkew {
+    /// What this connection's `Hello` announced — not the crate constants: a
+    /// caller may have pinned a narrower range.
+    pub offered: (u32, u32),
+    /// What the daemon said it serves. `None` from an `unsupported_generation`
+    /// refusal, whose frame carries a code and prose and no numbers.
+    pub daemon: Option<(u32, u32)>,
+}
+
+impl std::fmt::Display for GenerationSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (min, max) = self.offered;
+        match self.daemon {
+            Some((daemon_min, daemon_max)) => write!(
+                f,
+                "this client speaks protocol generation {min}..={max} and the daemon speaks \
+                 {daemon_min}..={daemon_max}"
+            ),
+            None => write!(f, "this client speaks protocol generation {min}..={max}"),
+        }
+    }
+}
+
+impl std::error::Error for GenerationSkew {}
+
+/// Which end of an incompatible pair has to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outdated {
+    /// The daemon serves nothing this client speaks. Replacing it is the fix,
+    /// and the only direction in which deploying this client's binary is an
+    /// upgrade rather than a downgrade.
+    Daemon,
+    /// The daemon's window starts above this client's. Only a newer client
+    /// meets it; pushing our bytes over it would destroy sessions to install
+    /// something older.
+    Client,
+}
+
+impl GenerationSkew {
+    /// Which end to blame, from the numbers alone.
+    ///
+    /// **A daemon that named no range is read as the newer one.** That is the
+    /// answer that offers no destructive action, and it is also the likely one:
+    /// a daemon below this build's floor cannot decode `Hello` and never
+    /// answers at all — it EOFs, which is [`PRE_CUT_DIAGNOSIS`]'s case, not
+    /// this.
+    fn outdated(&self) -> Outdated {
+        match self.daemon {
+            Some((_, daemon_max)) if daemon_max < self.offered.0 => Outdated::Daemon,
+            _ => Outdated::Client,
+        }
+    }
+}
+
+/// The code the daemon refused with, wherever [`DaemonRefusal`] sits in
+/// `error`'s chain — every `with_context` above it keeps it reachable.
+pub fn refusal_code(error: &anyhow::Error) -> Option<&str> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<DaemonRefusal>()
+            .map(|refusal| refusal.code.as_str())
+    })
+}
+
+/// Whether a request asks the daemon to *change* something.
+///
+/// Only these make `persisted: false` news (§8.5): a read's ack carries the
+/// same flag and means nothing by it, and warning on every `OpenWorkspace`
+/// against a degraded daemon is how the real signal gets ignored.
+fn mutates(frame: &Frame) -> bool {
+    matches!(
+        frame,
+        Frame::CreateWorkspace { .. }
+            | Frame::CreateSession { .. }
+            | Frame::UpdateLayout { .. }
+            | Frame::RenameWorkspace { .. }
+            | Frame::KillWorkspace { .. }
+            | Frame::Kill { .. }
+    )
+}
+
 /// Sessions kept alive by the ADE session daemon on this machine.
 pub struct DaemonBackend {
     endpoint: Endpoint,
@@ -209,11 +349,75 @@ pub struct DaemonBackend {
     /// next call reconnects, and the proxy restarts the daemon if it really is
     /// gone. Sessions lost that way come back as exited `(lost)` rows rather
     /// than being quietly recreated.
-    connection: Mutex<Option<DaemonConnection>>,
+    connection: Mutex<Option<Live>>,
     next_request_id: AtomicU64,
     /// [`ANSWER_TIMEOUT`], except in tests that would otherwise have to sit
     /// through it to reach the failure they are about.
     answer_timeout: Duration,
+    /// What the last handshake — on *either* connection — said about the
+    /// daemon. See [`Remembered`].
+    remembered: Arc<Remembered>,
+}
+
+/// The daemon snapshot the UI reads, shared by every connection to it.
+///
+/// **Shared because the status stream handshakes on its own connection.** It
+/// reconnects independently of the control one and its ack is just as current,
+/// so an upgrade the status thread was the first to meet still clears the arrow
+/// (§6.4's "update on every successful reconnect").
+///
+/// **A UI snapshot, never the authority for sending**: a reconnect
+/// renegotiates, so what a frame is gated on is the generation held with the
+/// live connection in [`DaemonBackend::connection`]. Nothing here is read to
+/// admit or refuse a frame.
+#[derive(Default)]
+struct Remembered {
+    /// The last handshake's `degraded` flag — §8.5, read-only ledger on a
+    /// newer schema. Set on (re)connect, stale between them like
+    /// [`DaemonBackend::daemon_stale`]; nothing before the first handshake
+    /// claims it.
+    degraded: AtomicBool,
+    /// Which daemon answered — see [`SessionBackend::instance_id`]. `None`
+    /// until one has, and from a daemon too old to say. Never unset by a later
+    /// handshake that omits it: the only way to get one is to reach a daemon,
+    /// and a daemon that once named itself is the daemon this backend is for.
+    instance_id: Mutex<Option<String>>,
+    /// The negotiated generation, [`GENERATION_UNKNOWN`] before there has been
+    /// a handshake. Kept across disconnects, so the arrow reads last-known
+    /// rather than blinking off with the channel.
+    generation: AtomicU32,
+}
+
+impl Remembered {
+    /// Record what a handshake said, and tell the sidebar if the generation
+    /// moved.
+    ///
+    /// `endpoint` is only ever used to reach the freshness observers, which are
+    /// channel sends: this must not call back into the backend, whose
+    /// connection lock the control caller is holding while it runs.
+    fn remember(&self, endpoint: &Endpoint, ack: &HelloAck) {
+        self.degraded.store(ack.degraded, Ordering::Relaxed);
+        if let Some(instance) = &ack.instance_id {
+            *self.instance_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(instance.clone());
+        }
+        // Same rule as a freshness verdict: only a *change* is announced, or a
+        // host reconnected four times would repaint every sidebar four times.
+        if self.generation.swap(ack.generation, Ordering::Relaxed) != ack.generation
+            && let Transport::Forwarded(link) = &endpoint.transport
+        {
+            link.announce_freshness();
+        }
+    }
+}
+
+/// The live control connection and the generation its own handshake selected.
+///
+/// One struct, so the two can only be read together under one lock: a
+/// generation read beside the slot could be paired with the connection a
+/// reconnect has since replaced.
+struct Live {
+    connection: DaemonConnection,
+    generation: u32,
 }
 
 impl Default for DaemonBackend {
@@ -259,7 +463,13 @@ impl DaemonBackend {
             connection: Mutex::new(None),
             next_request_id: AtomicU64::new(1),
             answer_timeout: ANSWER_TIMEOUT,
+            remembered: Arc::new(Remembered::default()),
         }
+    }
+
+    #[cfg(test)]
+    fn remember(&self, ack: &HelloAck) {
+        self.remembered.remember(&self.endpoint, ack);
     }
 
     /// [`Self::remote_with_args`] with the host's paths given rather than read
@@ -314,7 +524,7 @@ impl DaemonBackend {
         let host = ade_session::SshHost::new(destination).with_extra_args(extra_args);
         Self::with_endpoint(Endpoint {
             bin_path: resolve_binary(),
-            address: local.clone(),
+            address: Address::Named(local.clone()),
             state_dir: PathBuf::new(),
             transport: Transport::Forwarded(Arc::new(HostLink::with_paths(
                 host,
@@ -339,10 +549,22 @@ impl DaemonBackend {
     ) -> Self {
         Self::with_endpoint(Endpoint {
             bin_path: bin_path.into(),
-            address: LocalEndpoint::Socket(socket_path.into()),
+            address: Address::Named(LocalEndpoint::Socket(socket_path.into())),
             state_dir: PathBuf::new(),
             transport: Transport::Direct,
         })
+    }
+
+    /// Whether an ack claims its mutation reached the daemon's ledger. Frames
+    /// that are not mutation acks have nothing to say and answer `true`.
+    fn acked_persisted(frame: &Frame) -> bool {
+        match frame {
+            Frame::Created { persisted, .. }
+            | Frame::Workspace { persisted, .. }
+            | Frame::LayoutChanged { persisted, .. }
+            | Frame::WorkspaceRemoved { persisted, .. } => *persisted,
+            _ => true,
+        }
     }
 
     /// Send one request and wait for the reply that answers it.
@@ -371,12 +593,28 @@ impl DaemonBackend {
         request: Frame,
         want: impl Fn(&Frame) -> Option<T>,
     ) -> Result<T> {
+        self.request_captured(request_id, request, want)
+            .map(|(value, _degraded)| value)
+    }
+
+    /// [`Self::request`], answering also with the `degraded` flag of the
+    /// connection that served it.
+    ///
+    /// The only sound way to pair an answer with the ledger state behind it:
+    /// [`Self::degraded`] is re-armed by every reconnect, so a caller reading it
+    /// after the fact can judge a degraded daemon's listing by a healthy
+    /// daemon's flag. Read here, under the connection lock, it belongs to the
+    /// daemon that answered.
+    fn request_captured<T>(
+        &self,
+        request_id: u64,
+        request: Frame,
+        want: impl Fn(&Frame) -> Option<T>,
+    ) -> Result<(T, bool)> {
+        let mutation = mutates(&request);
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = smol::block_on(async {
-            let connection = match slot.as_mut() {
-                Some(connection) => connection,
-                None => slot.insert(self.endpoint.connect().await?),
-            };
+            let connection = &mut self.live(&mut slot).await?.connection;
             connection.send(&request).await?;
             // Unarmed until the daemon spends a frame on something that is not
             // this request's answer — see [`ANSWER_TIMEOUT`].
@@ -401,7 +639,20 @@ impl DaemonBackend {
                 if let Some(reply) = &reply
                     && let Some(value) = want(reply)
                 {
-                    return anyhow::Ok(Ok(value));
+                    if mutation && !Self::acked_persisted(reply) {
+                        // §8.5. Not a failure and never retried: the mutation
+                        // happened, only its ledger row did not. The standing
+                        // condition behind it is already reported once per
+                        // connection by the handshake's `degraded` flag.
+                        log::warn!(
+                            "the session daemon applied request {request_id} in memory only: \
+                             its ledger is read-only, so this will not survive a restart"
+                        );
+                    }
+                    return anyhow::Ok(Ok((
+                        value,
+                        self.remembered.degraded.load(Ordering::Relaxed),
+                    )));
                 }
                 // Whatever it was, the daemon has now written something that
                 // was not the answer, so the wait stops being open-ended.
@@ -421,17 +672,16 @@ impl DaemonBackend {
                     match reply_id {
                         // The answer. The code travels with the prose because
                         // "not_found" and "internal" are operationally
-                        // different answers and a log nobody can grep is how
-                        // that distinction gets lost. Both are `bounded`: this
-                        // string becomes the `bail!` below and then the ADE
-                        // sidebar's failure text, and a `message` is a frame
-                        // field the peer sizes up to `MAX_FRAME_BYTES`.
+                        // different answers — and because three callers decide
+                        // on it ([`DaemonRefusal`]). Both are `bounded`: this
+                        // becomes the ADE sidebar's failure text, and a
+                        // `message` is a frame field the peer sizes up to
+                        // `MAX_FRAME_BYTES`.
                         Some(id) if id == request_id => {
-                            return anyhow::Ok(Err(format!(
-                                "{}: {}",
-                                bounded(&code),
-                                bounded(&message)
-                            )));
+                            return anyhow::Ok(Err(DaemonRefusal {
+                                code: bounded(&code).into_owned(),
+                                message: bounded(&message).into_owned(),
+                            }));
                         }
                         // Unsolicited by contract: diagnostics, never a
                         // pending request's answer. A log line is not the wire,
@@ -453,7 +703,7 @@ impl DaemonBackend {
         });
         match outcome {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => bail!(message),
+            Ok(Err(refusal)) => Err(anyhow::Error::new(refusal)),
             // The connection is gone, or is being given up on, which here is
             // the same thing: a read abandoned mid-frame cannot be resumed, and
             // an answer that arrives after this request stopped waiting would
@@ -465,6 +715,53 @@ impl DaemonBackend {
                 Err(error)
             }
         }
+    }
+
+    /// The live control connection, opened if there is none.
+    ///
+    /// Takes the slot rather than the lock, so a caller that has to hold the
+    /// connection across more than this — every request does — cannot
+    /// accidentally drop it in between.
+    async fn live<'a>(&self, slot: &'a mut Option<Live>) -> Result<&'a mut Live> {
+        Ok(match slot {
+            Some(live) => live,
+            None => {
+                let (connection, ack) = self.endpoint.connect().await?;
+                self.remembered.remember(&self.endpoint, &ack);
+                slot.insert(Live {
+                    connection,
+                    generation: ack.generation,
+                })
+            }
+        })
+    }
+
+    /// Send one frame on the control connection and do not wait for anything.
+    ///
+    /// Only for ops the daemon answers with nothing at all — see
+    /// [`Self::request`] for the correlated kind. A write that fails drops the
+    /// connection for the same reason a request's does: a stream abandoned
+    /// mid-frame cannot be resumed.
+    ///
+    /// `since` is the generation the op arrived at. An older connection is not
+    /// sent it at all: the daemon would answer `uncapable_peer` and go on
+    /// serving, but the sender's half of that contract is not to emit it (see
+    /// `ade_session::proto`'s module doc). The check is under the slot lock the
+    /// write itself takes, so a reconnect cannot renegotiate in between.
+    fn notify(&self, since: u32, frame: Frame) -> Result<()> {
+        let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = smol::block_on(async {
+            let live = self.live(&mut slot).await?;
+            if live.generation < since {
+                return Ok(());
+            }
+            live.connection.send(&frame).await
+        });
+        if outcome.is_err() {
+            *slot = None;
+            self.endpoint.on_connection_lost();
+        }
+        outcome
     }
 
     fn request_id(&self) -> u64 {
@@ -497,7 +794,7 @@ impl DaemonBackend {
 
     fn finish_upgrade(
         &self,
-        connection: &mut Option<DaemonConnection>,
+        connection: &mut Option<Live>,
         outcome: Result<DaemonUpgradeOutcome>,
     ) -> Result<DaemonUpgradeOutcome> {
         if !matches!(&outcome, Ok(DaemonUpgradeOutcome::UpToDate)) {
@@ -525,6 +822,32 @@ impl DaemonBackend {
             Transport::Forwarded(link) => link.daemon_stale(),
             _ => false,
         }
+    }
+
+    /// Whether the last handshake found this host's ledger read-only (a newer
+    /// schema than the daemon can write). `false` before any handshake, like
+    /// [`Self::daemon_stale`].
+    pub fn degraded(&self) -> bool {
+        self.remembered.degraded.load(Ordering::Relaxed)
+    }
+
+    /// The generation the last handshake settled on, `None` before there has
+    /// been one — see [`SessionBackend::daemon_generation`].
+    pub fn daemon_generation(&self) -> Option<u32> {
+        match self.remembered.generation.load(Ordering::Relaxed) {
+            GENERATION_UNKNOWN => None,
+            generation => Some(generation),
+        }
+    }
+
+    /// The daemon this backend last handshook with — see
+    /// [`SessionBackend::instance_id`].
+    pub fn instance_id(&self) -> Option<String> {
+        self.remembered
+            .instance_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Ask to be told when [`Self::daemon_stale`] changes its answer.
@@ -618,14 +941,15 @@ impl DaemonBackend {
 
     /// The argv that gets a client onto one daemon session. No round trip: the
     /// binary and the address are the endpoint's, and the id is the caller's.
-    fn session_argv(&self, id: &proto::SessionId) -> Vec<String> {
+    fn session_argv(&self, id: &proto::SessionId, view_id: &str) -> Result<Vec<String>> {
         let mut argv = vec![
             self.endpoint.bin_path.display().to_string(),
             "attach".to_owned(),
             id.to_string(),
         ];
+        argv.extend(view_argv(view_id));
         argv.extend(client_argv(&self.endpoint.address));
-        argv
+        Ok(argv)
     }
 
     fn kill_daemon_session(&self, id: &proto::SessionId) -> Result<()> {
@@ -662,9 +986,9 @@ impl SessionBackend for DaemonBackend {
     /// Deliberately without [`Self::create_session`]'s bookkeeping: no
     /// one-live-session guard, because a second live session is the point, and
     /// no tombstone reaping, because the rows it would take belong to siblings
-    /// the caller never mentioned. The daemon's `ensure_workspace` leaves an
-    /// existing workspace record — and its layout — untouched, so the new
-    /// session enters the document only when this window captures it.
+    /// the caller never mentioned. A session never touches its workspace's
+    /// record or its layout, so the new session enters the document only when
+    /// this window captures it.
     fn create_session_in_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String> {
         let request_id = self.request_id();
         let session = self
@@ -718,6 +1042,46 @@ impl SessionBackend for DaemonBackend {
         Ok(self.live_session(id)?.is_some())
     }
 
+    /// One frame, answered with the minted record alone: the row's first
+    /// terminal is a separate create-session into the id this returns.
+    ///
+    /// **At generation 2 the reply is the combined create** — record, first
+    /// login shell and a one-leaf layout — and nothing here has to change for
+    /// it. The first terminal comes from [`SessionBackend::attach`], which is
+    /// attach-*or*-create: it finds the session the daemon already made and
+    /// never mints a second. Only the reply's extra `sessions` are dropped,
+    /// which the listing that follows re-reads anyway.
+    fn create_workspace(&self, root: &Path, name: Option<&str>) -> Result<BackendWorkspace> {
+        let request_id = self.request_id();
+        let workspace = self
+            .request(
+                request_id,
+                Frame::CreateWorkspace {
+                    root: root.display().to_string(),
+                    name: name.map(str::to_owned),
+                    request_id: Some(request_id),
+                    env: Vec::new(),
+                    cols: None,
+                    rows: None,
+                },
+                |frame| match frame {
+                    Frame::Workspace {
+                        workspace,
+                        request_id: Some(reply_id),
+                        ..
+                    } if *reply_id == request_id => Some(workspace.clone()),
+                    _ => None,
+                },
+            )
+            .with_context(|| format!("creating a workspace at {}", root.display()))?;
+        Ok(BackendWorkspace {
+            id: workspace.id,
+            name: workspace.name,
+            project_root: workspace.project_root,
+            created_at: workspace.created_at,
+        })
+    }
+
     /// Every workspace record the daemon holds, sessions or no sessions.
     ///
     /// Not derived from [`Self::list`]: the daemon's workspace records outlive
@@ -725,10 +1089,10 @@ impl SessionBackend for DaemonBackend {
     /// its ptys as lost — so a workspace with nothing running is exactly the
     /// case a listing of *sessions* cannot see, and exactly the one an empty
     /// registry most needs told about.
-    fn list_workspaces(&self) -> Result<Vec<BackendWorkspace>> {
+    fn list_workspaces(&self) -> Result<WorkspaceListing> {
         let request_id = self.request_id();
-        let workspaces = self
-            .request(
+        let (workspaces, degraded) = self
+            .request_captured(
                 request_id,
                 Frame::ListWorkspaces {
                     request_id: Some(request_id),
@@ -742,15 +1106,18 @@ impl SessionBackend for DaemonBackend {
                 },
             )
             .context("listing the daemon's workspaces")?;
-        Ok(workspaces
-            .into_iter()
-            .map(|workspace| BackendWorkspace {
-                id: workspace.id,
-                name: workspace.name,
-                project_root: workspace.project_root,
-                created_at: workspace.created_at,
-            })
-            .collect())
+        Ok(WorkspaceListing {
+            workspaces: workspaces
+                .into_iter()
+                .map(|workspace| BackendWorkspace {
+                    id: workspace.id,
+                    name: workspace.name,
+                    project_root: workspace.project_root,
+                    created_at: workspace.created_at,
+                })
+                .collect(),
+            degraded,
+        })
     }
 
     fn attach(&self, spec: &SessionSpec) -> Result<Attached> {
@@ -762,13 +1129,32 @@ impl SessionBackend for DaemonBackend {
             None => self.create_session(spec)?,
         };
         Ok(Attached {
-            argv: self.session_argv(&session.id),
+            argv: self.session_argv(&session.id, "")?,
             session_id: session.id.to_string(),
         })
     }
 
-    fn attach_session(&self, session_id: &str) -> Result<Vec<String>> {
-        Ok(self.session_argv(&proto::SessionId::new(session_id)))
+    fn attach_session(&self, session_id: &str, view_id: &str) -> Result<Vec<String>> {
+        self.session_argv(&proto::SessionId::new(session_id), view_id)
+    }
+
+    /// One frame, no answer: `focus_session` is fire-and-forget on the wire,
+    /// like `resize`. A daemon that refuses it says so with a rid-less error,
+    /// which the next request logs and reads past — the right trade for a
+    /// hint that fires on every focus change and must never block one.
+    ///
+    /// A generation-2 connection has no focus notion, so nothing is sent and
+    /// the pty keeps the smallest attached client's size, as it did then.
+    fn focus_session(&self, session_id: &str, view_id: &str, hover: bool) -> Result<()> {
+        self.notify(
+            VIEW_GENERATION,
+            Frame::FocusSession {
+                session_id: proto::SessionId::new(session_id),
+                view_id: view_id.to_owned(),
+                hover,
+            },
+        )
+        .with_context(|| format!("focusing view {view_id} on daemon session {session_id}"))
     }
 
     fn open_workspace(&self, workspace_id: &str) -> Result<WorkspaceLayout> {
@@ -892,6 +1278,15 @@ impl SessionBackend for DaemonBackend {
         DaemonBackend::daemon_stale(self)
     }
 
+    /// See [`DaemonBackend::instance_id`].
+    fn instance_id(&self) -> Option<String> {
+        DaemonBackend::instance_id(self)
+    }
+
+    fn daemon_generation(&self) -> Option<u32> {
+        DaemonBackend::daemon_generation(self)
+    }
+
     /// See [`DaemonBackend::observe_daemon_freshness`].
     fn observe_daemon_freshness(&self, observer: DaemonFreshnessObserver) {
         DaemonBackend::observe_daemon_freshness(self, observer);
@@ -936,12 +1331,13 @@ impl SessionBackend for DaemonBackend {
     fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
         let (sender, receiver) = smol::channel::unbounded();
         let endpoint = self.endpoint.clone();
+        let remembered = self.remembered.clone();
         // A plain thread, not a task: it owns a connection of its own and
         // spends its life blocked on it, which is the one thing an executor
         // thread must not do.
         std::thread::Builder::new()
             .name("ade-daemon-status".to_owned())
-            .spawn(move || stream_status(endpoint, sender))
+            .spawn(move || stream_status(endpoint, remembered, sender))
             .context("spawning the daemon status thread")?;
         Ok(receiver)
     }
@@ -960,18 +1356,27 @@ impl SessionBackend for DaemonBackend {
 /// that worked resets the schedule; the first failure and every *change* of
 /// failure is a warning, while the repeats stay at debug so a permanent one
 /// does not bury the log it is trying to be visible in.
-fn stream_status(endpoint: Endpoint, sender: Sender<DaemonEvent>) {
+///
+/// The state of the stream itself is [`DaemonEvent::Up`] / [`DaemonEvent::Down`]
+/// on the same channel as the events, so a subscriber sees a failure in the
+/// order it happened rather than only in the log. Incompatible retries keep
+/// going at the maximum delay — a swapped-back daemon must heal by itself — and
+/// say so once, not once per attempt.
+fn stream_status(endpoint: Endpoint, remembered: Arc<Remembered>, sender: Sender<DaemonEvent>) {
     let mut delay = FIRST_RESUBSCRIBE_DELAY;
     let mut last_failure: Option<String> = None;
     let mut known_workspaces = HashMap::new();
     let mut has_workspace_snapshot = false;
+    let mut announced: Option<StreamState> = None;
 
     while !sender.is_closed() {
         let mut subscribed = false;
         let outcome = smol::block_on(stream_status_once(
             &endpoint,
+            &remembered,
             &sender,
             &mut subscribed,
+            &mut announced,
             &mut known_workspaces,
             &mut has_workspace_snapshot,
         ));
@@ -995,18 +1400,19 @@ fn stream_status(endpoint: Endpoint, sender: Sender<DaemonEvent>) {
                     "daemon status stream for {endpoint} stopped, retrying in {delay:?}: {message}"
                 );
             }
-            last_failure = Some(message);
-            // TODO(#135 follow-up): this warning is the only place a
-            // *mid-stream* failure is visible. The sidebar's
-            // `status_stream_error` line
-            // (`workspace_sidebar::WorkspaceSidebar::new`) is fed once, from
-            // the single `Result` that `WorkspaceLifecycleService::
-            // subscribe_status` returns, so it can only report a stream that
-            // never opened. Carrying a later failure to it needs a seam that
-            // does not exist: either a `SessionChange`/`StatusEvent` shape that
-            // can say "the stream is down", or a second channel out of
-            // `SessionBackend::subscribe_status` — both public-API reshapes,
-            // and both would drag `lifecycle.rs` along with them.
+            last_failure = Some(message.clone());
+            let outdated = incompatible_daemon(&error);
+            announce(
+                &sender,
+                &mut announced,
+                StreamState::Down { message, outdated },
+            );
+            if outdated.is_some() {
+                // The two ends cannot talk. Retrying is still right — the
+                // daemon may be swapped back — but only at the far end of the
+                // backoff, and the subscriber has already been told once.
+                delay = MAX_RESUBSCRIBE_DELAY;
+            }
 
             // The next connect re-runs `--ensure` on a remote host, so a daemon
             // that died behind a live forward is brought back rather than
@@ -1027,6 +1433,38 @@ fn next_resubscribe_delay(delay: Duration) -> Duration {
     (delay * 2).min(MAX_RESUBSCRIBE_DELAY)
 }
 
+/// What the subscriber was last told about the stream — see [`announce`].
+#[derive(Debug, PartialEq, Eq)]
+enum StreamState {
+    Up,
+    Down {
+        message: String,
+        outdated: Option<Outdated>,
+    },
+}
+
+/// Sends a stream transition, and only a transition.
+///
+/// The same failure retried is not news: a reconnect loop against a daemon this
+/// client cannot speak to would otherwise re-open the incompatibility dialog
+/// every backoff. A *changed* class or direction is news, and so is recovery.
+fn announce(sender: &Sender<DaemonEvent>, announced: &mut Option<StreamState>, state: StreamState) {
+    if announced.as_ref() == Some(&state) {
+        return;
+    }
+    let event = match &state {
+        StreamState::Up => DaemonEvent::Up,
+        StreamState::Down { message, outdated } => DaemonEvent::Down {
+            message: message.clone(),
+            outdated: *outdated,
+        },
+    };
+    *announced = Some(state);
+    // Unbounded: the only failure is a receiver that is gone, which the loop
+    // notices on its own.
+    let _ = sender.try_send(event);
+}
+
 /// One subscription, from connect to disconnect.
 ///
 /// `subscribed` is set the moment the subscription is known to be live — which
@@ -1035,12 +1473,19 @@ fn next_resubscribe_delay(delay: Duration) -> Duration {
 /// an error off the connection.
 async fn stream_status_once(
     endpoint: &Endpoint,
+    remembered: &Remembered,
     sender: &Sender<DaemonEvent>,
     subscribed: &mut bool,
+    announced: &mut Option<StreamState>,
     known_workspaces: &mut HashMap<String, KnownWorkspace>,
     has_workspace_snapshot: &mut bool,
 ) -> Result<()> {
-    let mut connection = endpoint.connect().await?;
+    let (mut connection, ack) = endpoint.connect().await?;
+    // This handshake is as current as a control one: an upgrade met here first
+    // clears the arrow without waiting for a control request. Snapshot only —
+    // nothing below gates a frame on it.
+    remembered.remember(endpoint, &ack);
+    let degraded = ack.degraded;
 
     // **Subscribe first, list second.** The daemon's events name its own
     // session ids while this crate's callers name workspaces, and the listing
@@ -1087,12 +1532,17 @@ async fn stream_status_once(
     // behind it: this repairs layouts and removals missed while disconnected.
     *subscribed = true;
     let first_workspace_snapshot = !*has_workspace_snapshot;
-    for event in workspace_snapshot_events(workspaces.unwrap_or_default(), known_workspaces) {
+    for event in
+        workspace_snapshot_events(workspaces.unwrap_or_default(), known_workspaces, degraded)
+    {
         if sender.send(event).await.is_err() {
             return Ok(());
         }
     }
     *has_workspace_snapshot = true;
+    // After the recovery snapshot, and not before: a subscriber that is told
+    // the host is back reads the state it was brought back to.
+    announce(sender, announced, StreamState::Up);
 
     for frame in pending {
         if let Some(event) = status_event(frame, &mut join) {
@@ -1122,9 +1572,20 @@ struct KnownWorkspace {
     layout: LayoutDoc,
 }
 
+/// The news in a resubscribe's snapshot: what changed, and what the daemon no
+/// longer has.
+///
+/// **A degraded daemon's silence is not a removal.** Its ledger is read-only and
+/// its listing may omit live workspaces (§8.5), and a synthesized
+/// `WorkspaceRemoved` deletes this client's row — with none of the reconcile
+/// sweep's guards. So on `degraded` nothing is synthesized *and* the absent ids
+/// stay in `known`, which is what makes the first healthy snapshot that still
+/// omits one emit exactly one removal. Explicit removal events are unaffected:
+/// they go through [`accept_workspace_event`].
 fn workspace_snapshot_events(
     workspaces: Vec<proto::WorkspaceInfo>,
     known: &mut HashMap<String, KnownWorkspace>,
+    degraded: bool,
 ) -> Vec<DaemonEvent> {
     let current: HashMap<_, _> = workspaces
         .iter()
@@ -1139,11 +1600,13 @@ fn workspace_snapshot_events(
         })
         .collect();
     let mut events = Vec::new();
-    for workspace_id in known.keys() {
-        if !current.contains_key(workspace_id) {
-            events.push(DaemonEvent::WorkspaceRemoved {
-                workspace_id: workspace_id.clone(),
-            });
+    if !degraded {
+        for workspace_id in known.keys() {
+            if !current.contains_key(workspace_id) {
+                events.push(DaemonEvent::WorkspaceRemoved {
+                    workspace_id: workspace_id.clone(),
+                });
+            }
         }
     }
     for workspace in workspaces {
@@ -1168,7 +1631,11 @@ fn workspace_snapshot_events(
             }));
         }
     }
-    *known = current;
+    if degraded {
+        known.extend(current);
+    } else {
+        *known = current;
+    }
     events
 }
 
@@ -1207,7 +1674,9 @@ fn accept_workspace_event(
         DaemonEvent::WorkspaceRemoved { workspace_id } => {
             known.remove(workspace_id).is_some() || forward_unknown_removal
         }
-        DaemonEvent::Session(_) => true,
+        // Not workspace news, and not produced here at all: the stream's own
+        // state is announced by [`announce`], past this filter.
+        DaemonEvent::Session(_) | DaemonEvent::Up | DaemonEvent::Down { .. } => true,
     }
 }
 
@@ -1427,9 +1896,39 @@ fn newest_live(sessions: &[proto::SessionInfo], id: &SessionId) -> Option<proto:
 #[derive(Clone, Debug)]
 struct Endpoint {
     bin_path: PathBuf,
-    address: LocalEndpoint,
+    address: Address,
     state_dir: PathBuf,
     transport: Transport,
+}
+
+/// The address, in the two shapes a command line can carry it.
+///
+/// [`Self::Named`] is every address something has to be *told*: the socket a
+/// local unix daemon binds, and the local end of a host's forward. Both are
+/// spelled out to the proxy and to the attach client, because both are choices
+/// this crate made and neither side could derive.
+///
+/// [`Self::DefaultPipe`] is the Windows local daemon, where there is nothing to
+/// tell. `ade-daemon` derives `\\.\pipe\ade-daemon-<sid>` from the SID it is
+/// already running under, in every mode that needs it — so a name passed from
+/// here could only ever be the same one it would have derived, or a wrong one.
+/// The variant carries no name for exactly that reason, and the two argvs below
+/// emit no endpoint flag for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Address {
+    Named(LocalEndpoint),
+    #[cfg(windows)]
+    DefaultPipe,
+}
+
+impl std::fmt::Display for Address {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Named(address) => address.fmt(formatter),
+            #[cfg(windows)]
+            Self::DefaultPipe => formatter.write_str("this user's daemon pipe"),
+        }
+    }
 }
 
 /// How [`Endpoint::address`] is reached.
@@ -1450,11 +1949,22 @@ enum Transport {
 }
 
 impl Endpoint {
-    /// This machine's daemon: our own binary, at the standard socket.
+    /// This machine's daemon: our own binary, at the standard endpoint — the
+    /// socket under `~/.ade` on unix, this user's own pipe on Windows.
+    ///
+    /// The state dir is named on both, and on Windows that is the one thing
+    /// this side does name: the daemon would derive the same `~/.ade/daemon`
+    /// itself, but from `$HOME` where `dirs` reads the profile, and a client
+    /// that says which ledger it means cannot disagree with the daemon it
+    /// starts about where the sessions were written.
     fn local() -> Self {
+        #[cfg(not(windows))]
+        let address = Address::Named(LocalEndpoint::Socket(expand_home(DEFAULT_SOCKET_PATH)));
+        #[cfg(windows)]
+        let address = Address::DefaultPipe;
         Self {
             bin_path: resolve_binary(),
-            address: LocalEndpoint::Socket(expand_home(DEFAULT_SOCKET_PATH)),
+            address,
             state_dir: expand_home(DEFAULT_STATE_DIR),
             transport: Transport::Proxy,
         }
@@ -1477,7 +1987,7 @@ impl Endpoint {
         Ok(Self {
             // Our own client, run locally against the forwarded address.
             bin_path: resolve_binary(),
-            address: address.clone(),
+            address: Address::Named(address.clone()),
             // Unused: the daemon's state lives on the host, and the proxy argv
             // this would feed is never built for a forwarded endpoint.
             state_dir: PathBuf::new(),
@@ -1495,7 +2005,39 @@ impl Endpoint {
     /// [`Self::open`] + handshake, and what it rebuilds differs per transport —
     /// a fresh `--stdio-proxy` child locally, a fresh socket or loopback
     /// connect behind a forward.
-    async fn connect(&self) -> Result<DaemonConnection> {
+    async fn connect(&self) -> Result<(DaemonConnection, HelloAck)> {
+        let outcome = self.connect_once().await;
+        // The one upgrade path a *local* daemon has. It is too old to speak this
+        // client's generation and said so, which is connection-fatal at the
+        // daemon end — so the polite exit rides a connection of its own, and the
+        // proxy then starts the binary that ships with this app. A remote host
+        // is not this case: its daemon is replaced by the deploy path, and a
+        // refusal there must reach the operator's upgrade prompt untouched.
+        let Err(error) = outcome else {
+            return outcome;
+        };
+        // Only ever *downwards*. A refusal whose direction is not provably
+        // "the daemon is behind" — a newer local daemon, or one that named no
+        // range — fails closed to the client-too-old surface: asking a newer
+        // daemon to exit is how this client would install older bytes over the
+        // sessions it holds.
+        if matches!(self.transport, Transport::Forwarded(_))
+            || refusal_code(&error) != Some(proto::error_code::UNSUPPORTED_GENERATION)
+            || incompatible_daemon(&error) != Some(Outdated::Daemon)
+        {
+            return Err(error);
+        }
+        log::warn!(
+            "the local session daemon speaks a protocol generation this client does not; \
+             asking it to exit so the shipped one can take its place: {error:#}"
+        );
+        self.retire_outdated_local_daemon().await?;
+        self.connect_once().await
+    }
+
+    /// [`Self::connect`] without the generation-skew recovery, so that the
+    /// retry after it cannot recurse.
+    async fn connect_once(&self) -> Result<(DaemonConnection, HelloAck)> {
         if let Transport::Forwarded(link) = &self.transport {
             // Blocking, deliberately: `--ensure` and the forward are one
             // short ssh command and one process spawn, and bringing a
@@ -1509,6 +2051,40 @@ impl Endpoint {
             link.ensure_ready()?;
         }
         handshaken(|| self.open()).await
+    }
+
+    /// Ask an outdated local daemon to exit, on a connection it can actually
+    /// read.
+    ///
+    /// The refusal that brought us here ended that connection, and this
+    /// client's own `Hello` is what it refused — so the request is handshaken
+    /// at **generation 2**, the generation `Shutdown` has existed at and the
+    /// only one such a daemon serves. Unforced: the daemon re-checks for itself
+    /// that it holds nothing an upgrade may sacrifice, and its decline is the
+    /// answer this returns rather than something to override. Nothing here may
+    /// hard-kill a local daemon; only the operator's own click does that, and
+    /// only on a remote host.
+    async fn retire_outdated_local_daemon(&self) -> Result<()> {
+        let mut connection = self.open().await?;
+        connection
+            .handshake_at(Hello {
+                min_generation: RETIRING_GENERATION,
+                max_generation: RETIRING_GENERATION,
+                capabilities: Vec::new(),
+                request_id: None,
+            })
+            .await
+            .context("handshaking with the outdated local daemon at generation 2")?;
+        connection
+            .send(&Frame::Shutdown {
+                force: false,
+                request_id: Some(1),
+            })
+            .await
+            .context("asking the outdated local daemon to exit")?;
+        await_shutdown_ack(&mut connection)
+            .await
+            .context("the outdated local daemon would not exit")
     }
 
     /// One connection, opened and not yet handshaken.
@@ -1540,21 +2116,34 @@ impl Endpoint {
     async fn open_directly(&self) -> Result<DaemonConnection> {
         let connection = match &self.address {
             #[cfg(unix)]
-            LocalEndpoint::Socket(path) => DaemonConnection::Socket(ade_session::Connection::new(
-                smol::net::unix::UnixStream::connect(path)
-                    .await
-                    .with_context(|| format!("connecting to {}", path.display()))?,
-            )),
+            Address::Named(LocalEndpoint::Socket(path)) => {
+                DaemonConnection::Socket(ade_session::Connection::new(
+                    smol::net::unix::UnixStream::connect(path)
+                        .await
+                        .with_context(|| format!("connecting to {}", path.display()))?,
+                ))
+            }
             #[cfg(not(unix))]
-            LocalEndpoint::Socket(path) => bail!(
+            Address::Named(LocalEndpoint::Socket(path)) => bail!(
                 "this platform cannot connect to the Unix socket {}",
                 path.display()
             ),
-            LocalEndpoint::Loopback(port) => DaemonConnection::Tcp(ade_session::Connection::new(
-                smol::net::TcpStream::connect((LOOPBACK_ADDRESS, *port))
-                    .await
-                    .with_context(|| format!("connecting to {LOOPBACK_ADDRESS}:{port}"))?,
-            )),
+            // Unreachable: the only Windows endpoint that names it is the local
+            // one, and that is [`Transport::Proxy`] — which is the point. The
+            // pipe client lives in the daemon binary, once, and this crate
+            // reaches it through `--stdio-proxy` rather than growing a second.
+            #[cfg(windows)]
+            Address::DefaultPipe => bail!(
+                "this user's daemon pipe is only ever reached through the proxy, never connected \
+                 to directly"
+            ),
+            Address::Named(LocalEndpoint::Loopback(port)) => {
+                DaemonConnection::Tcp(ade_session::Connection::new(
+                    smol::net::TcpStream::connect((LOOPBACK_ADDRESS, *port))
+                        .await
+                        .with_context(|| format!("connecting to {LOOPBACK_ADDRESS}:{port}"))?,
+                ))
+            }
         };
         Ok(connection)
     }
@@ -1572,16 +2161,69 @@ impl Endpoint {
     }
 
     fn proxy_argv(&self) -> Vec<String> {
-        DaemonEndpoint::preinstalled(
-            self.bin_path.display().to_string(),
-            // Only ever built for [`Transport::Proxy`], which fronts a *local*
-            // daemon, and a daemon binds a socket. A loopback address here
-            // would be a construction bug; it is passed through so the child
-            // says so rather than this panicking.
-            self.address.to_string(),
-            self.state_dir.display().to_string(),
-        )
-        .proxy_argv()
+        match &self.address {
+            Address::Named(address) => DaemonEndpoint::preinstalled(
+                self.bin_path.display().to_string(),
+                // Only ever built for [`Transport::Proxy`], which fronts a
+                // *local* daemon, and a daemon binds a socket. A loopback
+                // address here would be a construction bug; it is passed
+                // through so the child says so rather than this panicking.
+                address.to_string(),
+                self.state_dir.display().to_string(),
+            )
+            .proxy_argv(),
+            // The same argv minus the endpoint, which `--stdio-proxy` derives
+            // for itself here. Built rather than borrowed from
+            // [`ade_session::deploy`]: that module's argv names a socket, and
+            // this endpoint is a pipe.
+            #[cfg(windows)]
+            Address::DefaultPipe => vec![
+                self.bin_path.display().to_string(),
+                "--stdio-proxy".to_owned(),
+                "--state-dir".to_owned(),
+                self.state_dir.display().to_string(),
+            ],
+        }
+    }
+}
+
+/// Wait out a daemon that has been sent [`Frame::Shutdown`], bounded by
+/// [`SHUTDOWN_ACK_TIMEOUT`].
+///
+/// A declined shutdown is a [`DaemonRefusal`] carrying the daemon's reason —
+/// correlated, like every other request: an error with no rid is the daemon
+/// reporting something else entirely and must not be read as a refusal to exit.
+async fn await_shutdown_ack(connection: &mut DaemonConnection) -> Result<()> {
+    let mut deadline = AnswerDeadline::armed(SHUTDOWN_ACK_TIMEOUT);
+    loop {
+        match connection
+            .receive(Some(&mut deadline))
+            .await
+            .context("waiting for the shutdown answer")?
+        {
+            Received::Frame(Frame::ShutdownAck { .. }) => return Ok(()),
+            Received::Frame(Frame::Error {
+                code,
+                message,
+                request_id: Some(1),
+                ..
+            }) => {
+                return Err(anyhow::Error::new(DaemonRefusal {
+                    code: bounded(&code).into_owned(),
+                    message: bounded(&message).into_owned(),
+                }));
+            }
+            Received::Frame(other) => {
+                log::debug!("ignoring {other:?} while waiting for ShutdownAck")
+            }
+            Received::Discarded => continue,
+            // The caller drops the connection with this error, which is what
+            // [`Received::Expired`] requires: the read was abandoned mid-frame.
+            Received::Expired => bail!(
+                "the session daemon accepted the shutdown request and did not answer within \
+                 {SHUTDOWN_ACK_TIMEOUT:?}"
+            ),
+        }
     }
 }
 
@@ -1595,7 +2237,7 @@ impl Endpoint {
 /// diagnosed. Anything else is an *answer*: a generation outside this client's
 /// range, an explicit error frame, a spawn that failed. Retrying an answer
 /// would just get it twice.
-async fn handshaken<C, F>(open: C) -> Result<DaemonConnection>
+async fn handshaken<C, F>(open: C) -> Result<(DaemonConnection, HelloAck)>
 where
     C: Fn() -> F,
     F: Future<Output = Result<DaemonConnection>>,
@@ -1604,7 +2246,7 @@ where
     loop {
         let mut connection = open().await?;
         let error = match connection.handshake().await {
-            Ok(()) => return Ok(connection),
+            Ok(ack) => return Ok((connection, ack)),
             Err(error) => error,
         };
         // Before the delay, not after: the failed connection is a proxy child
@@ -1646,10 +2288,37 @@ fn handshake_ended_in_eof(error: &anyhow::Error) -> bool {
 /// this matches the sentence itself — the one place it is produced
 /// ([`handshaken`]) and the one place it is acted on (the forced shutdown's
 /// fallback) share the constant.
-pub(crate) fn is_incompatible_daemon(error: &anyhow::Error) -> bool {
+fn is_pre_cut_daemon(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains(PRE_CUT_DIAGNOSIS))
+}
+
+/// Whether this failure is "the two ends cannot talk" rather than "the host
+/// could not be reached", and if so which end is behind.
+///
+/// Three shapes reach here and none of them is read out of prose: the pre-cut
+/// EOF diagnosis, a typed [`DaemonRefusal`] with `unsupported_generation`, and
+/// a typed [`GenerationSkew`] from an ack outside the range we offered. An
+/// ordinary network or spawn failure is `None` and keeps the plain-terminal
+/// fallback it always had.
+pub(crate) fn incompatible_daemon(error: &anyhow::Error) -> Option<Outdated> {
+    if is_pre_cut_daemon(error) {
+        return Some(Outdated::Daemon);
+    }
+    let skew = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<GenerationSkew>());
+    if let Some(skew) = skew {
+        return Some(skew.outdated());
+    }
+    (refusal_code(error) == Some(proto::error_code::UNSUPPORTED_GENERATION)).then(|| {
+        GenerationSkew {
+            offered: (proto::MIN_GENERATION, proto::MAX_GENERATION),
+            daemon: None,
+        }
+        .outdated()
+    })
 }
 
 /// The POSIX script the forced upgrade runs to take down a pre-cut daemon.
@@ -1777,10 +2446,20 @@ impl std::fmt::Display for Endpoint {
 /// How the attach client is told where the daemon is — the flag pair
 /// `ade-daemon attach` takes, which is the seam between this crate's idea of a
 /// local endpoint and the client's command line.
-fn client_argv(address: &LocalEndpoint) -> [String; 2] {
+fn client_argv(address: &Address) -> Vec<String> {
     match address {
-        LocalEndpoint::Socket(path) => ["--socket".to_owned(), path.display().to_string()],
-        LocalEndpoint::Loopback(port) => ["--tcp".to_owned(), format!("{LOOPBACK_ADDRESS}:{port}")],
+        Address::Named(LocalEndpoint::Socket(path)) => {
+            vec!["--socket".to_owned(), path.display().to_string()]
+        }
+        Address::Named(LocalEndpoint::Loopback(port)) => {
+            vec!["--tcp".to_owned(), format!("{LOOPBACK_ADDRESS}:{port}")]
+        }
+        // Nothing at all: `ade-daemon attach <id>` with neither `--pipe` nor
+        // `--tcp` derives this user's own pipe, which is the one this client
+        // means. Naming it would mean deriving a SID in this crate to arrive at
+        // the same string the client is about to derive anyway.
+        #[cfg(windows)]
+        Address::DefaultPipe => Vec::new(),
     }
 }
 
@@ -1811,7 +2490,7 @@ fn sanitize_host(destination: &str) -> String {
 }
 
 /// The host's absolute paths. Absolute because the client has to name the same
-/// socket the daemon binds, and `~` is only a shell's idea.
+/// endpoint the daemon binds, and `~` is only a shell's idea.
 #[derive(Clone, Debug)]
 struct RemotePaths {
     bin: String,
@@ -1822,10 +2501,10 @@ struct RemotePaths {
 /// What the `--ensure` line says beyond "a daemon is listening".
 ///
 /// The line is `ade-daemon <version>` followed by optional `key=value` tokens
-/// a newer daemon appends: `hash=<hex sha256 of its binary>` and
-/// `upgrade_ready=<bool>`. Absent tokens decode to the conservative reading —
-/// no hash means a legacy daemon nothing may touch, and readiness defaults to
-/// `false` for the same reason.
+/// a newer daemon appends: `hash=<hex sha256 of its binary>`,
+/// `upgrade_ready=<bool>` and `generations=<min>..=<max>`. Absent tokens decode
+/// to the conservative reading — no hash means a legacy daemon nothing may
+/// touch, and readiness defaults to `false` for the same reason.
 #[derive(Debug, PartialEq, Eq)]
 struct EnsureReport {
     /// The daemon's binary identity, and the *only* thing that can say whether
@@ -1834,6 +2513,24 @@ struct EnsureReport {
     /// versions would be comparing a constant with itself.
     hash: Option<String>,
     upgrade_ready: bool,
+    /// The protocol window the daemon serves — see [`Generations`].
+    generations: Generations,
+}
+
+/// What the `generations=` token said, in the three states the deploy guard has
+/// to tell apart.
+///
+/// **Absent and malformed are opposites, not the same.** No token is a daemon
+/// predating it, which is definitionally older than this client and safe to
+/// replace; a token this build cannot read can only come from a daemon whose
+/// spelling is newer than this build knows, and replacing that one is the
+/// downgrade the guard exists to refuse.
+#[derive(Debug, PartialEq, Eq, Default)]
+enum Generations {
+    #[default]
+    Absent,
+    Valid(u32, u32),
+    Malformed,
 }
 
 impl EnsureReport {
@@ -1841,6 +2538,7 @@ impl EnsureReport {
         let mut report = Self {
             hash: None,
             upgrade_ready: false,
+            generations: Generations::Absent,
         };
         for token in line.split_whitespace() {
             if let Some(value) = token.strip_prefix("hash=") {
@@ -1849,10 +2547,53 @@ impl EnsureReport {
                 }
             } else if let Some(value) = token.strip_prefix("upgrade_ready=") {
                 report.upgrade_ready = value == "true";
+            } else if let Some(value) = token.strip_prefix("generations=") {
+                // A second token is malformed however well each one parses:
+                // last-wins would let an unknown format hide a real window
+                // behind a readable one.
+                report.generations = match report.generations {
+                    Generations::Absent => parse_generations(value),
+                    _ => Generations::Malformed,
+                };
             }
         }
         report
     }
+}
+
+/// `<min>..=<max>`, or [`Generations::Malformed`] for anything else.
+fn parse_generations(value: &str) -> Generations {
+    let Some((min, max)) = value.split_once("..=") else {
+        return Generations::Malformed;
+    };
+    match (min.parse(), max.parse()) {
+        (Ok(min), Ok(max)) if min <= max => Generations::Valid(min, max),
+        _ => Generations::Malformed,
+    }
+}
+
+/// Refuse to replace a daemon whose window starts above this client's.
+///
+/// The deploy decision is a *hash* comparison and it runs before any handshake,
+/// so without this a client meeting a newer daemon reads "different bytes" and
+/// pushes its own older ones over sessions it could never have talked to. The
+/// error is a [`GenerationSkew`], so the caller that surfaces it lands on
+/// [`Outdated::Client`] — update the client — with no prose to parse.
+fn refuse_downgrade(report: &EnsureReport) -> Result<()> {
+    let daemon = match report.generations {
+        Generations::Absent => return Ok(()),
+        Generations::Valid(min, _) if min <= proto::MAX_GENERATION => return Ok(()),
+        Generations::Valid(min, max) => Some((min, max)),
+        // No numbers anybody may trust: the refusal carries none, and the
+        // direction falls to the same client-too-old reading a range-less
+        // typed refusal takes.
+        Generations::Malformed => None,
+    };
+    Err(anyhow::Error::new(GenerationSkew {
+        offered: (proto::MIN_GENERATION, proto::MAX_GENERATION),
+        daemon,
+    })
+    .context("refusing to replace a daemon this client cannot prove is older"))
 }
 
 /// One remote host's single ssh connection, and everything needed to bring it
@@ -1952,9 +2693,8 @@ impl HostLink {
     }
 
     /// A link whose remote paths are already known, so the `$HOME` query is
-    /// skipped. See [`DaemonBackend::remote_at`].
-    // Its only caller is unix-gated, so the plain `test` gate warned on
-    // Windows.
+    /// skipped. See [`DaemonBackend::remote_at`], which is its only caller and
+    /// carries the same gate.
     #[cfg(all(test, unix))]
     fn with_paths(host: ade_session::SshHost, local: LocalEndpoint, paths: RemotePaths) -> Self {
         Self {
@@ -2089,6 +2829,13 @@ impl HostLink {
         self.freshness_observers.add(observer);
     }
 
+    /// Wake the sidebar for something other than the hash verdict — the
+    /// negotiated generation moving, which colours the arrow on the same rows.
+    /// One channel, because a sidebar redraws all its rows or none.
+    fn announce_freshness(&self) {
+        self.freshness_observers.announce();
+    }
+
     /// One `--ensure` over ssh, and nothing else. The raw question: is a daemon
     /// listening, and what does it say about itself?
     fn ensure_once(&self, paths: &RemotePaths) -> Result<EnsureOutcome> {
@@ -2164,15 +2911,7 @@ impl HostLink {
             }
         };
         let line = self.ensure_installed(&paths)?;
-        let report = EnsureReport::parse(&line);
-        let Some(remote_hash) = report.hash else {
-            bail!(
-                "the daemon on {} predates binary identity and cannot be upgraded in place; \
-                 stop it by hand",
-                self.host.destination
-            );
-        };
-        let outcome = self.upgrade_to_local_binary(&paths, &remote_hash, true)?;
+        let outcome = self.upgrade_to_local_binary(&paths, &EnsureReport::parse(&line), true)?;
         if outcome == DaemonUpgradeOutcome::Upgraded {
             self.ensure_after_upgrade(&paths)?;
         }
@@ -2188,7 +2927,7 @@ impl HostLink {
     /// not fail because an upgrade attempt did.
     fn upgrade_if_stale(&self, paths: &RemotePaths, ensure_line: &str) -> bool {
         let report = EnsureReport::parse(ensure_line);
-        let Some(remote_hash) = report.hash else {
+        let Some(remote_hash) = report.hash.as_deref() else {
             log::debug!(
                 "{}: daemon predates binary identity; leaving it alone",
                 self.host.destination
@@ -2227,7 +2966,7 @@ impl HostLink {
             );
             return false;
         }
-        match self.upgrade_to_local_binary(paths, &remote_hash, false) {
+        match self.upgrade_to_local_binary(paths, &report, false) {
             Ok(outcome) => outcome == DaemonUpgradeOutcome::Upgraded,
             Err(err) => {
                 log::warn!(
@@ -2272,12 +3011,25 @@ impl HostLink {
     /// readiness itself, so a daemon that changed its mind in between declines
     /// and the attempt is abandoned — as it should be, nobody asked for it.
     /// The operator's own click passes `true` and is never declined.
+    ///
+    /// The single funnel for the destructive half, so the two guards that must
+    /// never be bypassed live here: a daemon newer than this client is refused
+    /// outright ([`refuse_downgrade`]) before the cross-build is even started,
+    /// and one too old to report a hash cannot be compared and is left alone.
     fn upgrade_to_local_binary(
         &self,
         paths: &RemotePaths,
-        remote_hash: &str,
+        report: &EnsureReport,
         force: bool,
     ) -> Result<DaemonUpgradeOutcome> {
+        refuse_downgrade(report)?;
+        let Some(remote_hash) = report.hash.as_deref() else {
+            bail!(
+                "the daemon on {} predates binary identity and cannot be upgraded in place; \
+                 stop it by hand",
+                self.host.destination
+            );
+        };
         let (binary, local_hash) = self.local_binary()?;
         self.note_hash_verdict(local_hash != remote_hash);
         if local_hash == remote_hash {
@@ -2298,10 +3050,7 @@ impl HostLink {
         );
         self.request_shutdown(paths, force)
             .context("asking the daemon to exit for the upgrade")?;
-        let config = ade_session::DeployConfig::new(binary, ade_session::daemon_version())
-            .with_bin_path(paths.bin.clone())
-            .with_socket_path(paths.socket.clone())
-            .with_state_dir(paths.state_dir.clone());
+        let config = deploy_config(binary, paths);
         ade_session::replace_daemon(&self.host, &config).with_context(|| {
             format!(
                 "installing the fresh ade-daemon on {}",
@@ -2359,8 +3108,8 @@ impl HostLink {
             })
             .await
             {
-                Ok(connection) => connection,
-                Err(error) if force && is_incompatible_daemon(&error) => {
+                Ok((connection, _ack)) => connection,
+                Err(error) if force && is_pre_cut_daemon(&error) => {
                     return self.kill_pre_cut_daemon(paths);
                 }
                 Err(error) => {
@@ -2374,26 +3123,7 @@ impl HostLink {
                 })
                 .await
                 .context("sending Shutdown")?;
-            loop {
-                match connection
-                    .recv_decodable()
-                    .await
-                    .context("waiting for the shutdown answer")?
-                {
-                    Frame::ShutdownAck { .. } => return Ok(()),
-                    // Correlated, like every other request: a declined
-                    // shutdown echoes this rid, while an error carrying none is
-                    // the daemon reporting something else entirely and must
-                    // not be read as a refusal to exit.
-                    Frame::Error {
-                        code,
-                        message,
-                        request_id: Some(1),
-                        ..
-                    } => bail!("{}: {}", bounded(&code), bounded(&message)),
-                    other => log::debug!("ignoring {other:?} while waiting for ShutdownAck"),
-                }
-            }
+            await_shutdown_ack(&mut connection).await
         })
     }
 
@@ -2480,10 +3210,7 @@ impl HostLink {
             .with_context(|| format!("getting an ade-daemon binary for {triple}"))?;
         log::info!("uploading ade-daemon to {}:{}", destination, paths.bin);
 
-        let config = ade_session::DeployConfig::new(binary, ade_session::daemon_version())
-            .with_bin_path(paths.bin.clone())
-            .with_socket_path(paths.socket.clone())
-            .with_state_dir(paths.state_dir.clone());
+        let config = deploy_config(binary, paths);
         let endpoint = ade_session::deploy::ensure_daemon(&self.host, &config)
             .with_context(|| format!("deploying ade-daemon to {destination}"))?;
         log::info!(
@@ -2503,14 +3230,15 @@ impl HostLink {
         state.forward = None;
     }
 
-    /// The host's `$HOME`, expanded into the three paths the daemon uses.
+    /// What the host is, and where its daemon's files go.
     ///
-    /// `ssh host command` is not a login shell, so this asks a plain `sh -c`
-    /// for `$HOME` the same way [`ade_session::deploy`] does — proven against a
-    /// real connection by that crate's loopback tests.
+    /// `ssh host command` is not a login shell, so the host is asked for
+    /// `$HOME` through a plain `sh -c` the same way [`ade_session::deploy`]
+    /// does — proven against a real connection by that crate's loopback tests.
     fn remote_paths(&self) -> Result<RemotePaths> {
         use ade_session::deploy::HostExec as _;
 
+        let destination = &self.host.destination;
         let output = self
             .host
             .run(&[
@@ -2518,11 +3246,10 @@ impl HostLink {
                 "-c".to_owned(),
                 "printf %s \"$HOME\"".to_owned(),
             ])
-            .with_context(|| format!("asking {} for $HOME", self.host.destination))?;
+            .with_context(|| format!("asking {destination} for $HOME"))?;
         if !output.success() || output.stdout.trim().is_empty() {
             bail!(
-                "could not read $HOME on {}: {}",
-                self.host.destination,
+                "could not read $HOME on {destination}: {}",
                 output.stderr.trim(),
             );
         }
@@ -2533,6 +3260,23 @@ impl HostLink {
             state_dir: expand_remote(DEFAULT_STATE_DIR, &home),
         })
     }
+}
+
+/// `--view-id <id>`, or nothing for a caller that has no view to name — the
+/// workspace-level attach, whose terminal never claims focus.
+fn view_argv(view_id: &str) -> Vec<String> {
+    match view_id.is_empty() {
+        true => Vec::new(),
+        false => vec!["--view-id".to_owned(), view_id.to_owned()],
+    }
+}
+
+/// What to deploy where, for the host these paths belong to.
+fn deploy_config(binary: Vec<u8>, paths: &RemotePaths) -> ade_session::DeployConfig {
+    ade_session::DeployConfig::new(binary, ade_session::daemon_version())
+        .with_bin_path(paths.bin.clone())
+        .with_socket_path(paths.socket.clone())
+        .with_state_dir(paths.state_dir.clone())
 }
 
 /// `~/x` against a host's `$HOME`. Anything else is already absolute.
@@ -2552,23 +3296,13 @@ enum DaemonConnection {
 }
 
 impl DaemonConnection {
-    async fn handshake(&mut self) -> Result<()> {
-        // Pinned at generation 2: this client still implements gen-2 semantics
-        // (auto-created workspaces, the combined create), while the crate can
-        // already speak 3. Announcing 3 would have the daemon hold it to the
-        // gen-3 meanings. The registry client that speaks 3 is the next commit,
-        // and it removes this pin.
-        let hello = Hello {
-            max_generation: proto::MIN_GENERATION,
-            ..Hello::current()
-        };
-        let ack = match self {
-            Self::Proxied(connection) => connection.handshake(hello.clone()).await,
-            #[cfg(unix)]
-            Self::Socket(connection) => connection.handshake(hello.clone()).await,
-            Self::Tcp(connection) => connection.handshake(hello).await,
-        }
-        .context("handshaking with the session daemon")?;
+    /// Handshakes and answers with the ack's `degraded` flag — see
+    /// [`DaemonBackend::degraded`].
+    async fn handshake(&mut self) -> Result<HelloAck> {
+        let ack = self
+            .handshake_at(Hello::current())
+            .await
+            .context("handshaking with the session daemon")?;
         // The *generation* is policed, and not here: since the cut,
         // `Connection::handshake` verifies the daemon's selection lies inside
         // this build's range and fails legibly if it does not (§3.1). What is
@@ -2603,7 +3337,47 @@ impl DaemonConnection {
                 ack.host_os,
             );
         }
-        Ok(())
+        Ok(ack)
+    }
+
+    /// Send `hello` and read the ack, verified against the range `hello` itself
+    /// announced.
+    ///
+    /// Deliberately **not** [`ade_session::Connection::handshake`], for two
+    /// reasons that are the same reason: that one flattens the daemon's refusal
+    /// code into prose, and the one caller that must branch on the code —
+    /// generation skew, [`Endpoint::retire_outdated_local_daemon`] — is also
+    /// the caller whose ack is legitimately outside this build's range. Its
+    /// §6.1 EOF signature survives, because the read is the same raw one.
+    async fn handshake_at(&mut self, hello: Hello) -> Result<HelloAck> {
+        let (min, max) = (hello.min_generation, hello.max_generation);
+        self.send(&Frame::Hello(hello)).await?;
+        match self.recv().await? {
+            Frame::HelloAck(ack) => {
+                if ack.generation < min || ack.generation > max {
+                    // Typed, because the UI has to choose between offering to
+                    // replace the daemon and telling the user to update the
+                    // client, and both ranges are here in numbers.
+                    return Err(anyhow::Error::new(GenerationSkew {
+                        offered: (min, max),
+                        daemon: Some((ack.min_generation, ack.max_generation)),
+                    })
+                    .context(format!(
+                        "daemon {} selected protocol generation {}, outside the {min}..={max} \
+                         this connection offered",
+                        bounded(&ack.daemon_version),
+                        ack.generation,
+                    )));
+                }
+                Ok(ack)
+            }
+            Frame::Error { code, message, .. } => Err(anyhow::Error::new(DaemonRefusal {
+                code: bounded(&code).into_owned(),
+                message: bounded(&message).into_owned(),
+            })
+            .context("the session daemon refused the handshake")),
+            other => bail!("expected HelloAck, got {}", bounded_debug(&other)),
+        }
     }
 
     async fn send(&mut self, frame: &Frame) -> Result<()> {
@@ -3060,6 +3834,30 @@ mod control_connection {
             sessions: Vec<proto::SessionInfo>,
             workspaces: Vec<proto::WorkspaceInfo>,
             pending: Vec<Frame>,
+            /// §8.5 in the handshake: this snapshot may be missing workspaces.
+            degraded: bool,
+        },
+        /// Refuse the handshake the way a daemon older than this client does:
+        /// no generation in common, one `Error`, connection over.
+        RefuseGeneration,
+        /// The connection that outdated daemon *can* read: a generation-2
+        /// handshake carrying a polite `Shutdown`. Asserts both, then either
+        /// acks or declines — a daemon holding live work says no, and no client
+        /// may override that.
+        RetireAtGenerationTwo { declining: bool },
+        /// Handshake at `generation` and then answer whatever comes, recording
+        /// every op the client sent.
+        ///
+        /// What the generation-gated tests read is that recording: which frames
+        /// the client *chose* to put on the wire, which is the sender half of
+        /// the contract a receiver-side refusal cannot prove.
+        Dialogue {
+            generation: u32,
+            /// What `list_sessions` answers with. A generation-2 daemon's
+            /// combined create has already put the workspace's first session
+            /// here; a generation-3 one has not.
+            sessions: Vec<proto::SessionInfo>,
+            ops: Arc<Mutex<Vec<String>>>,
         },
         /// Handshake, wait for one request, then write this frame over and
         /// over, in pre-encoded bursts, until the client hangs up.
@@ -3081,15 +3879,76 @@ mod control_connection {
             host_os: "test".to_owned(),
             min_generation: proto::MIN_GENERATION,
             max_generation: proto::MAX_GENERATION,
-            // What a real daemon selects for this client, whose handshake pins
-            // its offer at generation 2.
-            generation: proto::MIN_GENERATION,
+            generation: proto::MAX_GENERATION,
             capabilities: Vec::new(),
             degraded: false,
+            instance_id: Some("scripted-daemon".to_owned()),
             binary_hash: None,
             upgrade_ready: None,
-            instance_id: None,
             request_id: None,
+        }
+    }
+
+    /// The wire's own name for a frame's operation — read back off the
+    /// envelope rather than matched here, so a test asserts on what was sent.
+    fn op_of(frame: &Frame) -> String {
+        let payload = ade_session::encode_frame(frame).expect("encoding a client frame");
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&payload).expect("decoding a client envelope");
+        envelope["op"]
+            .as_str()
+            .expect("every frame names its op")
+            .to_owned()
+    }
+
+    /// The whole daemon [`Script::Dialogue`] plays: an answer per request, or
+    /// `None` for the fire-and-forget ops that are answered with silence.
+    fn dialogue_reply(request: &Frame, sessions: &[proto::SessionInfo]) -> Option<Frame> {
+        match request {
+            Frame::CreateWorkspace {
+                root,
+                name,
+                request_id,
+                ..
+            } => Some(Frame::Workspace {
+                workspace: proto::WorkspaceInfo {
+                    id: DIALOGUE_WORKSPACE.to_owned(),
+                    name: name.clone().unwrap_or_else(|| "scripted".to_owned()),
+                    project_root: root.clone(),
+                    created_at: 0,
+                    layout_rev: 0,
+                    layout: ade_session::LayoutDoc::default(),
+                },
+                // A generation-2 combined create answers with the session it
+                // made; a generation-3 one has none to name.
+                sessions: sessions.to_vec(),
+                persisted: true,
+                request_id: *request_id,
+            }),
+            Frame::ListSessions { request_id } => Some(Frame::SessionList {
+                sessions: sessions.to_vec(),
+                request_id: *request_id,
+            }),
+            Frame::CreateSession { request_id, .. } => Some(Frame::Created {
+                session: dialogue_session(),
+                persisted: true,
+                request_id: *request_id,
+            }),
+            _ => None,
+        }
+    }
+
+    const DIALOGUE_WORKSPACE: &str = "ws-1";
+
+    fn dialogue_session() -> proto::SessionInfo {
+        proto::SessionInfo {
+            id: proto::SessionId::new("session-1"),
+            workspace_id: DIALOGUE_WORKSPACE.to_owned(),
+            agent_kind: "shell".to_owned(),
+            instance_label: DIALOGUE_WORKSPACE.to_owned(),
+            cwd: "/repos/zed".to_owned(),
+            created_at: 0,
+            status: SessionStatus::Idle,
         }
     }
 
@@ -3231,15 +4090,107 @@ mod control_connection {
                             continue;
                         }
                         let mut daemon = ade_session::Connection::new(stream);
-                        let _hello = daemon.recv().await;
+                        let hello = daemon.recv().await;
+                        match &script {
+                            // Fatal to the connection at the daemon end, which
+                            // is the whole difficulty: dropping `daemon` here is
+                            // that close.
+                            Script::RefuseGeneration => {
+                                daemon
+                                    .send(&error(
+                                        proto::error_code::UNSUPPORTED_GENERATION,
+                                        "this daemon serves generation 2 only",
+                                        None,
+                                    ))
+                                    .await
+                                    .expect("refusing the handshake");
+                                continue;
+                            }
+                            Script::RetireAtGenerationTwo { declining } => {
+                                let Ok(Frame::Hello(hello)) = hello else {
+                                    panic!("the retirement channel must open with a Hello");
+                                };
+                                assert_eq!(
+                                    (hello.min_generation, hello.max_generation),
+                                    (RETIRING_GENERATION, RETIRING_GENERATION),
+                                    "the polite shutdown rides a generation-2 handshake"
+                                );
+                                daemon
+                                    .send(&Frame::HelloAck(proto::HelloAck {
+                                        protocol_version: RETIRING_GENERATION,
+                                        min_generation: RETIRING_GENERATION,
+                                        max_generation: RETIRING_GENERATION,
+                                        generation: RETIRING_GENERATION,
+                                        ..ack()
+                                    }))
+                                    .await
+                                    .expect("acking the generation-2 handshake");
+                                match daemon.recv().await.expect("the shutdown request") {
+                                    Frame::Shutdown { force, .. } => assert!(
+                                        !force,
+                                        "nothing without a human's click may force a shutdown"
+                                    ),
+                                    other => panic!("expected Shutdown, got {other:?}"),
+                                }
+                                let answer = if *declining {
+                                    error(proto::error_code::DECLINED, "a session is busy", Some(1))
+                                } else {
+                                    Frame::ShutdownAck {
+                                        request_id: Some(1),
+                                    }
+                                };
+                                daemon.send(&answer).await.expect("answering the shutdown");
+                                continue;
+                            }
+                            Script::Dialogue {
+                                generation,
+                                sessions,
+                                ops,
+                            } => {
+                                let Ok(Frame::Hello(hello)) = hello else {
+                                    panic!("a dialogue opens with a Hello");
+                                };
+                                assert!(
+                                    (hello.min_generation..=hello.max_generation)
+                                        .contains(generation),
+                                    "the client offered {}..={}, which does not include {generation}",
+                                    hello.min_generation,
+                                    hello.max_generation,
+                                );
+                                daemon
+                                    .send(&Frame::HelloAck(proto::HelloAck {
+                                        protocol_version: *generation,
+                                        min_generation: proto::MIN_GENERATION,
+                                        max_generation: *generation,
+                                        generation: *generation,
+                                        ..ack()
+                                    }))
+                                    .await
+                                    .expect("acking the dialogue handshake");
+                                while let Ok(request) = daemon.recv().await {
+                                    ops.lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .push(op_of(&request));
+                                    if let Some(reply) = dialogue_reply(&request, sessions) {
+                                        daemon.send(&reply).await.expect("answering a request");
+                                    }
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
                         if let Script::SubscriptionSnapshot {
                             sessions,
                             workspaces,
                             pending,
+                            degraded,
                         } = &script
                         {
                             daemon
-                                .send(&Frame::HelloAck(ack()))
+                                .send(&Frame::HelloAck(proto::HelloAck {
+                                    degraded: *degraded,
+                                    ..ack()
+                                }))
                                 .await
                                 .expect("sending the ack");
                             assert!(matches!(
@@ -3289,8 +4240,11 @@ mod control_connection {
                             Script::AnswerWith(frames) => (Duration::ZERO, frames, None),
                             Script::AnswerAfter(quiet_for, frames) => (quiet_for, frames, None),
                             Script::KeepTalking(frame) => (Duration::ZERO, Vec::new(), Some(frame)),
-                            Script::LegacySessionList(_) => unreachable!(),
-                            Script::SubscriptionSnapshot { .. } => unreachable!(),
+                            Script::LegacySessionList(_)
+                            | Script::SubscriptionSnapshot { .. }
+                            | Script::RefuseGeneration
+                            | Script::Dialogue { .. }
+                            | Script::RetireAtGenerationTwo { .. } => unreachable!(),
                         };
                         daemon
                             .send(&Frame::HelloAck(ack()))
@@ -3321,12 +4275,337 @@ mod control_connection {
         let port = port.recv().expect("the scripted daemon's port");
         let mut backend = DaemonBackend::with_endpoint(Endpoint {
             bin_path: PathBuf::from(DAEMON_BIN),
-            address: LocalEndpoint::Loopback(port),
+            address: Address::Named(LocalEndpoint::Loopback(port)),
             state_dir: PathBuf::new(),
             transport: Transport::Direct,
         });
         backend.answer_timeout = SCRIPTED_ANSWER_TIMEOUT;
         backend
+    }
+
+    /// A backend on a daemon that serves `generation`, with the ops it receives
+    /// recorded for the caller.
+    fn dialogue(
+        generation: u32,
+        sessions: Vec<proto::SessionInfo>,
+    ) -> (DaemonBackend, Arc<Mutex<Vec<String>>>) {
+        let ops = Arc::new(Mutex::new(Vec::new()));
+        let backend = scripted_daemon(vec![Script::Dialogue {
+            generation,
+            sessions,
+            ops: ops.clone(),
+        }]);
+        (backend, ops)
+    }
+
+    fn recorded(ops: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        ops.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// **The generation-2 create is the combined one.** The daemon answers
+    /// `create_workspace` with the record *and* its first session, and the
+    /// client's attach-or-create finds that session rather than making a
+    /// second one — one shell in the workspace, not two.
+    #[test]
+    fn a_generation_two_create_leaves_the_daemons_own_first_session_alone() {
+        let (backend, ops) = dialogue(2, vec![dialogue_session()]);
+
+        let calls = bounded("the generation-2 create", move || {
+            let workspace = backend
+                .create_workspace(Path::new("/repos/zed"), Some("zed"))
+                .expect("the combined create");
+            let spec = SessionSpec::new(workspace.id.clone(), "/repos/zed");
+            let attached = backend.attach(&spec).expect("attaching to what it made");
+            (workspace, attached)
+        });
+
+        assert_eq!(calls.0.id, DIALOGUE_WORKSPACE);
+        assert_eq!(calls.1.session_id, "session-1");
+        assert_eq!(
+            recorded(&ops),
+            vec!["create_workspace", "list_sessions"],
+            "a second create_session would be a second shell in the workspace"
+        );
+    }
+
+    /// The generation-3 mirror: the record is minted alone, so the same attach
+    /// has to create the first session itself.
+    #[test]
+    fn a_generation_three_create_still_makes_the_first_session_itself() {
+        let (backend, ops) = dialogue(3, Vec::new());
+
+        bounded("the generation-3 create", move || {
+            let workspace = backend
+                .create_workspace(Path::new("/repos/zed"), Some("zed"))
+                .expect("the record-only create");
+            let spec = SessionSpec::new(workspace.id, "/repos/zed");
+            backend.attach(&spec).expect("attaching to what it made");
+        });
+
+        assert!(
+            recorded(&ops).contains(&"create_session".to_owned()),
+            "{:?}",
+            recorded(&ops)
+        );
+    }
+
+    /// Generation 2 has no focus notion, and the sender's half of that contract
+    /// is not to emit the frame — a daemon refusing it is the receiver's half.
+    #[test]
+    fn focus_is_never_sent_on_a_generation_two_connection() {
+        for (generation, expected) in [
+            (2, vec!["list_sessions"]),
+            (3, vec!["focus_session", "list_sessions"]),
+        ] {
+            let (backend, ops) = dialogue(generation, Vec::new());
+            bounded("focusing then listing", move || {
+                backend
+                    .focus_session("session-1", "view-1", false)
+                    .expect("focus never fails the caller");
+                // The list is what proves the focus decision has been made: the
+                // daemon reads in order, so anything sent before it is recorded
+                // by the time its answer comes back.
+                backend.list().expect("listing");
+            });
+            assert_eq!(recorded(&ops), expected, "at generation {generation}");
+        }
+    }
+
+    /// The arrow's other fact: the negotiated generation, remembered across the
+    /// disconnect that follows.
+    #[test]
+    fn the_negotiated_generation_is_remembered() {
+        let (backend, _ops) = dialogue(2, Vec::new());
+        assert_eq!(
+            backend.daemon_generation(),
+            None,
+            "nothing is known before the first handshake"
+        );
+
+        let backend = bounded("one request", move || {
+            backend.list().expect("listing");
+            backend
+        });
+
+        assert_eq!(backend.daemon_generation(), Some(2));
+        *backend
+            .connection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        assert_eq!(
+            backend.daemon_generation(),
+            Some(2),
+            "the last known generation outlives the connection"
+        );
+    }
+
+    /// **The status connection feeds the arrow too.** It handshakes on its own
+    /// connection and reconnects on its own schedule, so a daemon upgraded
+    /// while the user sits still is met there first — and §6.4's "update on
+    /// every successful reconnect" would otherwise wait for a control request
+    /// that may never come.
+    #[test]
+    fn a_status_reconnect_refreshes_the_remembered_generation() {
+        let backend = scripted_daemon(vec![Script::SubscriptionSnapshot {
+            sessions: Vec::new(),
+            workspaces: Vec::new(),
+            pending: Vec::new(),
+            degraded: false,
+        }]);
+        // What a control handshake against the daemon this one replaced left
+        // behind.
+        backend.remembered.generation.store(2, Ordering::Relaxed);
+
+        let (sender, _receiver) = smol::channel::unbounded();
+        let mut known = HashMap::new();
+        let mut has_snapshot = false;
+        let mut announced = None;
+        let mut subscribed = false;
+        smol::block_on(stream_status_once(
+            &backend.endpoint,
+            &backend.remembered,
+            &sender,
+            &mut subscribed,
+            &mut announced,
+            &mut known,
+            &mut has_snapshot,
+        ))
+        .expect_err("the scripted connection closes after its snapshot");
+
+        assert_eq!(
+            backend.daemon_generation(),
+            Some(proto::MAX_GENERATION),
+            "the subscription's own handshake is as current as a control one"
+        );
+        assert_eq!(
+            backend.instance_id().as_deref(),
+            Some("scripted-daemon"),
+            "and so is everything else the ack says"
+        );
+        assert!(
+            backend.connection.lock().unwrap().is_none(),
+            "no control connection was opened to learn it"
+        );
+    }
+
+    /// The stream's own state is news only when it *changes*: a reconnect loop
+    /// failing the same way every 30 seconds must not re-open a dialog, and a
+    /// recovery must not go unsaid.
+    #[test]
+    fn a_stream_announces_transitions_and_not_retries() {
+        let (sender, receiver) = smol::channel::unbounded();
+        let mut announced = None;
+        let down = |outdated| StreamState::Down {
+            message: "no protocol generation is common".to_owned(),
+            outdated,
+        };
+
+        announce(&sender, &mut announced, down(Some(Outdated::Client)));
+        announce(&sender, &mut announced, down(Some(Outdated::Client)));
+        announce(&sender, &mut announced, down(Some(Outdated::Daemon)));
+        announce(&sender, &mut announced, StreamState::Up);
+        announce(&sender, &mut announced, StreamState::Up);
+
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_eq!(
+            events,
+            vec![
+                DaemonEvent::Down {
+                    message: "no protocol generation is common".to_owned(),
+                    outdated: Some(Outdated::Client),
+                },
+                DaemonEvent::Down {
+                    message: "no protocol generation is common".to_owned(),
+                    outdated: Some(Outdated::Daemon),
+                },
+                DaemonEvent::Up,
+            ]
+        );
+    }
+
+    /// **The local daemon's one upgrade path**, exercised directly because
+    /// nothing this client can meet today proves the direction it needs (see
+    /// [`Endpoint::connect`]'s gate and the test below). A daemon older than
+    /// this client refuses the handshake and closes, so the polite exit cannot
+    /// ride the refused connection: it goes down a fresh one, handshaken at the
+    /// generation that daemon does speak.
+    #[test]
+    fn an_outdated_local_daemon_is_asked_to_exit() {
+        let backend = scripted_daemon(vec![Script::RetireAtGenerationTwo { declining: false }]);
+
+        bounded("retiring an outdated local daemon", move || {
+            smol::block_on(backend.endpoint.retire_outdated_local_daemon())
+        })
+        .expect("the daemon accepts the polite shutdown");
+    }
+
+    /// A declined shutdown is the daemon's answer, not an obstacle: it holds
+    /// live work, and nothing without a human's click may take that away.
+    #[test]
+    fn an_outdated_local_daemon_that_declines_to_exit_is_left_alone() {
+        let backend = scripted_daemon(vec![Script::RetireAtGenerationTwo { declining: true }]);
+
+        let failure = bounded("retiring a daemon that will not exit", move || {
+            smol::block_on(backend.endpoint.retire_outdated_local_daemon())
+        })
+        .expect_err("a daemon that would not exit cannot be retired");
+
+        assert!(
+            format!("{failure:#}").contains("declined"),
+            "the daemon's own reason reaches the caller: {failure:#}"
+        );
+    }
+
+    /// **Direction, not prose, decides who gets asked to leave.** A typed
+    /// `unsupported_generation` carries no ranges, so it classifies as
+    /// client-too-old — and a client that answered *that* with a shutdown
+    /// request would be pushing older bytes at a newer daemon. It fails closed:
+    /// no second connection, and the refusal reaches the caller intact.
+    #[test]
+    fn a_daemon_that_may_be_newer_is_never_asked_to_exit() {
+        let backend = scripted_daemon(vec![Script::RefuseGeneration]);
+
+        let failure = bounded("listing against a daemon that refuses", move || {
+            backend.list()
+        })
+        .expect_err("a daemon with no common generation cannot be listed");
+
+        assert_eq!(
+            refusal_code(&failure),
+            Some(proto::error_code::UNSUPPORTED_GENERATION),
+            "the daemon's own refusal is what reaches the caller: {failure:#}"
+        );
+        assert_eq!(
+            incompatible_daemon(&failure),
+            Some(Outdated::Client),
+            "a range-less refusal is read as the client being behind: {failure:#}"
+        );
+    }
+
+    /// The handshake's `degraded` flag reaches [`DaemonBackend::degraded`] and
+    /// stays there for the calls that follow on the same connection — the
+    /// plumbing [`ade_workspaces::lifecycle`]'s reconcile drop-guard reads.
+    ///
+    /// Self-contained rather than [`scripted_daemon`]: that helper's `ack()`
+    /// is shared by every other script here, and giving it a knob just for
+    /// this one case would touch every call site for no reader's benefit.
+    #[test]
+    fn a_degraded_handshake_is_remembered_on_the_backend() {
+        let (port_sender, port) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("ade-degraded-daemon".to_owned())
+            .spawn(move || {
+                smol::block_on(async move {
+                    let listener = smol::net::TcpListener::bind((LOOPBACK_ADDRESS, 0))
+                        .await
+                        .expect("binding a loopback listener");
+                    port_sender
+                        .send(listener.local_addr().expect("the bound address").port())
+                        .expect("the test is waiting for the port");
+                    let (stream, _) = listener.accept().await.expect("a client");
+                    let mut daemon = ade_session::Connection::new(stream);
+                    let _hello = daemon.recv().await;
+                    daemon
+                        .send(&Frame::HelloAck(proto::HelloAck {
+                            degraded: true,
+                            ..ack()
+                        }))
+                        .await
+                        .expect("sending the degraded ack");
+                    let request = daemon.recv().await.expect("ListWorkspaces");
+                    let Frame::ListWorkspaces { request_id } = request else {
+                        panic!("expected ListWorkspaces, got {request:?}");
+                    };
+                    daemon
+                        .send(&Frame::WorkspaceList {
+                            workspaces: Vec::new(),
+                            request_id,
+                        })
+                        .await
+                        .expect("sending WorkspaceList");
+                })
+            })
+            .expect("spawning the degraded daemon");
+        let port = port.recv().expect("the degraded daemon's port");
+
+        let mut backend = DaemonBackend::with_endpoint(Endpoint {
+            bin_path: PathBuf::from(DAEMON_BIN),
+            address: Address::Named(LocalEndpoint::Loopback(port)),
+            state_dir: PathBuf::new(),
+            transport: Transport::Direct,
+        });
+        backend.answer_timeout = SCRIPTED_ANSWER_TIMEOUT;
+
+        assert!(!backend.degraded(), "nothing is known before a handshake");
+        bounded("listing workspaces on a degraded daemon", move || {
+            backend.list_workspaces().expect("listing succeeds");
+            assert!(
+                backend.degraded(),
+                "the handshake's degraded flag must reach the backend"
+            );
+        });
     }
 
     /// **An error frame is only this request's answer when it carries this
@@ -3599,6 +4878,115 @@ mod control_connection {
         assert!(listed.expect("the retry gets a healthy daemon").is_empty());
     }
 
+    /// **A degraded daemon's silence is not a kill.** Its ledger is read-only
+    /// and its listing may omit live workspaces, and the removal a resubscribe
+    /// would synthesize from that deletes the client's row with none of the
+    /// reconcile sweep's guards.
+    ///
+    /// So: nothing on the degraded snapshot, the omitted id retained across it,
+    /// exactly one removal when a *healthy* snapshot still omits it — and the
+    /// daemon's own explicit removal, queued behind the degraded snapshot,
+    /// through untouched.
+    #[test]
+    fn a_degraded_snapshot_synthesizes_no_removals() {
+        fn workspace(id: &str) -> proto::WorkspaceInfo {
+            proto::WorkspaceInfo {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                project_root: "/worktree".to_owned(),
+                created_at: 1,
+                layout_rev: 1,
+                layout: LayoutDoc::empty(),
+            }
+        }
+
+        let backend = scripted_daemon(vec![
+            Script::SubscriptionSnapshot {
+                sessions: Vec::new(),
+                workspaces: vec![workspace("omitted"), workspace("explicitly-removed")],
+                pending: Vec::new(),
+                degraded: false,
+            },
+            // The read-only ledger: both are missing, and one of them really
+            // was removed — which only the explicit event may say.
+            Script::SubscriptionSnapshot {
+                sessions: Vec::new(),
+                workspaces: Vec::new(),
+                pending: vec![Frame::WorkspaceRemoved {
+                    workspace_id: "explicitly-removed".to_owned(),
+                    persisted: true,
+                    request_id: None,
+                }],
+                degraded: true,
+            },
+            Script::SubscriptionSnapshot {
+                sessions: Vec::new(),
+                workspaces: Vec::new(),
+                pending: Vec::new(),
+                degraded: false,
+            },
+        ]);
+        let (sender, receiver) = smol::channel::unbounded();
+        let mut known = HashMap::new();
+        let mut has_snapshot = false;
+        let mut after_degraded = Vec::new();
+        let remembered = Remembered::default();
+        let mut announced = None;
+
+        for pass in 0..3 {
+            let mut subscribed = false;
+            smol::block_on(stream_status_once(
+                &backend.endpoint,
+                &remembered,
+                &sender,
+                &mut subscribed,
+                &mut announced,
+                &mut known,
+                &mut has_snapshot,
+            ))
+            .expect_err("the scripted connection closes after its snapshot");
+            assert!(subscribed);
+            if pass == 1 {
+                after_degraded = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+                assert!(
+                    known.contains_key("omitted"),
+                    "an id a degraded listing did not name is still known: {known:?}"
+                );
+            }
+        }
+        let after_healthy: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+
+        let removals = |events: &[DaemonEvent], id: &str| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(event, DaemonEvent::WorkspaceRemoved { workspace_id }
+                        if workspace_id == id)
+                })
+                .count()
+        };
+        assert_eq!(
+            removals(&after_degraded, "omitted"),
+            0,
+            "a degraded snapshot may not delete a row: {after_degraded:?}"
+        );
+        assert_eq!(
+            removals(&after_degraded, "explicitly-removed"),
+            1,
+            "the daemon's own removal still passes: {after_degraded:?}"
+        );
+        assert_eq!(
+            removals(&after_healthy, "omitted"),
+            1,
+            "the first authoritative absence is the removal: {after_healthy:?}"
+        );
+        assert_eq!(
+            removals(&after_healthy, "explicitly-removed"),
+            0,
+            "the explicit removal took it out of `known`: {after_healthy:?}"
+        );
+    }
+
     #[test]
     fn reconnect_repairs_missed_layouts_and_workspace_removals() {
         fn workspace(id: &str, rev: u64, path: &str) -> proto::WorkspaceInfo {
@@ -3625,6 +5013,7 @@ mod control_connection {
                     persisted: true,
                     request_id: None,
                 }],
+                degraded: false,
             },
             Script::SubscriptionSnapshot {
                 sessions: Vec::new(),
@@ -3635,6 +5024,7 @@ mod control_connection {
                     workspace("repaired", 3, "/before-repair"),
                 ],
                 pending: Vec::new(),
+                degraded: false,
             },
             Script::SubscriptionSnapshot {
                 sessions: Vec::new(),
@@ -3657,18 +5047,23 @@ mod control_connection {
                         request_id: None,
                     },
                 ],
+                degraded: false,
             },
         ]);
         let (sender, receiver) = smol::channel::unbounded();
         let mut known = HashMap::new();
         let mut has_snapshot = false;
 
+        let remembered = Remembered::default();
+        let mut announced = None;
         for _ in 0..3 {
             let mut subscribed = false;
             smol::block_on(stream_status_once(
                 &backend.endpoint,
+                &remembered,
                 &sender,
                 &mut subscribed,
+                &mut announced,
                 &mut known,
                 &mut has_snapshot,
             ))
@@ -3677,6 +5072,14 @@ mod control_connection {
         }
 
         let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| **event == DaemonEvent::Up)
+                .count(),
+            1,
+            "the stream says it is up once, after the snapshot that brought it back: {events:?}"
+        );
         assert!(events.contains(&DaemonEvent::WorkspaceRemoved {
             workspace_id: "removed".to_owned(),
         }));
@@ -3773,8 +5176,9 @@ mod control_connection {
             backend.daemon_sessions()
         })
         .expect_err("the incompatible daemon must be surfaced to the connect flow");
-        assert!(
-            is_incompatible_daemon(&failure),
+        assert_eq!(
+            incompatible_daemon(&failure),
+            Some(Outdated::Daemon),
             "unexpected failure: {failure:#}"
         );
     }
@@ -3782,7 +5186,7 @@ mod control_connection {
 
 #[cfg(test)]
 mod ensure_report_tests {
-    use super::EnsureReport;
+    use super::{EnsureReport, Generations, proto};
 
     /// A daemon from before binary identity: two tokens, nothing else. The
     /// conservative reading — no hash, not ready — is what keeps the upgrade
@@ -3794,7 +5198,8 @@ mod ensure_report_tests {
             report,
             EnsureReport {
                 hash: None,
-                upgrade_ready: false
+                upgrade_ready: false,
+                generations: Generations::Absent,
             }
         );
     }
@@ -3825,9 +5230,94 @@ mod ensure_report_tests {
             report,
             EnsureReport {
                 hash: None,
-                upgrade_ready: true
+                upgrade_ready: true,
+                generations: Generations::Absent,
             }
         );
+    }
+
+    /// The token a daemon of this generation or newer appends, and the shapes
+    /// that are not it. A range nobody can parse is **malformed**, which is not
+    /// absence — see [`Generations`].
+    #[test]
+    fn the_generation_range_is_read_when_the_daemon_names_one() {
+        assert_eq!(
+            EnsureReport::parse("ade-daemon 0.1.0 hash=abc upgrade_ready=true generations=2..=3")
+                .generations,
+            Generations::Valid(2, 3)
+        );
+        for line in [
+            "ade-daemon 0.1.0 generations=",
+            "ade-daemon 0.1.0 generations=3",
+            "ade-daemon 0.1.0 generations=3..=2",
+            "ade-daemon 0.1.0 generations=x..=y",
+            "ade-daemon 0.1.0 generations=4294967296..=4294967297",
+            // Two tokens: readable one by one, and unreadable as a window.
+            "ade-daemon 0.1.0 generations=2..=3 generations=4..=5",
+        ] {
+            assert_eq!(
+                EnsureReport::parse(line).generations,
+                Generations::Malformed,
+                "unusable range accepted from {line:?}"
+            );
+        }
+    }
+
+    /// The deploy guard. A daemon whose floor is above this client's ceiling is
+    /// newer, and replacing it with these bytes would be a downgrade that
+    /// destroys the sessions it holds.
+    #[test]
+    fn a_daemon_newer_than_this_client_is_never_deployed_over() {
+        let refused = super::refuse_downgrade(&EnsureReport::parse(&format!(
+            "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations={}..={}",
+            proto::MAX_GENERATION + 1,
+            proto::MAX_GENERATION + 2
+        )))
+        .expect_err("a newer daemon must not be replaced");
+        assert_eq!(
+            super::incompatible_daemon(&refused),
+            Some(super::Outdated::Client),
+            "the refusal must surface as client-too-old, never as an upgrade offer"
+        );
+
+        // Absent range: a daemon predating the token, definitionally older.
+        // Overlapping and older ranges: an upgrade, as before.
+        for line in [
+            "ade-daemon 0.1.0 hash=abc upgrade_ready=true".to_owned(),
+            format!(
+                "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations={}..={}",
+                proto::MIN_GENERATION,
+                proto::MAX_GENERATION
+            ),
+            format!(
+                "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations={}..={}",
+                proto::MIN_GENERATION,
+                proto::MIN_GENERATION
+            ),
+        ] {
+            super::refuse_downgrade(&EnsureReport::parse(&line))
+                .unwrap_or_else(|error| panic!("deploy wrongly refused for {line:?}: {error:#}"));
+        }
+    }
+
+    /// Fail closed on a token this build cannot read: only a daemon newer than
+    /// this one can spell the window in a way this one does not know, so the
+    /// unreadable case takes the same no-deploy exit as a proven newer range.
+    #[test]
+    fn a_generation_token_that_does_not_parse_refuses_the_deploy() {
+        for line in [
+            "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations=4..=5,6",
+            "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations=nonsense",
+            "ade-daemon 0.1.0 hash=abc upgrade_ready=true generations=2..=3 generations=2..=3",
+        ] {
+            let refused = super::refuse_downgrade(&EnsureReport::parse(line))
+                .expect_err("an unreadable window must not be deployed over");
+            assert_eq!(
+                super::incompatible_daemon(&refused),
+                Some(super::Outdated::Client),
+                "{line:?} must surface as client-too-old, never as an upgrade offer"
+            );
+        }
     }
 }
 
@@ -3909,11 +5399,61 @@ mod daemon_freshness_tests {
             Some(true)
         );
     }
+
+    /// The negotiated generation rides the same seam, so a stationary sidebar learns
+    /// about it — and, like the arrow's verdict, only when it *changes*.
+    #[test]
+    fn a_new_generation_wakes_the_sidebar_and_a_repeated_one_does_not() {
+        let backend = DaemonBackend::with_endpoint(Endpoint {
+            bin_path: PathBuf::from(DAEMON_BIN),
+            address: Address::Named(LocalEndpoint::Loopback(0)),
+            state_dir: PathBuf::new(),
+            transport: Transport::Forwarded(Arc::new(HostLink::new(
+                ade_session::SshHost::new("fevm1"),
+                LocalEndpoint::Loopback(0),
+            ))),
+        });
+        let woken = Arc::new(AtomicU64::new(0));
+        backend.observe_daemon_freshness(Arc::new({
+            let woken = woken.clone();
+            move || {
+                woken.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        let ack = |generation| proto::HelloAck {
+            daemon_version: "0.0.0".to_owned(),
+            protocol_version: generation,
+            host_os: "test".to_owned(),
+            min_generation: proto::MIN_GENERATION,
+            max_generation: generation,
+            generation,
+            capabilities: Vec::new(),
+            degraded: false,
+            instance_id: None,
+            binary_hash: None,
+            upgrade_ready: None,
+            request_id: None,
+        };
+
+        assert_eq!(backend.daemon_generation(), None);
+        backend.remember(&ack(2));
+        assert_eq!(backend.daemon_generation(), Some(2));
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
+        backend.remember(&ack(2));
+        assert_eq!(woken.load(Ordering::Relaxed), 1, "a reconnect is not news");
+        backend.remember(&ack(3));
+        assert_eq!(backend.daemon_generation(), Some(3));
+        assert_eq!(woken.load(Ordering::Relaxed), 2, "the arrow has to clear");
+    }
 }
 
 #[cfg(test)]
 mod pre_cut_fallback_tests {
-    use super::{is_incompatible_daemon, pre_cut_kill_script};
+    use super::{
+        DaemonRefusal, GenerationSkew, Outdated, incompatible_daemon, is_pre_cut_daemon,
+        pre_cut_kill_script, proto,
+    };
     use ade_session::PRE_CUT_DIAGNOSIS;
     use anyhow::anyhow;
 
@@ -3925,10 +5465,59 @@ mod pre_cut_fallback_tests {
         let diagnosed = anyhow!("reading frame length: unexpected end of file")
             .context(PRE_CUT_DIAGNOSIS)
             .context("handshaking for the shutdown request");
-        assert!(is_incompatible_daemon(&diagnosed));
+        assert!(is_pre_cut_daemon(&diagnosed));
+        assert_eq!(incompatible_daemon(&diagnosed), Some(Outdated::Daemon));
 
         let ordinary = anyhow!("connection refused").context("spawning the shutdown channel");
-        assert!(!is_incompatible_daemon(&ordinary));
+        assert!(!is_pre_cut_daemon(&ordinary));
+        assert_eq!(
+            incompatible_daemon(&ordinary),
+            None,
+            "a host that could not be reached still gets today's fallback"
+        );
+    }
+
+    /// The typed refusal, classified structurally — the code, never the prose,
+    /// and never the code of some *other* refusal.
+    #[test]
+    fn a_typed_generation_refusal_blames_the_client() {
+        let refused = anyhow::Error::new(DaemonRefusal {
+            code: proto::error_code::UNSUPPORTED_GENERATION.to_owned(),
+            message: "no protocol generation is common".to_owned(),
+        })
+        .context("the session daemon refused the handshake")
+        .context("listing the workspaces on winbox");
+        // A refusal names no range, and a daemon under this build's floor
+        // could not have sent one: what refused us is newer, and nothing may
+        // deploy older bytes over it.
+        assert_eq!(incompatible_daemon(&refused), Some(Outdated::Client));
+
+        let declined = anyhow::Error::new(DaemonRefusal {
+            code: proto::error_code::DECLINED.to_owned(),
+            message: "a session is busy".to_owned(),
+        });
+        assert_eq!(incompatible_daemon(&declined), None);
+    }
+
+    /// Both directions, off the numbers the ack carried.
+    #[test]
+    fn a_named_range_decides_which_end_is_behind() {
+        let daemon_behind = anyhow::Error::new(GenerationSkew {
+            offered: (4, 5),
+            daemon: Some((2, 3)),
+        })
+        .context("handshaking with the session daemon");
+        assert_eq!(
+            incompatible_daemon(&daemon_behind),
+            Some(Outdated::Daemon),
+            "a window that ends below ours is the one an upgrade fixes"
+        );
+
+        let client_behind = anyhow::Error::new(GenerationSkew {
+            offered: (2, 3),
+            daemon: Some((4, 5)),
+        });
+        assert_eq!(incompatible_daemon(&client_behind), Some(Outdated::Client));
     }
 
     /// The script's guards are load-bearing: the pidfile check, the
@@ -3972,6 +5561,81 @@ mod pre_cut_fallback_tests {
     }
 }
 
+/// The Windows shape of this machine's endpoint, which is the whole of what
+/// this crate had to learn for local workspaces there: a proxy, a state dir,
+/// and no endpoint flag anywhere — because `--socket` is refused by name on
+/// that binary and `--pipe` would only repeat what it derives.
+///
+/// String-level and daemon-free on purpose: what can go wrong here is an argv
+/// the daemon rejects, and that is decided before anything is spawned.
+#[cfg(all(test, windows))]
+mod windows_local_tests {
+    use super::*;
+
+    #[test]
+    fn the_local_endpoint_is_a_proxy_that_names_no_pipe() {
+        let endpoint = Endpoint::local();
+
+        assert!(matches!(endpoint.transport, Transport::Proxy));
+        assert_eq!(endpoint.address, Address::DefaultPipe);
+        assert_eq!(
+            endpoint.proxy_argv(),
+            vec![
+                endpoint.bin_path.display().to_string(),
+                "--stdio-proxy".to_owned(),
+                "--state-dir".to_owned(),
+                expand_home(DEFAULT_STATE_DIR).display().to_string(),
+            ]
+        );
+        // The flag this platform's `ade-daemon` refuses by name, and the one it
+        // would only ever be handed its own derivation of.
+        assert!(
+            !endpoint
+                .proxy_argv()
+                .iter()
+                .any(|argument| argument == "--socket" || argument == "--pipe"),
+            "the Windows proxy argv named an endpoint: {:?}",
+            endpoint.proxy_argv()
+        );
+    }
+
+    /// The attach argv a terminal is opened with: the binary, the mode, the id
+    /// and the view it draws, and nothing else. Anything more would have to be
+    /// `--pipe`, and the only name this side could put there is the one
+    /// `attach` derives.
+    #[test]
+    fn the_attach_argv_is_the_binary_the_mode_the_session_id_and_the_view() {
+        let backend = DaemonBackend::new();
+        let argv = backend
+            .session_argv(&proto::SessionId::new("session-1"), "view-1")
+            .expect("a local Windows endpoint has no host paths to fail on");
+
+        assert_eq!(
+            argv,
+            vec![
+                backend.endpoint.bin_path.display().to_string(),
+                "attach".to_owned(),
+                "session-1".to_owned(),
+                "--view-id".to_owned(),
+                "view-1".to_owned(),
+            ]
+        );
+        assert!(client_argv(&backend.endpoint.address).is_empty());
+    }
+
+    /// The workspace-level attach names no view — its terminal never claims
+    /// the pty — and must not leave a dangling flag behind.
+    #[test]
+    fn an_attach_with_no_view_carries_no_view_flag() {
+        let backend = DaemonBackend::new();
+        let argv = backend
+            .session_argv(&proto::SessionId::new("session-1"), "")
+            .expect("a local Windows endpoint has no host paths to fail on");
+
+        assert!(!argv.iter().any(|word| word == "--view-id"));
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -3992,8 +5656,15 @@ mod tests {
         (dir, server, backend)
     }
 
-    fn spec(id: &str, directory: &TempDir) -> SessionSpec {
-        SessionSpec::new(id, directory.path())
+    /// A spec naming a **real** workspace record: the daemon refuses a session
+    /// in one it does not hold, so the row is created first — which is what the
+    /// client's own row creation does. The name is the test's; the id is the
+    /// daemon's.
+    fn spec(name: &str, directory: &TempDir, backend: &DaemonBackend) -> SessionSpec {
+        let workspace = backend
+            .create_workspace(directory.path(), Some(name))
+            .expect("creating the workspace record");
+        SessionSpec::new(workspace.id, directory.path())
     }
 
     /// Poll `condition` until it holds. Statuses are derived by a sweep on the
@@ -4010,7 +5681,7 @@ mod tests {
     #[test]
     fn create_list_exists_and_kill_over_the_seam() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-main-000001", &dir);
+        let spec = spec("ade-main-000001", &dir, &backend);
 
         // Creating hands back the *caller's* id, so the registry can go on
         // caching the name it derived.
@@ -4045,7 +5716,7 @@ mod tests {
     #[test]
     fn attach_names_our_own_client_and_creates_what_is_missing() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-main-000003", &dir);
+        let spec = spec("ade-main-000003", &dir, &backend);
 
         // Attach-or-create: nothing exists yet, and the argv still works.
         let attached = backend.attach(&spec).unwrap();
@@ -4071,7 +5742,7 @@ mod tests {
     #[test]
     fn a_new_backend_reattaches_after_the_app_disconnects_without_duplicating() {
         let (dir, server, backend) = backend();
-        let spec = spec("ade-reconnect-000004", &dir);
+        let spec = spec("ade-reconnect-000004", &dir, &backend);
         let first = backend.attach(&spec).expect("the first app attaches");
         drop(backend);
 
@@ -4100,7 +5771,7 @@ mod tests {
     #[test]
     fn a_workspace_holds_more_than_one_session() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-plural-000020", &dir);
+        let spec = spec("ade-plural-000020", &dir, &backend);
         backend.create(&spec).unwrap();
         let first = backend.live_session(&spec.id).unwrap().unwrap().id;
 
@@ -4168,7 +5839,13 @@ mod tests {
         let replacement = backend
             .create_session_in_workspace(spec.id.as_str(), dir.path())
             .unwrap();
-        let sibling = SessionSpec::new("ade-plural-sibling-000021", dir.path());
+        let sibling = SessionSpec::new(
+            backend
+                .create_workspace(dir.path(), Some("ade-plural-sibling-000021"))
+                .unwrap()
+                .id,
+            dir.path(),
+        );
         backend.create(&sibling).unwrap();
 
         backend.kill(&spec.id).unwrap();
@@ -4215,18 +5892,19 @@ mod tests {
     #[test]
     fn a_layout_is_stored_against_a_revision_and_a_stale_write_loses() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-layout-000010", &dir);
+        let spec = spec("ade-layout-000010", &dir, &backend);
         backend.create(&spec).unwrap();
         let session = backend.live_session(&spec.id).unwrap().unwrap();
 
-        // The daemon made the workspace record when the session named it, and
-        // seeded it with the one tab that session is.
+        // The record was made empty and a session does not touch it: the
+        // arrangement is the client's to write, from revision zero up.
         let stored = backend.open_workspace(spec.id.as_str()).unwrap();
         assert_eq!(
             stored.layout,
-            LayoutDoc::single_terminal(session.id.clone()),
-            "a fresh workspace is one leaf holding its session"
+            LayoutDoc::empty(),
+            "the daemon invented a layout for a session"
         );
+        assert_eq!(stored.rev, 0);
 
         // A write has to be one past what is stored.
         let split = LayoutDoc::new(ade_session::LayoutNode::Split {
@@ -4271,7 +5949,7 @@ mod tests {
     #[test]
     fn an_accepted_layout_comes_back_on_the_event_stream() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-layout-000012", &dir);
+        let spec = spec("ade-layout-000012", &dir, &backend);
         backend.create(&spec).unwrap();
         let session = backend.live_session(&spec.id).unwrap().unwrap();
 
@@ -4310,7 +5988,7 @@ mod tests {
     #[test]
     fn killing_a_workspace_takes_its_sessions_and_its_record() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-layout-000014", &dir);
+        let spec = spec("ade-layout-000014", &dir, &backend);
         backend.create(&spec).unwrap();
         assert!(backend.open_workspace(spec.id.as_str()).is_ok());
 
@@ -4356,14 +6034,17 @@ mod tests {
     #[test]
     fn workspaces_are_listed_for_adoption_and_a_killed_one_is_not() {
         let (dir, _server, backend) = backend();
-        assert!(backend.list_workspaces().unwrap().is_empty());
+        assert!(backend.list_workspaces().unwrap().workspaces.is_empty());
 
-        let spec = spec("ade-adopt-000020", &dir);
+        let spec = spec("ade-adopt-000020", &dir, &backend);
         backend.create(&spec).unwrap();
 
         let listed = backend.list_workspaces().unwrap();
-        assert_eq!(listed.len(), 1);
-        let workspace = &listed[0];
+        assert_eq!(listed.workspaces.len(), 1);
+        // A healthy daemon's listing is authoritative, which is what licenses
+        // reconcile to drop what it does not name.
+        assert!(!listed.degraded);
+        let workspace = &listed.workspaces[0];
         // Keyed by the seam's id, which is what an adopted row records as its
         // `terminal_session_id` and addresses the workspace by ever after.
         assert_eq!(workspace.id, spec.id.as_str());
@@ -4374,11 +6055,14 @@ mod tests {
         backend
             .rename_workspace(&workspace.id, "vector DB")
             .unwrap();
-        assert_eq!(backend.list_workspaces().unwrap()[0].name, "vector DB");
+        assert_eq!(
+            backend.list_workspaces().unwrap().workspaces[0].name,
+            "vector DB"
+        );
 
         // Killed: gone from the listing, so there is nothing to adopt back.
         backend.kill_workspace(spec.id.as_str()).unwrap();
-        assert!(backend.list_workspaces().unwrap().is_empty());
+        assert!(backend.list_workspaces().unwrap().workspaces.is_empty());
     }
 
     /// The layout's own attach: an argv for a session the daemon already has,
@@ -4386,11 +6070,13 @@ mod tests {
     #[test]
     fn attaching_by_session_id_names_the_client_without_creating_anything() {
         let (dir, _server, backend) = backend();
-        let spec = spec("ade-layout-000013", &dir);
+        let spec = spec("ade-layout-000013", &dir, &backend);
         backend.create(&spec).unwrap();
         let session = backend.live_session(&spec.id).unwrap().unwrap();
 
-        let argv = backend.attach_session(session.id.as_str()).unwrap();
+        let argv = backend
+            .attach_session(session.id.as_str(), "view-1")
+            .unwrap();
         assert_eq!(argv[0], "/opt/ade/ade-daemon");
         assert_eq!(argv[1], "attach");
         assert_eq!(argv[2], session.id.to_string());
@@ -4399,7 +6085,7 @@ mod tests {
         // A session id nobody owns still produces an argv — the client is what
         // discovers that, and nothing is created here either way.
         assert_eq!(backend.list().unwrap().len(), 1);
-        backend.attach_session("not-a-session").unwrap();
+        backend.attach_session("not-a-session", "view-1").unwrap();
         assert_eq!(backend.list().unwrap().len(), 1);
 
         // And killing by the daemon's own id takes that one session.
@@ -4410,7 +6096,7 @@ mod tests {
     #[test]
     fn a_session_whose_process_is_gone_is_not_a_live_session() {
         let (dir, server, backend) = backend();
-        let spec = spec("ade-main-000004", &dir);
+        let spec = spec("ade-main-000004", &dir, &backend);
         backend.create(&spec).unwrap();
         let session = backend.live_session(&spec.id).unwrap().unwrap();
 
@@ -4436,7 +6122,7 @@ mod tests {
         // A session that already exists when the stream opens: subscribing
         // pushes a snapshot of it, and receiving that is also what proves the
         // subscription is live before anything below depends on it.
-        let existing = spec("ade-existing-000005", &dir);
+        let existing = spec("ade-existing-000005", &dir, &backend);
         backend.create(&existing).unwrap();
         let events = backend.subscribe_events().unwrap();
         let snapshot = smol::block_on(next_session(&events));
@@ -4447,7 +6133,7 @@ mod tests {
         );
 
         // And one that appears afterwards, which the daemon announces itself.
-        let fresh = spec("ade-fresh-000006", &dir);
+        let fresh = spec("ade-fresh-000006", &dir, &backend);
         backend.create(&fresh).unwrap();
         let created = smol::block_on(next_for(&events, &fresh.id));
         assert_eq!(
@@ -4508,7 +6194,7 @@ mod tests {
     fn the_proxy_argv_is_the_one_the_deploy_module_defines() {
         let endpoint = Endpoint {
             bin_path: PathBuf::from("/opt/ade/ade-daemon"),
-            address: LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock")),
+            address: Address::Named(LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock"))),
             state_dir: PathBuf::from("/var/lib/ade"),
             transport: Transport::Proxy,
         };
@@ -4535,7 +6221,7 @@ mod tests {
 
         assert!(matches!(endpoint.transport, Transport::Forwarded(_)));
         assert_eq!(endpoint.bin_path, resolve_binary());
-        let LocalEndpoint::Socket(socket_path) = &endpoint.address else {
+        let Address::Named(LocalEndpoint::Socket(socket_path)) = &endpoint.address else {
             panic!(
                 "a unix client forwards to a socket, got {:?}",
                 endpoint.address
@@ -4577,7 +6263,7 @@ mod tests {
         )
         .expect("a tcp-mode backend");
 
-        let LocalEndpoint::Loopback(port) = backend.endpoint.address else {
+        let Address::Named(LocalEndpoint::Loopback(port)) = backend.endpoint.address else {
             panic!(
                 "expected a loopback address, got {:?}",
                 backend.endpoint.address
@@ -4593,15 +6279,15 @@ mod tests {
         let Transport::Forwarded(link) = &backend.endpoint.transport else {
             panic!("a remote endpoint is forwarded");
         };
-        assert_eq!(link.local, backend.endpoint.address);
+        assert_eq!(Address::Named(link.local.clone()), backend.endpoint.address);
     }
 
     #[test]
     fn a_socket_endpoint_is_named_to_the_client_as_a_socket() {
         assert_eq!(
-            client_argv(&LocalEndpoint::Socket(PathBuf::from(
+            client_argv(&Address::Named(LocalEndpoint::Socket(PathBuf::from(
                 "/run/ade/daemon.sock"
-            ))),
+            )))),
             ["--socket".to_owned(), "/run/ade/daemon.sock".to_owned()]
         );
     }
@@ -4665,7 +6351,7 @@ mod tests {
     fn an_endpoint_names_itself_by_its_host_or_by_its_binary() {
         let local = Endpoint {
             bin_path: PathBuf::from("/opt/ade/ade-daemon"),
-            address: LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock")),
+            address: Address::Named(LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock"))),
             state_dir: PathBuf::from("/var/lib/ade"),
             transport: Transport::Proxy,
         };

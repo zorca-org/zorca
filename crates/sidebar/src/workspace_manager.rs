@@ -1166,6 +1166,25 @@ pub fn render_row(
         _ => false,
     };
 
+    // `end_slot_on_hover` stacks the hover actions *over* the persistent end
+    // slot and hides it, so a row with both would have its indicator swallowed
+    // the moment the pointer arrived — and the indicator is a button. Laid out
+    // in one row instead: the actions appear on hover to the left, the
+    // indicator keeps the rightmost slot to itself.
+    let (end_slot, hover_actions) = match (end_slot, hover_actions) {
+        (Some(end_slot), Some(hover_actions)) => (
+            Some(
+                h_flex()
+                    .gap_px()
+                    .child(h_flex().visible_on_hover("list_item").child(hover_actions))
+                    .child(end_slot)
+                    .into_any_element(),
+            ),
+            None,
+        ),
+        slots => slots,
+    };
+
     ListItem::new(ix)
         .indent_level(row.depth)
         .indent_step_size(px(12.))

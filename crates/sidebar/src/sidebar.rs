@@ -33,10 +33,11 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    ContextMenu, PopoverMenu, PopoverMenuHandle, ThreadItemWorktreeInfo, TintColor, Tooltip,
-    prelude::*, right_click_menu,
+    CommonAnimationExt as _, ContextMenu, PopoverMenu, PopoverMenuHandle, ThreadItemWorktreeInfo,
+    TintColor, Tooltip, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use util::path_list::PathList;
@@ -160,22 +161,121 @@ fn update_cached_worktree_path(
     }
 }
 
-/// The host of a row that draws the daemon upgrade arrow, given a `is_stale`
-/// answer for a host. Only a project row has a host of its own to upgrade: a
-/// group row spans hosts, and a worktree row's daemon is its project's.
+/// The host whose daemon a row speaks for. Only a project row has one: a group
+/// row spans hosts, a worktree row's daemon is its project's, and a local row
+/// has no remote daemon at all.
+fn daemon_row_host(kind: workspace_manager::RowKind, ade_host: Option<&str>) -> Option<&str> {
+    matches!(kind, workspace_manager::RowKind::Project(_))
+        .then_some(ade_host)
+        .flatten()
+}
+
+/// The generation a row's host serves when that is **behind** this client's, so
+/// the row's upgrade arrow turns yellow and says why.
 ///
-/// Separate from `Sidebar::stale_daemon_host` so the rule can be tested without
-/// an `App`; `is_stale` is the lifecycle service in production.
-fn stale_daemon_host_for_row(
+/// Distinct from the hash staleness the same arrow also answers to: a binary
+/// can be stale without a protocol gap, or carry one with no hash anybody has
+/// compared. `None` before the first handshake — an unanswered question draws
+/// nothing — and the last known generation after a disconnect, which is what
+/// the backend keeps.
+///
+/// **Scoped to the remote spelling this row was contacted through**, exactly
+/// like the stale-binary verdict: a local row has no `ade_host` and draws
+/// nothing, and one daemon reached through two aliases has a snapshot per alias
+/// until both have handshaken. Canonical-by-daemon attribution needs an ordered
+/// observation keyed by instance id, which this is not.
+///
+/// Free-standing so the rule can be tested without an `App`; `generation_of` is
+/// the lifecycle service in production.
+fn outdated_daemon_generation_for_row(
     kind: workspace_manager::RowKind,
     ade_host: Option<&str>,
-    is_stale: impl FnOnce(&str) -> bool,
-) -> Option<String> {
-    if !matches!(kind, workspace_manager::RowKind::Project(_)) {
-        return None;
+    generation_of: impl FnOnce(&str) -> Option<u32>,
+) -> Option<u32> {
+    generation_of(daemon_row_host(kind, ade_host)?)
+        .filter(|generation| *generation < ade_workspaces::CLIENT_GENERATION)
+}
+
+/// What the yellow arrow says: the gap, and the cost of closing it.
+/// `upgrade_on_demand` forces the daemon out over whatever it holds, and
+/// nothing outlives it, so the running sessions go with it.
+fn compat_daemon_tooltip(generation: u32) -> String {
+    format!(
+        "Compatibility mode — protocol generation {generation} of {}. Upgrading kills \
+         running sessions.",
+        ade_workspaces::CLIENT_GENERATION
+    )
+}
+
+/// How long the check stays after a successful upgrade before the row goes
+/// back to having no indicator at all.
+const DAEMON_UPGRADE_CHECK_LINGER: Duration = Duration::from_secs(2);
+
+/// Where a host's upgrade arrow is in its press → finish cycle. Absent is idle:
+/// the arrow itself, or nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonUpgradeUi {
+    InProgress,
+    Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonUpgradeStep {
+    Started,
+    Succeeded,
+    Failed,
+    Expired,
+}
+
+/// A press starts the spinner, success shows a check, the timer then clears it,
+/// and a failure puts the arrow back to be retried. `Expired` clears only the
+/// check it was spawned for — a newer press outranks a timer still in flight.
+fn record_daemon_upgrade_step(
+    states: &mut HashMap<String, DaemonUpgradeUi>,
+    host: &str,
+    step: DaemonUpgradeStep,
+) {
+    match step {
+        DaemonUpgradeStep::Started => {
+            states.insert(host.to_owned(), DaemonUpgradeUi::InProgress);
+        }
+        DaemonUpgradeStep::Succeeded => {
+            states.insert(host.to_owned(), DaemonUpgradeUi::Done);
+        }
+        DaemonUpgradeStep::Failed => {
+            states.remove(host);
+        }
+        DaemonUpgradeStep::Expired => {
+            if states.get(host) == Some(&DaemonUpgradeUi::Done) {
+                states.remove(host);
+            }
+        }
     }
-    let host = ade_host?;
-    is_stale(host).then(|| host.to_owned())
+}
+
+/// The one daemon indicator a row draws, if any.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonIndicator {
+    /// `Some(generation)` when the host negotiated below this client: the arrow
+    /// goes yellow and its tooltip explains the compatibility mode.
+    Upgrade(Option<u32>),
+    InProgress,
+    Done,
+}
+
+/// A stale binary and a generation behind both mean "deploy this client's
+/// daemon", so they share one arrow; a running upgrade replaces it in place.
+fn daemon_indicator(
+    stale: bool,
+    behind_generation: Option<u32>,
+    upgrade: Option<DaemonUpgradeUi>,
+) -> Option<DaemonIndicator> {
+    match upgrade {
+        Some(DaemonUpgradeUi::InProgress) => Some(DaemonIndicator::InProgress),
+        Some(DaemonUpgradeUi::Done) => Some(DaemonIndicator::Done),
+        None => (stale || behind_generation.is_some())
+            .then_some(DaemonIndicator::Upgrade(behind_generation)),
+    }
 }
 
 /// What a workspace-manager row's menus act on.
@@ -494,6 +594,10 @@ pub struct Sidebar {
     collapsed_projects: HashSet<workspace_manager::ScopedPath>,
     pending_worktree_open: Option<PathBuf>,
     pending_worktree_deletions: HashSet<workspace_manager::ScopedPath>,
+    /// Hosts whose daemon upgrade is running or just finished, by ssh
+    /// destination — the arrow's own spelling, so every row on that host shows
+    /// the same step.
+    daemon_upgrades: HashMap<String, DaemonUpgradeUi>,
     pending_worktree_renames: HashSet<(PathBuf, Option<String>, PathBuf)>,
     /// Set when the user asks to add a project, so the workspace that add
     /// produces opens a terminal while restored ones do not.
@@ -686,12 +790,12 @@ impl Sidebar {
                     let multi_workspace = multi_workspace.clone();
                     let workspace = workspace.clone();
                     cx.defer_in(window, move |this, window, cx| {
-                        // An ssh connection reattaches to the host's daemon
-                        // workspace before the terminal-first default applies —
-                        // whether the user just opened it or startup restored
-                        // it with a serialized layout, which is the case the
-                        // fresh-window path never sees. Every add runs the
-                        // flow: it refuses non-ssh windows itself, claims each
+                        // A project reattaches to its daemon workspace before
+                        // the terminal-first default applies — whether the user
+                        // just opened it or startup restored it with a
+                        // serialized layout, which is the case the fresh-window
+                        // path never sees. Every add runs the flow: it refuses
+                        // the windows ADE has no daemon for itself, claims each
                         // window exactly once, and waits out a restored
                         // window's still-loading worktrees.
                         let is_active = multi_workspace.read(cx).workspace() == &workspace;
@@ -808,6 +912,7 @@ impl Sidebar {
             collapsed_projects: HashSet::default(),
             pending_worktree_open: None,
             pending_worktree_deletions: HashSet::default(),
+            daemon_upgrades: HashMap::default(),
             pending_worktree_renames: HashSet::default(),
             open_terminal_for_next_workspace: false,
             workspace_groups: Vec::new(),
@@ -3240,10 +3345,20 @@ impl Sidebar {
             });
         }
 
-        // A fresh SSH workspace is still empty while ADE attaches its
-        // persistent terminal. Let that claimed flow supply the first tab;
-        // otherwise this stock shell races it and both appear.
+        // A fresh workspace is still empty while ADE attaches its persistent
+        // terminal. Let that claimed flow supply the first tab; otherwise this
+        // stock shell races it and both appear.
+        //
+        // Only while the centre is empty. The flow's own fallback declines an
+        // occupied window — a restored layout already has the user's shells —
+        // so deferring to it there would swallow the click and open nothing.
+        let empty = workspace
+            .read(cx)
+            .panes()
+            .iter()
+            .all(|pane| pane.read(cx).items_len() == 0);
         if command.is_none()
+            && empty
             && !workspace.read(cx).ade_owns_layout()
             && workspace.update(cx, |workspace, cx| {
                 ade_workspaces::open_connection_workspace(workspace, window, cx)
@@ -4617,7 +4732,6 @@ impl Sidebar {
     ) -> Option<AnyElement> {
         let can_create_worktree = context.can_create_worktree;
         let workspace_key = context.workspace_key.clone();
-        let stale_daemon_host = self.stale_daemon_host(context, cx);
 
         Some(
             h_flex()
@@ -4650,57 +4764,72 @@ impl Sidebar {
                         )
                     },
                 )
-                // Remote rows only, and only where a hash comparison already
-                // found the host's daemon behind: an arrow that is always
-                // there says "an upgrade is conceivable", not "an update
-                // exists". The local daemon is replaced when the app is.
-                .when_some(stale_daemon_host, |this, host| {
-                    this.child(
-                        IconButton::new("workspace-manager-row-upgrade-daemon", IconName::ArrowUp)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Upgrade Host Daemon"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.upgrade_host_daemon(host.clone(), cx);
-                            })),
-                    )
-                })
                 .into_any_element(),
         )
     }
 
+    /// The row's one persistent daemon indicator: the upgrade arrow, or what
+    /// the press it started is doing. Never waits for a hover.
     fn render_daemon_upgrade_action(
         &self,
         context: &WorkspaceRowContext,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let host = self.stale_daemon_host(context, cx)?;
+        let host = daemon_row_host(context.kind, context.ade_host.as_deref())?.to_owned();
+        // `try_lifecycle_service` and not the eager one: a render must not be
+        // what builds the service, which opens the workspace registry's
+        // database on the way. No service means nothing has contacted any
+        // host, which reads the same as "nothing to say".
+        let lifecycle = ade_workspaces::try_lifecycle_service(cx);
+        let stale = lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.host_daemon_stale(&host));
+        let behind = outdated_daemon_generation_for_row(context.kind, Some(&host), |host| {
+            lifecycle
+                .as_ref()
+                .and_then(|lifecycle| lifecycle.host_daemon_generation(host))
+        });
         Some(
-            IconButton::new(
-                "workspace-manager-row-upgrade-daemon-visible",
-                IconName::ArrowUp,
-            )
-            .icon_size(IconSize::Small)
-            .tooltip(Tooltip::text("Upgrade Host Daemon"))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.upgrade_host_daemon(host.clone(), cx);
-            }))
-            .into_any_element(),
+            match daemon_indicator(stale, behind, self.daemon_upgrades.get(&host).copied())? {
+                DaemonIndicator::InProgress => Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element(),
+                DaemonIndicator::Done => Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success)
+                    .into_any_element(),
+                DaemonIndicator::Upgrade(behind) => {
+                    let label = SharedString::from(match behind {
+                        Some(generation) => compat_daemon_tooltip(generation),
+                        None => "Upgrade Host Daemon".to_owned(),
+                    });
+                    IconButton::new(
+                        "workspace-manager-row-upgrade-daemon-visible",
+                        IconName::ArrowUp,
+                    )
+                    .icon_size(IconSize::Small)
+                    // Yellow says "behind the protocol", not merely "behind the
+                    // bytes".
+                    .when(behind.is_some(), |button| button.icon_color(Color::Warning))
+                    // Spoken as well as hovered: a tooltip needs a pointer, and
+                    // this is the only thing on the row that says the host is a
+                    // generation behind.
+                    .aria_label(label.clone())
+                    .tooltip(move |_, cx| match behind {
+                        Some(_) => {
+                            Tooltip::with_meta("Upgrade Host Daemon", None, label.clone(), cx)
+                        }
+                        None => Tooltip::simple(label.clone(), cx),
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.upgrade_host_daemon(host.clone(), cx);
+                    }))
+                    .into_any_element()
+                }
+            },
         )
-    }
-
-    /// This row's host, when something has already found its daemon behind the
-    /// binary this client would deploy. `None` for a local row, and for a host
-    /// nobody has compared — an unanswered question must not draw an arrow.
-    ///
-    /// `try_lifecycle_service` and not the eager one: a render must not be what
-    /// builds the service, which opens the workspace registry's database on the
-    /// way. No service means nothing has contacted any host, which reads the
-    /// same as "not stale".
-    fn stale_daemon_host(&self, context: &WorkspaceRowContext, cx: &App) -> Option<String> {
-        stale_daemon_host_for_row(context.kind, context.ade_host.as_deref(), |host| {
-            ade_workspaces::try_lifecycle_service(cx)
-                .is_some_and(|lifecycle| lifecycle.host_daemon_stale(host))
-        })
     }
 
     /// Build the current daemon binary and put it on `host`, replacing the one
@@ -4721,7 +4850,9 @@ impl Sidebar {
         // would keep the window's workspace alive long after it closed just to
         // deliver a toast nobody can see.
         let workspace = self.active_workspace(cx).map(|w| w.downgrade());
-        cx.spawn(async move |_, cx| {
+        record_daemon_upgrade_step(&mut self.daemon_upgrades, &host, DaemonUpgradeStep::Started);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn({
                     let host = host.clone();
@@ -4741,73 +4872,44 @@ impl Sidebar {
                 Ok(_) => log::info!("{message}"),
                 Err(_) => log::warn!("{message}"),
             }
-            let Some(workspace) = workspace else {
-                return;
+            let step = match &outcome {
+                Ok(_) => DaemonUpgradeStep::Succeeded,
+                // Back to an arrow, so the operator can retry; the error is
+                // already in the toast and the log.
+                Err(_) => DaemonUpgradeStep::Failed,
             };
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.show_toast(
-                        Toast::new(NotificationId::unique::<UpgradeHostDaemon>(), message),
-                        cx,
-                    )
-                })
-                .ok();
-        })
-        .detach();
-    }
-
-    fn kill_and_recreate_workspace_sessions(
-        &mut self,
-        workspace: WeakEntity<Workspace>,
-        worktree_name: SharedString,
-        worktree_root: PathBuf,
-        ade_host: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let confirmation = window.prompt(
-            gpui::PromptLevel::Critical,
-            &format!("Kill and recreate sessions for \"{worktree_name}\"?"),
-            Some(
-                "This terminates every terminal and agent running in this worktree and deletes their scrollback. Repository files and other worktrees are not changed.",
-            ),
-            &["Kill and Recreate", "Cancel"],
-            cx,
-        );
-
-        window
-            .spawn(cx, async move |cx| {
-                if confirmation.await != Ok(0) {
-                    return anyhow::Ok(());
-                }
-                let Some(workspace) = workspace.upgrade() else {
-                    return anyhow::Ok(());
-                };
-                let recovery = cx.update(|window, cx| {
-                    ade_workspaces::kill_and_recreate_workspace_sessions(
-                        &workspace,
-                        worktree_root,
-                        ade_host,
-                        window,
-                        cx,
-                    )
-                })?;
-                if let Err(error) = recovery.await {
-                    let detail = format!("{error:#}");
-                    let prompt = cx.update(|window, cx| {
-                        window.prompt(
-                            gpui::PromptLevel::Critical,
-                            "Could not recreate persistent sessions",
-                            Some(&detail),
-                            &["OK"],
+            this.update(cx, |this, cx| {
+                record_daemon_upgrade_step(&mut this.daemon_upgrades, &host, step);
+                cx.notify();
+            })
+            .ok();
+            if let Some(workspace) = workspace {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(NotificationId::unique::<UpgradeHostDaemon>(), message),
                             cx,
                         )
-                    })?;
-                    prompt.await.log_err();
-                }
-                anyhow::Ok(())
+                    })
+                    .ok();
+            }
+            if step != DaemonUpgradeStep::Succeeded {
+                return;
+            }
+            cx.background_executor()
+                .timer(DAEMON_UPGRADE_CHECK_LINGER)
+                .await;
+            this.update(cx, |this, cx| {
+                record_daemon_upgrade_step(
+                    &mut this.daemon_upgrades,
+                    &host,
+                    DaemonUpgradeStep::Expired,
+                );
+                cx.notify();
             })
-            .detach_and_log_err(cx);
+            .ok();
+        })
+        .detach();
     }
 
     /// Backs both the hover `…` button and right-clicking the row, so the two
@@ -5113,60 +5215,19 @@ impl Sidebar {
 
                 let menu = if is_worktree {
                     menu.when_some(context.worktree_workspace.clone(), |menu, workspace| {
-                        let recovery_scope = context.worktree_root.clone().and_then(|root| {
-                            workspace
-                                .upgrade()
-                                .is_some_and(|workspace| {
-                                    ade_workspaces::can_reset_workspace_sessions(
-                                        &workspace,
-                                        &root,
-                                        context.ade_host.as_deref(),
-                                        _cx,
-                                    )
-                                })
-                                .then(|| (root, context.ade_host.clone()))
-                        });
-                        let worktree_name = context.worktree_name.clone().unwrap_or_else(|| {
-                            context
-                                .worktree_root
-                                .as_ref()
-                                .and_then(|root| root.file_name())
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_else(|| "worktree".to_owned())
-                                .into()
-                        });
-                        let recovery_sidebar = sidebar.clone();
-                        let recovery_workspace = workspace.clone();
-                        let menu =
-                            menu.separator()
-                                .entry("Close Workspace", None, move |window, cx| {
-                                    let Some(workspace) = workspace.upgrade() else {
-                                        return;
-                                    };
-                                    multi_workspace
-                                        .update(cx, |multi_workspace, cx| {
-                                            multi_workspace
-                                                .close_workspace(&workspace, window, cx)
-                                                .detach_and_log_err(cx);
-                                        })
-                                        .ok();
-                                });
-                        menu.when_some(recovery_scope, |menu, (worktree_root, ade_host)| {
-                            menu.entry("Kill and Recreate Sessions…", None, move |window, cx| {
-                                recovery_sidebar
-                                    .update(cx, |sidebar, cx| {
-                                        sidebar.kill_and_recreate_workspace_sessions(
-                                            recovery_workspace.clone(),
-                                            worktree_name.clone(),
-                                            worktree_root.clone(),
-                                            ade_host.clone(),
-                                            window,
-                                            cx,
-                                        );
+                        menu.separator()
+                            .entry("Close Workspace", None, move |window, cx| {
+                                let Some(workspace) = workspace.upgrade() else {
+                                    return;
+                                };
+                                multi_workspace
+                                    .update(cx, |multi_workspace, cx| {
+                                        multi_workspace
+                                            .close_workspace(&workspace, window, cx)
+                                            .detach_and_log_err(cx);
                                     })
                                     .ok();
                             })
-                        })
                     })
                 } else {
                     menu.separator()

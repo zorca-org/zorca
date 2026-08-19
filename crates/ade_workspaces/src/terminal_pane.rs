@@ -27,9 +27,10 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use gpui::{
-    AppContext as _, AsyncWindowContext, Context, Entity, Global, Task, WeakEntity, Window,
+    App, AppContext as _, AsyncWindowContext, Context, Entity, Focusable as _, Global, Task,
+    WeakEntity, Window,
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, rc::Rc};
 use task::SpawnInTerminal;
 use terminal_view::TerminalView;
 use workspace::{Pane, Workspace};
@@ -192,6 +193,7 @@ pub(crate) async fn open_session_terminal(
     ade_workspace: &AdeWorkspace,
     cwd: Option<PathBuf>,
     attach_argv: Vec<String>,
+    view_id: &str,
     destination_index: Option<usize>,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<TerminalView>> {
@@ -201,6 +203,7 @@ pub(crate) async fn open_session_terminal(
         ade_workspace,
         cwd,
         attach_argv,
+        view_id,
         cx,
     )
     .await?;
@@ -222,12 +225,15 @@ pub(crate) async fn open_session_terminal(
     Ok(terminal_view)
 }
 
+/// `view_id` must be the one already in `attach_argv` — it is how the daemon
+/// ties the focus this view claims to the client drawing it.
 pub(crate) async fn create_session_terminal(
     zed_workspace: &WeakEntity<Workspace>,
     session_id: &str,
     ade_workspace: &AdeWorkspace,
     cwd: Option<PathBuf>,
     attach_argv: Vec<String>,
+    view_id: &str,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<TerminalView>> {
     let title = ade_workspace.name.as_str();
@@ -258,10 +264,64 @@ pub(crate) async fn create_session_terminal(
         AdeWorkspaceStore::global(cx).update(cx, |store, cx| {
             store.follow_session_title(workspace_id, &terminal_view, cx);
         });
+        claim_focused_size(
+            &terminal_view,
+            session_id,
+            ade_workspace,
+            view_id,
+            window,
+            cx,
+        );
         terminal_view
     })?;
 
     Ok(terminal_view)
+}
+
+/// While this view has focus — or was last hovered — its session's pty holds
+/// *this* view's size instead of the smallest of every client attached to the
+/// session.
+///
+/// Edge-triggered: the daemon keeps the claim until the owning view's own
+/// client detaches, so only gaining focus or hover has anything to say; a
+/// repeated claim is a no-op in the daemon. Hover claims so a glance at the
+/// *other* client's window redraws it at its own size without a click. Off the
+/// main thread because the claim is a blocking backend call, and a failure is
+/// a log line — nothing the user did needs a dialog about geometry.
+fn claim_focused_size(
+    terminal_view: &Entity<TerminalView>,
+    session_id: &str,
+    ade_workspace: &AdeWorkspace,
+    view_id: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let focus_handle = terminal_view.focus_handle(cx);
+    let claim = {
+        let ade_workspace = ade_workspace.clone();
+        let session_id = session_id.to_owned();
+        let view_id = view_id.to_owned();
+        Rc::new(move |cx: &mut App, hover: bool| {
+            let lifecycle = crate::lifecycle_service(cx);
+            let ade_workspace = ade_workspace.clone();
+            let session_id = session_id.clone();
+            let view_id = view_id.clone();
+            cx.background_spawn(async move {
+                if let Err(error) =
+                    lifecycle.focus_session(&ade_workspace, &session_id, &view_id, hover)
+                {
+                    log::warn!("session {session_id} could not follow the focused view: {error:#}");
+                }
+            })
+            .detach();
+        })
+    };
+    terminal_view.update(cx, |terminal_view, cx| {
+        let hover_claim = claim.clone();
+        terminal_view.set_hover_enter_callback(move |cx, hover| hover_claim(cx, hover));
+        cx.on_focus(&focus_handle, window, move |_, _, cx| claim(cx, false))
+            .detach();
+    });
 }
 
 /// The spawn description for one session attach — and, through

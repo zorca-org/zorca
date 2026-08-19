@@ -65,24 +65,34 @@ fn test_cached_worktree_path_supports_consecutive_renames() {
     );
 }
 
+/// The arrow goes yellow at a generation below the client's, stops at the
+/// client's own, and claims nothing for a host no handshake has answered for.
+/// Independent of the hash staleness, which asks a different question.
 #[test]
-fn test_stale_daemon_host_for_row() {
+fn test_outdated_daemon_generation_for_row() {
     use workspace_manager::{GroupId, ProjectId, RowKind, WorktreeId};
 
-    let stale = |_: &str| true;
-    let fresh = |_: &str| false;
+    let client = ade_workspaces::CLIENT_GENERATION;
+    let project = RowKind::Project(ProjectId(0));
 
     assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), Some("host"), stale),
-        Some("host".to_owned())
+        outdated_daemon_generation_for_row(project, Some("host"), |_| Some(client - 1)),
+        Some(client - 1)
     );
     assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), Some("host"), fresh),
-        None
+        outdated_daemon_generation_for_row(project, Some("host"), |_| Some(client)),
+        None,
+        "a host at this client's own generation is not behind"
     );
     assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), None, stale),
-        None
+        outdated_daemon_generation_for_row(project, Some("host"), |_| None),
+        None,
+        "nothing is claimed before the first handshake"
+    );
+    assert_eq!(
+        outdated_daemon_generation_for_row(project, None, |_| Some(client - 1)),
+        None,
+        "the arrow covers the contacted remote spelling only: a local row draws none"
     );
     for kind in [
         RowKind::Group(GroupId(0)),
@@ -90,12 +100,113 @@ fn test_stale_daemon_host_for_row() {
         RowKind::PinnedSection,
     ] {
         assert_eq!(
-            stale_daemon_host_for_row(kind, Some("host"), |_| {
-                panic!("a non-project row must not query daemon freshness")
+            outdated_daemon_generation_for_row(kind, Some("host"), |_| {
+                panic!("a non-project row must not query the daemon generation")
             }),
             None
         );
     }
+}
+
+#[test]
+fn test_daemon_row_host() {
+    use workspace_manager::{GroupId, ProjectId, RowKind, WorktreeId};
+
+    assert_eq!(
+        daemon_row_host(RowKind::Project(ProjectId(0)), Some("host")),
+        Some("host")
+    );
+    assert_eq!(
+        daemon_row_host(RowKind::Project(ProjectId(0)), None),
+        None,
+        "a local row has no remote daemon"
+    );
+    for kind in [
+        RowKind::Group(GroupId(0)),
+        RowKind::Worktree(WorktreeId(0)),
+        RowKind::PinnedSection,
+    ] {
+        assert_eq!(daemon_row_host(kind, Some("host")), None);
+    }
+}
+
+/// One arrow for both facts, yellow only for the protocol gap, and replaced in
+/// place while a press of it runs.
+#[test]
+fn test_daemon_indicator() {
+    assert_eq!(daemon_indicator(false, None, None), None);
+    assert_eq!(
+        daemon_indicator(true, None, None),
+        Some(DaemonIndicator::Upgrade(None)),
+        "a stale binary alone keeps the plain arrow"
+    );
+    assert_eq!(
+        daemon_indicator(false, Some(2), None),
+        Some(DaemonIndicator::Upgrade(Some(2))),
+        "compatibility mode draws the arrow even with the binary current"
+    );
+    assert_eq!(
+        daemon_indicator(true, Some(2), None),
+        Some(DaemonIndicator::Upgrade(Some(2)))
+    );
+    for behind in [None, Some(2)] {
+        assert_eq!(
+            daemon_indicator(true, behind, Some(DaemonUpgradeUi::InProgress)),
+            Some(DaemonIndicator::InProgress),
+            "a running upgrade replaces the arrow, whatever it was drawn for"
+        );
+        assert_eq!(
+            daemon_indicator(true, behind, Some(DaemonUpgradeUi::Done)),
+            Some(DaemonIndicator::Done)
+        );
+    }
+}
+
+/// The tooltip has to say what pressing costs, because the upgrade forces the
+/// daemon out over whatever it holds.
+#[test]
+fn test_compat_daemon_tooltip() {
+    let client = ade_workspaces::CLIENT_GENERATION;
+    let gap = format!("Compatibility mode — protocol generation 2 of {client}.");
+
+    assert_eq!(
+        compat_daemon_tooltip(2),
+        format!("{gap} Upgrading kills running sessions.")
+    );
+}
+
+#[test]
+fn test_daemon_upgrade_state_machine() {
+    let mut states = HashMap::default();
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::InProgress));
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Succeeded);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::Done));
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Expired);
+    assert_eq!(states.get("host"), None, "the check clears itself");
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Failed);
+    assert_eq!(
+        states.get("host"),
+        None,
+        "a failure puts the arrow back to be retried"
+    );
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Expired);
+    assert_eq!(
+        states.get("host"),
+        Some(&DaemonUpgradeUi::InProgress),
+        "a stale timer must not clear a newer press"
+    );
+
+    record_daemon_upgrade_step(&mut states, "other", DaemonUpgradeStep::Succeeded);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::InProgress));
+    assert_eq!(states.get("other"), Some(&DaemonUpgradeUi::Done));
 }
 
 #[test]
@@ -210,12 +321,6 @@ fn test_open_group_filter_ignores_runtime_ssh_fields() {
 }
 
 fn init_test(cx: &mut TestAppContext) {
-    // A test must never reach this machine's real daemon: the sidebar's flows
-    // spawn the proxy on their own, and a box with a live `~/.ade` would hand
-    // the test real workspaces — and a real pty under the test scheduler.
-    // SAFETY: nextest runs one test per process, and this bootstrap runs
-    // before any thread reads the environment.
-    unsafe { std::env::set_var(ade_workspaces::DAEMON_BIN_ENV, "/nonexistent/ade-daemon") };
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
@@ -1279,6 +1384,41 @@ async fn test_new_terminal_in_an_ade_window_is_never_a_stock_terminal(cx: &mut T
     );
 }
 
+/// A window that already has tabs is never deferred to the connection flow:
+/// the flow's own fallback declines an occupied window, so the claim would
+/// swallow the click and open nothing.
+#[gpui::test]
+async fn test_new_terminal_in_an_occupied_window_is_a_stock_terminal(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+    let terminal_requests = capture_center_terminal_requests(cx);
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        let item = cx.new(workspace::item::test::TestItem::new);
+        workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+    });
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_new_terminal(&workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        terminal_requests
+            .lock()
+            .expect("terminal request mutex should not be poisoned")
+            .len(),
+        1,
+        "an occupied window's new-terminal click must open a terminal",
+    );
+}
+
 #[gpui::test]
 async fn test_selection_clamps_after_entry_removal(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
@@ -2193,60 +2333,6 @@ async fn test_close_selected_linked_worktree_closes_its_workspace_not_the_active
             .expect("closing a workspace must not pretend the Git worktree was deleted");
         assert!(closed_row.workspace.is_none());
     });
-}
-
-#[gpui::test]
-async fn test_persistent_workspace_reset_requires_confirmation_and_cancel_can_retry(
-    cx: &mut TestAppContext,
-) {
-    init_test(cx);
-    let fs = FakeFs::new(cx.executor());
-    let root = PathBuf::from("/project");
-    fs.insert_tree(&root, serde_json::json!({ ".git": {}, "src": {} }))
-        .await;
-    cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
-    let project = project::Project::test(fs, [root.as_path()], cx).await;
-    project
-        .update(cx, |project, cx| project.git_scans_complete(cx))
-        .await;
-    let (multi_workspace, cx) =
-        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
-    let workspace =
-        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
-    let sidebar = setup_sidebar(&multi_workspace, cx);
-
-    let open_reset_prompt = |cx: &mut gpui::VisualTestContext| {
-        sidebar.update_in(cx, |sidebar, window, cx| {
-            sidebar.kill_and_recreate_workspace_sessions(
-                workspace.downgrade(),
-                "project".into(),
-                PathBuf::from("/project"),
-                None,
-                window,
-                cx,
-            );
-        });
-    };
-
-    open_reset_prompt(cx);
-    assert!(
-        cx.pending_prompt().is_some_and(|(title, detail)| {
-            title.contains("Kill and recreate sessions")
-                && detail.contains("Repository files and other worktrees are not changed")
-        }),
-        "the destructive action must explain its exact scope"
-    );
-    cx.simulate_prompt_answer("Cancel");
-    cx.run_until_parked();
-    assert!(!cx.has_pending_prompt());
-
-    open_reset_prompt(cx);
-    assert!(
-        cx.has_pending_prompt(),
-        "cancelling must leave the recovery action available"
-    );
-    cx.simulate_prompt_answer("Cancel");
-    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -4251,6 +4337,10 @@ async fn init_sidebar_create_worktree_test(
     cx: &mut TestAppContext,
 ) -> (Arc<FakeFs>, Entity<project::Project>) {
     agent_workspaces::test_support::init_test(cx);
+    // These tests cover the pre-adoption terminal routing, so the local ADE
+    // flow is refused up front: otherwise its fallback plants a shell in every
+    // empty window, and a real pty trips gpui's determinism guard.
+    cx.update(|cx| ade_workspaces::refuse_daemon(None, cx));
     let fs = FakeFs::new(cx.executor());
     fs.insert_tree(
         "/project-a",
@@ -5772,6 +5862,7 @@ async fn test_project_without_a_repository_still_appears(cx: &mut TestAppContext
 #[gpui::test]
 async fn test_fallback_worktrees_use_main_label(cx: &mut TestAppContext) {
     agent_workspaces::test_support::init_test(cx);
+    cx.update(|cx| ade_workspaces::refuse_daemon(None, cx));
     let fs = FakeFs::new(cx.executor());
     cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
     let project = project::Project::test(fs.clone(), [], cx).await;

@@ -39,7 +39,7 @@
 //! synchronous. Callers must run them on a background executor.
 
 use crate::WorkspaceStatus;
-use crate::daemon_backend::DaemonUpgradeOutcome;
+use crate::daemon_backend::{DaemonUpgradeOutcome, Outdated};
 use ade_session::LayoutDoc;
 use anyhow::{Result, bail};
 use smol::channel::Receiver;
@@ -51,10 +51,6 @@ use std::{
 };
 
 /// A session's identity as its backend knows it.
-///
-/// The tmux backend's ids are tmux session names (`ade-<slug>-<id6>`, see
-/// [`crate::tmux_session_name`]), which is what the registry caches in
-/// `terminal_session_id`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(String);
 
@@ -158,6 +154,22 @@ pub struct BackendWorkspace {
     pub project_root: String,
     /// Unix seconds.
     pub created_at: u64,
+}
+
+/// One host's workspace listing, with the ledger state of the daemon that
+/// produced it.
+///
+/// **The flag travels with the list because it qualifies *this* list.** A
+/// degraded daemon's ledger is read-only and its answer may be incomplete, so
+/// reconciliation must not drop rows on it — and asking the backend afterwards
+/// asks whichever daemon it is connected to *now*, which a mid-pass reconnect
+/// can make a different, healthy one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkspaceListing {
+    pub workspaces: Vec<BackendWorkspace>,
+    /// §8.5: the answering daemon found a ledger written by a newer schema, so
+    /// what it did not list may still exist.
+    pub degraded: bool,
 }
 
 /// How a backend reports that a session's status changed.
@@ -290,6 +302,21 @@ pub enum DaemonEvent {
     WorkspaceRemoved {
         workspace_id: String,
     },
+    /// The push stream is live: subscribed, both listings answered, and the
+    /// snapshot that reconciles what was missed already queued ahead of this.
+    /// A compatible handshake whose listing then failed is **not** this.
+    Up,
+    /// The push stream is down, with the failure that took it down.
+    ///
+    /// `outdated` is the typed direction when the two ends cannot speak to each
+    /// other at all — never prose, never a boolean — and `None` for an ordinary
+    /// reachability failure, which is a host error and nothing more. Sent on a
+    /// *change* of state or class only: a retry loop that keeps failing the same
+    /// way says so once.
+    Down {
+        message: String,
+        outdated: Option<Outdated>,
+    },
 }
 
 /// One workspace-level thing that happened, as the layers above the seam see
@@ -348,6 +375,23 @@ pub trait SessionBackend: Send + Sync {
         bail!("this session backend holds one session per workspace")
     }
 
+    /// Mints a workspace record with **no sessions in it**, and answers with
+    /// the id it minted.
+    ///
+    /// The first call of a panel row's life: the record exists the moment the
+    /// row appears, before any terminal, and its id is the workspace's identity
+    /// from then on (see [`crate::AdeWorkspace::daemon_workspace_id`]). The
+    /// first terminal is a separate create-session into it.
+    ///
+    /// `name` absent leaves the naming to the backend, which has the root.
+    ///
+    /// A backend with no workspaces of its own says so, like
+    /// [`SessionBackend::kill_workspace`]: there is nothing to fall back to,
+    /// and a locally invented id would name a workspace no host holds.
+    fn create_workspace(&self, _root: &Path, _name: Option<&str>) -> Result<BackendWorkspace> {
+        bail!("this session backend has no workspaces of its own to create")
+    }
+
     /// Every live session this app owns. Sessions belonging to anything else
     /// are not listed, and a backend that is not running yet reports no
     /// sessions rather than an error.
@@ -365,8 +409,8 @@ pub trait SessionBackend: Send + Sync {
     /// own.** Adoption is a pass over every host, and tmux having nothing to
     /// contribute is not a host failure — an error here reads as "this host
     /// could not be asked", and the layers above treat it that way.
-    fn list_workspaces(&self) -> Result<Vec<BackendWorkspace>> {
-        Ok(Vec::new())
+    fn list_workspaces(&self) -> Result<WorkspaceListing> {
+        Ok(WorkspaceListing::default())
     }
 
     /// Whether one session is alive: [`SessionBackend::list`] narrowed to a
@@ -435,8 +479,20 @@ pub trait SessionBackend: Send + Sync {
     /// same call: this one never creates. A layout names sessions the backend
     /// minted, and rendering one must not conjure a shell for a tab whose
     /// session has died — the daemon prunes those from the document instead.
-    fn attach_session(&self, _session_id: &str) -> Result<Vec<String>> {
+    /// `view_id` identifies the terminal view the client will draw, so
+    /// [`SessionBackend::focus_session`] can later name it.
+    fn attach_session(&self, _session_id: &str, _view_id: &str) -> Result<Vec<String>> {
         bail!("this session backend has no sessions of its own to attach to")
+    }
+
+    /// Hold the session's pty at `view_id`'s size rather than at the smallest
+    /// attached client's — that view just took focus.
+    ///
+    /// A hint, not a mutation: a backend that mirrors no clients has no
+    /// smallest size to override, so the default is silence rather than an
+    /// error a focus gesture would have to surface.
+    fn focus_session(&self, _session_id: &str, _view_id: &str, _hover: bool) -> Result<()> {
+        Ok(())
     }
 
     /// The workspace's stored layout and the revision guarding the next write.
@@ -504,6 +560,35 @@ pub trait SessionBackend: Send + Sync {
     /// it succeeded.
     fn upgrade_daemon(&self) -> Result<DaemonUpgradeOutcome> {
         bail!("this session backend has no host daemon to upgrade")
+    }
+
+    /// **Which daemon this backend talks to**, if it has been told: the id the
+    /// daemon minted for itself and keeps across restarts.
+    ///
+    /// Two backends reporting the same id are two spellings of one host — an
+    /// IP and a hostname, a bare name and an ssh alias — and the lifecycle
+    /// layer treats them as one daemon. `None` means "not known", which is
+    /// both a backend that has never connected and a daemon too old to say;
+    /// the caller then falls back to the host spelling, as it always did.
+    ///
+    /// Learned at connect and cached, so this contacts nothing.
+    fn instance_id(&self) -> Option<String> {
+        None
+    }
+
+    /// The protocol generation this backend's host last handshook at, `None`
+    /// before it has handshaken at all.
+    ///
+    /// Below the client's own maximum means the host serves an older dialect —
+    /// a badge, not an error, since the connection works. **Distinct from
+    /// [`Self::daemon_stale`]**: a binary can be stale for reasons that have
+    /// nothing to do with the generation, and a generation gap can outlive a
+    /// hash comparison nobody has made.
+    ///
+    /// Last-known and kept across disconnects, like [`Self::instance_id`]:
+    /// read-only and non-blocking, because a render is the caller.
+    fn daemon_generation(&self) -> Option<u32> {
+        None
     }
 
     /// Whether this backend's host runs a daemon older than the client would

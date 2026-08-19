@@ -738,14 +738,14 @@ fn main() {
         });
         vim::init(cx);
         terminal_view::init(cx);
-        // ADE fork: a fresh window on an ssh connection reattaches to (or
-        // creates) the host's daemon workspace instead of opening a shell that
+        // ADE fork: a fresh window on a project — local or ssh — reattaches to
+        // (or creates) its daemon workspace instead of opening a shell that
         // would die with the window; the connect flow opens its own plain
-        // terminal when the host cannot be reached. Every other fresh window —
-        // local, WSL, Docker — opens on a terminal rather than on the agent
-        // panel. Same entry point as `workspace: new center terminal` — the
-        // working directory it picks is the user's home for a window with no
-        // project.
+        // terminal when the daemon cannot be reached. A WSL or Docker window
+        // has no daemon to reach, so it opens on a terminal rather than on the
+        // agent panel. Same entry point as `workspace: new center terminal` —
+        // the working directory it picks is the user's home for a window with
+        // no project.
         workspace::on_fresh_window(cx, |workspace, window, cx| {
             if ade_workspaces::open_connection_workspace(workspace, window, cx) {
                 return;

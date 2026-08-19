@@ -1,17 +1,19 @@
-//! Opening a workspace from anywhere in the app: mark it opened, ask the
-//! backend what state its session is in, and attach unless the session is dead.
+//! Opening a workspace from anywhere in the app: mark it opened, build the
+//! arrangement the daemon holds, and otherwise attach a terminal to it.
 //!
 //! The one entry point every surface uses — the scaffold panel's rows and the
 //! ledger sidebar's — so that "clicking a workspace" means the same thing
-//! wherever it is clicked, and the three rules of the lifecycle layer are
-//! honoured once instead of per caller:
+//! wherever it is clicked, and the rules of the lifecycle layer are honoured
+//! once instead of per caller:
 //!
-//! - **Selecting attaches; it never repairs.** A session that probed
-//!   [`SessionState::Dead`] is left alone for the caller to surface; only an
-//!   explicit recreate brings it back.
-//! - **`NeverCreated` attaches too.** The argv is attach-or-create, so the
-//!   first open of a workspace that has no session makes it and attaches in one
-//!   step — and the registry is then told the name it now points at.
+//! - **A stored arrangement wins.** Opening builds what the daemon holds and
+//!   attaches to the sessions it names; only a workspace with no arrangement
+//!   to build gets the single-terminal attach-or-create below.
+//! - **Zero sessions is a normal state, and it gets a terminal.** A row created
+//!   a moment ago and one whose shells have all exited are the same case: the
+//!   argv is attach-or-create, so the first open makes the session and attaches
+//!   in one step. The only refusal is a host that could not be asked, because
+//!   nothing is known about it.
 //! - **Every lifecycle call blocks**, so all of them run on the background
 //!   executor.
 //!
@@ -27,22 +29,19 @@
 //! one. The two paths used to differ — an attached window installed no
 //! [`crate::LayoutSync`], so a terminal added to it later reached no document
 //! and died with the window — and [`attach_terminal`] is where they meet. It is
-//! the one entry point for every attach in the app: this module's fallback, the
-//! create-workspace modal, and the sidebar's recreate.
+//! the one entry point for every attach in the app: this module's fallback and
+//! the create-workspace modal.
 
 use crate::{
-    AdeLayouts, AdeWorkspace, Attached, MissingTab, SessionState, WorkspaceId, WorkspaceLayout,
+    AdeLayouts, AdeWorkspace, Attached, SessionState, WorkspaceId, WorkspaceLayout,
     open_workspace_terminal, render_layout,
     store::AdeWorkspaceStore,
-    workspace_view::{
-        bound_workspace_for_worktree, ensure_repository_worktree, name_window_after_workspace,
-    },
+    workspace_view::{ensure_repository_worktree, name_window_after_workspace},
 };
 use anyhow::{Context as _, Result};
 use gpui::{App, AppContext as _, AsyncWindowContext, Entity, Task, WeakEntity, Window};
-use std::path::{Path, PathBuf};
 use util::ResultExt as _;
-use workspace::{SaveIntent, Workspace};
+use workspace::Workspace;
 
 /// Opens (or refocuses) the terminal attached to workspace `id` in this window.
 ///
@@ -92,18 +91,20 @@ pub fn open_workspace_session(
                         // reconciliation whose host failed produces it — and it
                         // would mean "we do not know", which is never grounds
                         // for attach-or-*create*.
-                        (None, SessionState::Dead | SessionState::Unknown) => None,
-                        (None, SessionState::Alive | SessionState::NeverCreated) => {
-                            Some(lifecycle.attach_command(&workspace)?)
-                        }
+                        (None, SessionState::Unknown) => None,
+                        // A workspace with no live session — brand new, or one
+                        // whose shells have all exited — gets its terminal.
+                        // Zero sessions is a normal state, not one to refuse to
+                        // act on.
+                        (None, _) => Some(lifecycle.attach_command(&workspace)?),
                     };
-                    anyhow::Ok((workspace, state, stored, attached))
+                    anyhow::Ok((workspace, stored, attached))
                 }
             })
             .await;
 
         let outcome = match opened {
-            Ok((workspace, state, stored, attached)) => {
+            Ok((workspace, stored, attached)) => {
                 // The Zed window *is* the workspace view: make the repository a
                 // visible worktree so the file tree and git panel follow the
                 // selection. Additive and never fatal — see
@@ -137,23 +138,23 @@ pub fn open_workspace_session(
                         Some(attached) => {
                             let opened =
                                 attach_terminal(&zed_workspace, &workspace, attached, cx).await;
-                            match (opened, state) {
-                                // The pane's own attach-or-create is what brought
-                                // the session into being, so the registry has to be
-                                // told the name it now points at — otherwise the dot
-                                // would keep reading muted over a running session.
-                                (Ok(()), SessionState::NeverCreated) => {
+                            match opened {
+                                // The pane's own attach-or-create may be what
+                                // brought the session into being, so the registry
+                                // is told the workspace is running — otherwise the
+                                // dot would keep reading muted over a live session.
+                                Ok(()) => {
                                     cx.background_spawn(async move {
                                         lifecycle.record_attached_session(&id).await.map(|_| ())
                                     })
                                     .await
                                 }
-                                (opened, _) => opened,
+                                opened => opened,
                             }
                         }
-                        // Dead: the caller renders its "gone" affordance and waits.
-                        // The file tree still updated above, so the repository is
-                        // browsable while the session is not.
+                        // The host could not be asked. Nothing attaches, because
+                        // nothing is known; the file tree still updated above, so
+                        // the repository is browsable meanwhile.
                         None => Ok(()),
                     }
                 }
@@ -168,119 +169,6 @@ pub fn open_workspace_session(
 
         outcome
     })
-}
-
-/// Whether this window's persistent-workspace binding belongs to the exact
-/// worktree row the user acted on.
-pub fn can_reset_workspace_sessions(
-    zed_workspace: &Entity<Workspace>,
-    repository_path: &Path,
-    remote_host: Option<&str>,
-    cx: &App,
-) -> bool {
-    bound_workspace_for_worktree(zed_workspace.entity_id(), repository_path, remote_host, cx)
-        .is_some()
-}
-
-/// Kills every persistent session in the workspace shown by this window and
-/// attaches one fresh session without restarting the host daemon.
-///
-/// The window binding identifies the selected workspace; only other registry
-/// rows for that exact host and repository root share its recovery scope.
-pub fn kill_and_recreate_workspace_sessions(
-    zed_workspace: &Entity<Workspace>,
-    repository_path: PathBuf,
-    remote_host: Option<String>,
-    window: &mut Window,
-    cx: &mut App,
-) -> Task<Result<()>> {
-    let Some(id) = bound_workspace_for_worktree(
-        zed_workspace.entity_id(),
-        &repository_path,
-        remote_host.as_deref(),
-        cx,
-    )
-    .cloned() else {
-        return Task::ready(Err(anyhow::anyhow!(
-            "this worktree is not the persistent workspace attached to this window"
-        )));
-    };
-    let lifecycle = crate::lifecycle_service(cx);
-    let zed_workspace = zed_workspace.downgrade();
-
-    window.spawn(cx, async move |cx| {
-        let pane =
-            zed_workspace.read_with(cx, |workspace, _| workspace.active_pane().downgrade())?;
-        pane.update(cx, |pane, cx| pane.begin_pending_item(cx))?;
-        let outcome = async {
-            let entity_id = zed_workspace.entity_id();
-            cx.update(|_, cx| AdeLayouts::forget_window(entity_id, cx))?;
-            close_center_terminals(&zed_workspace, cx).await?;
-            let (ade_workspace, attached) = cx
-                .background_spawn(async move { lifecycle.reset_workspace_sessions(&id).await })
-                .await?;
-            cx.update(|_, cx| AdeLayouts::forget_window(entity_id, cx))?;
-            close_center_terminals(&zed_workspace, cx).await?;
-            attach_terminal(&zed_workspace, &ade_workspace, attached, cx).await
-        }
-        .await;
-        if outcome.is_err() {
-            rollback_layout_ownership(&zed_workspace, false, cx);
-        }
-        pane.update(cx, |pane, cx| pane.end_pending_item(cx))
-            .log_err();
-
-        cx.update(|_, cx| {
-            AdeWorkspaceStore::global(cx).update(cx, |store, cx| store.refresh(cx));
-        })
-        .ok();
-        outcome
-    })
-}
-
-/// Removes the terminal views before the backend resets their sessions,
-/// without disturbing editor tabs in the same panes.
-async fn close_center_terminals(
-    zed_workspace: &WeakEntity<Workspace>,
-    cx: &mut AsyncWindowContext,
-) -> Result<()> {
-    let terminals = zed_workspace.read_with(cx, |workspace, cx| {
-        workspace
-            .center()
-            .panes()
-            .into_iter()
-            .flat_map(|pane| {
-                let pane = pane.clone();
-                let item_ids = pane
-                    .read(cx)
-                    .items()
-                    .filter(|item| {
-                        item.downcast::<terminal_view::TerminalView>().is_some()
-                            || item.downcast::<MissingTab>().is_some_and(|placeholder| {
-                                matches!(
-                                    placeholder.read(cx).tab(),
-                                    ade_session::Tab::Terminal { .. }
-                                )
-                            })
-                    })
-                    .map(|item| item.item_id())
-                    .collect::<Vec<_>>();
-                item_ids
-                    .into_iter()
-                    .map(move |item_id| (pane.clone(), item_id))
-            })
-            .collect::<Vec<_>>()
-    })?;
-
-    for (pane, item_id) in terminals {
-        let close = cx.update(|window, cx| {
-            pane.update(cx, |pane, cx| {
-                pane.close_item_by_id(item_id, SaveIntent::Skip, window, cx)
-            })
-        })?;
-        close.await?;
-    }
-    Ok(())
 }
 
 /// Builds the window's whole centre from the stored layout, then keeps the two
@@ -529,7 +417,9 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
 
         let registry = crate::AdeWorkspaceRegistry::open_test_db(name).await;
-        let ade_workspace = AdeWorkspace::new("main", "repo", "/repo");
+        let mut ade_workspace = AdeWorkspace::new("main", "repo", "/repo");
+        // Every row has a daemon record; without one nothing can be opened.
+        ade_workspace.terminal_session_id = Some("ws-repo-1".to_owned());
         registry
             .create_workspace(ade_workspace.clone())
             .await
@@ -566,121 +456,6 @@ mod tests {
         task.await
     }
 
-    #[gpui::test]
-    async fn recovery_removes_terminal_placeholders_but_keeps_editor_placeholders(
-        cx: &mut TestAppContext,
-    ) {
-        let (workspace, _ade_workspace, mut window) =
-            test_window("recovery_removes_terminal_placeholders", cx).await;
-        let pane = workspace.read_with(&window, |workspace, _| workspace.active_pane().clone());
-        window.update(|window, cx| {
-            let terminal = cx.new(|cx| MissingTab::session("dead-session", cx));
-            let editor = cx.new(|cx| MissingTab::file("/repo/missing.rs", cx));
-            pane.update(cx, |pane, cx| {
-                pane.add_item(Box::new(terminal), false, false, None, window, cx);
-                pane.add_item(Box::new(editor), false, false, None, window, cx);
-            });
-        });
-
-        let task = window.update(|window, cx| {
-            window.spawn(cx, {
-                let workspace = workspace.downgrade();
-                async move |cx| close_center_terminals(&workspace, cx).await
-            })
-        });
-        task.await.expect("placeholder cleanup should succeed");
-
-        let remaining = pane.read_with(&window, |pane, cx| {
-            pane.items()
-                .filter_map(|item| item.downcast::<MissingTab>())
-                .map(|placeholder| placeholder.read(cx).tab().clone())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(
-            remaining,
-            vec![ade_session::Tab::Editor {
-                path: "/repo/missing.rs".to_owned()
-            }]
-        );
-    }
-
-    #[gpui::test]
-    async fn a_bound_workspace_can_reset_without_layout_ownership(cx: &mut TestAppContext) {
-        let (workspace, ade_workspace, mut window) =
-            test_window("bound_workspace_can_reset_without_layout_ownership", cx).await;
-        assert!(!window.update(|_, cx| {
-            can_reset_workspace_sessions(&workspace, Path::new("/repo"), None, cx)
-        }));
-        let bind = window.update(|window, cx| {
-            window.spawn(cx, {
-                let workspace = workspace.downgrade();
-                let ade_workspace = ade_workspace.clone();
-                async move |cx| name_window_after_workspace(&workspace, &ade_workspace, cx)
-            })
-        });
-        bind.await.expect("the workspace should bind");
-
-        assert!(!workspace.read_with(&window, |workspace, _| workspace.ade_owns_layout()));
-        assert!(window.update(|_, cx| {
-            can_reset_workspace_sessions(&workspace, Path::new("/repo"), None, cx)
-        }));
-        assert!(!window.update(|_, cx| {
-            can_reset_workspace_sessions(&workspace, Path::new("/repo/sibling"), None, cx)
-        }));
-    }
-
-    #[gpui::test]
-    async fn reset_failure_does_not_leave_the_killed_terminal_visible(cx: &mut TestAppContext) {
-        let (workspace, ade_workspace, mut window) =
-            test_window("reset_failure_does_not_leave_killed_terminal", cx).await;
-        let bind = window.update(|window, cx| {
-            window.spawn(cx, {
-                let workspace = workspace.downgrade();
-                async move |cx| name_window_after_workspace(&workspace, &ade_workspace, cx)
-            })
-        });
-        bind.await.expect("the workspace should bind");
-
-        let pane = workspace.read_with(&window, |workspace, _| workspace.active_pane().clone());
-        window.update(|window, cx| {
-            let terminal = cx.new(|cx| MissingTab::session("old-session", cx));
-            pane.update(cx, |pane, cx| {
-                pane.add_item(Box::new(terminal), false, false, None, window, cx);
-            });
-        });
-
-        let reset = window.update(|window, cx| {
-            kill_and_recreate_workspace_sessions(
-                &workspace,
-                PathBuf::from("/repo"),
-                None,
-                window,
-                cx,
-            )
-        });
-        let error = reset
-            .await
-            .expect_err("the test backend deliberately refuses the replacement session");
-        assert!(format!("{error:#}").contains("creating session"));
-        assert!(pane.read_with(&window, |pane, cx| {
-            pane.items().all(|item| {
-                !item.downcast::<MissingTab>().is_some_and(|placeholder| {
-                    matches!(
-                        placeholder.read(cx).tab(),
-                        ade_session::Tab::Terminal { .. }
-                    )
-                })
-            })
-        }));
-        assert!(!pane.read_with(&window, |pane, _| pane.has_pending_item()));
-        assert!(
-            window.update(|_, cx| {
-                can_reset_workspace_sessions(&workspace, Path::new("/repo"), None, cx)
-            }),
-            "a failed recovery must remain retryable"
-        );
-    }
-
     #[gpui::test(iterations = 10)]
     async fn failed_terminal_attach_returns_the_center_to_zed(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut window) =
@@ -712,7 +487,8 @@ mod tests {
             );
         });
 
-        let replacement = AdeWorkspace::new("other", "repo", "/repo");
+        let mut replacement = AdeWorkspace::new("other", "repo", "/repo");
+        replacement.terminal_session_id = Some("ws-repo-2".to_owned());
         attach(&workspace, &replacement, failed_attach(), &mut window)
             .await
             .expect_err("the replacement attach must fail");

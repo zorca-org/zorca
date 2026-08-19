@@ -136,8 +136,8 @@ pub(crate) struct CreateWorkspaceModal {
     host_editor: Entity<Editor>,
     lifecycle: Arc<WorkspaceLifecycleService>,
     on_created: OnCreated,
-    /// Set while the session is being made, so the modal cannot be
-    /// confirmed twice into two sessions.
+    /// Set while the host is minting the record, so the modal cannot be
+    /// confirmed twice into two workspaces.
     creating: bool,
     error: Option<SharedString>,
 }

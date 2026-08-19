@@ -15,14 +15,17 @@
 //! rule that holds everywhere else in this crate.
 
 use crate::{
-    AdeWorkspace, AdeWorkspaceRegistry, SessionState, StatusDelivery, WorkspaceId,
-    WorkspaceLifecycleService,
+    AdeWorkspace, AdeWorkspaceRegistry, DaemonKey, SessionState, StatusDelivery, WorkspaceEntry,
+    WorkspaceId, WorkspaceLifecycleService,
 };
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, Global, SharedString, Subscription, Task,
     WeakEntity,
 };
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 
@@ -34,10 +37,16 @@ impl Global for GlobalWorkspaceStore {}
 /// current from the daemon's pushed status events.
 pub struct AdeWorkspaceStore {
     lifecycle: Arc<WorkspaceLifecycleService>,
-    entries: Vec<(AdeWorkspace, SessionState)>,
+    /// The merged view: rows this client uses, then what the hosts hold that it
+    /// does not.
+    entries: Vec<WorkspaceEntry>,
     /// One line per host the last pass could not reach. Their entries are still
     /// listed, showing what was last known of them.
     host_errors: Vec<SharedString>,
+    /// Which host spellings the last pass found to be one daemon — see
+    /// [`crate::Reconciled::daemons`]. The views key selection and dedupe by
+    /// it, so two spellings of one host do not draw one workspace twice.
+    daemons: HashMap<Option<String>, String>,
     /// The last failed refresh, cleared by the next successful one.
     error: Option<SharedString>,
     /// Set when the backend pushes status but the stream could not be opened.
@@ -62,7 +71,58 @@ pub struct AdeWorkspaceStore {
     /// here must not accumulate.
     title_watchers: HashMap<EntityId, (WeakEntity<Terminal>, Subscription)>,
     refresh_task: Task<()>,
+    /// **Only the latest refresh may land.** A pass takes a whole listing per
+    /// host, so one in flight when a workspace is removed is holding a view of
+    /// the world from before the removal; landing it puts the dead row back,
+    /// and for a workspace with no live session nothing pushes a status event
+    /// afterwards to correct it. Every refresh captures this at spawn and
+    /// applies only if it is still the one it captured; every removal bumps it.
+    refresh_ticket: u64,
+    /// The `(host, wire id)` of removals whose registry half is still running.
+    ///
+    /// The ticket alone cannot cover them: a refresh may *start* after the
+    /// synchronous eviction and still land before the mutation finishes, and
+    /// its listing is as stale as the earlier one's. Anything named here is
+    /// filtered out of a landing refresh until the mutation ends.
+    pending_removals: HashSet<(Option<String>, String)>,
     _status_task: Task<()>,
+}
+
+/// Windows shells announce their own executable path as the console title on
+/// startup; as a tab name that is noise. Show the shell's name instead.
+// ponytail: any title ending in a known shell exe collapses; tighten to
+// whole-path-only if a real title ever ends that way.
+fn friendly_shell_title(title: &str) -> &str {
+    let name = title.rsplit(['\\', '/']).next().unwrap_or(title);
+    match name.to_ascii_lowercase().as_str() {
+        "powershell.exe" | "pwsh.exe" => "PowerShell",
+        "cmd.exe" => "Command Prompt",
+        // The console host, not a shell: no title at all, so the tab keeps
+        // the workspace's name until the program inside speaks.
+        "conhost.exe" | "openconsole.exe" => "",
+        _ => title,
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::friendly_shell_title;
+
+    #[test]
+    fn a_shell_path_title_becomes_the_shell_name() {
+        assert_eq!(
+            friendly_shell_title(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            "PowerShell"
+        );
+        assert_eq!(
+            friendly_shell_title(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            "PowerShell"
+        );
+        assert_eq!(friendly_shell_title("cmd.exe"), "Command Prompt");
+        assert_eq!(friendly_shell_title(r"C:\WINDOWS\system32\conhost.exe"), "");
+        assert_eq!(friendly_shell_title("Claude Code"), "Claude Code");
+        assert_eq!(friendly_shell_title(""), "");
+    }
 }
 
 impl AdeWorkspaceStore {
@@ -130,21 +190,30 @@ impl AdeWorkspaceStore {
             lifecycle,
             entries: Vec::new(),
             host_errors: Vec::new(),
+            daemons: HashMap::new(),
             error: None,
             status_stream_error,
             session_titles: HashMap::new(),
             title_watchers: HashMap::new(),
             refresh_task: Task::ready(()),
+            refresh_ticket: 0,
+            pending_removals: HashSet::new(),
             _status_task: status_task,
         };
         this.refresh(cx);
         this
     }
 
-    /// Every registered workspace with the state its session was last found in,
-    /// most recently opened first.
-    pub fn entries(&self) -> &[(AdeWorkspace, SessionState)] {
+    /// Every workspace the last pass saw — used and merely discovered — with
+    /// the state its session was last found in, most recently opened first.
+    pub fn entries(&self) -> &[WorkspaceEntry] {
         &self.entries
+    }
+
+    /// Only the ones with a registry row, for a caller whose actions all take a
+    /// [`WorkspaceId`].
+    pub fn persisted(&self) -> impl Iterator<Item = (&AdeWorkspace, SessionState)> {
+        self.entries.iter().filter_map(WorkspaceEntry::persisted)
     }
 
     pub fn error(&self) -> Option<&SharedString> {
@@ -153,6 +222,10 @@ impl AdeWorkspaceStore {
 
     pub fn host_errors(&self) -> &[SharedString] {
         &self.host_errors
+    }
+
+    pub fn daemons(&self) -> &HashMap<Option<String>, String> {
+        &self.daemons
     }
 
     pub fn status_stream_error(&self) -> Option<&SharedString> {
@@ -206,7 +279,8 @@ impl AdeWorkspaceStore {
                 if !matches!(event, terminal::Event::BreadcrumbsChanged) {
                     return;
                 }
-                let title = terminal.read(cx).breadcrumb_text.trim().to_owned();
+                let title =
+                    friendly_shell_title(terminal.read(cx).breadcrumb_text.trim()).to_owned();
                 this.set_session_title(&workspace_id, terminal.entity_id(), &title, cx);
                 if let Some(view) = view.upgrade() {
                     view.update(cx, |view, cx| {
@@ -243,11 +317,80 @@ impl AdeWorkspaceStore {
         }
     }
 
+    /// **A workspace that is gone.** Drops it from the view now, then drops the
+    /// row and the discovery behind it.
+    ///
+    /// The in-memory removal is synchronous because the user has just been told
+    /// (or has just asked) that the workspace is dead: leaving it on screen
+    /// until a round trip to sqlite and the host finishes is a row that can be
+    /// clicked. The refresh that follows is what corrects everything else.
+    pub fn forget_workspace(&mut self, host: Option<&str>, wire_id: &str, cx: &mut Context<Self>) {
+        self.entries
+            .retain(|entry| entry.remote_host() != host || entry.wire_id() != Some(wire_id));
+        // Outdates every refresh already in flight, and tombstones the one that
+        // may start before the registry half finishes — see the fields.
+        self.refresh_ticket += 1;
+        let key = (host.map(str::to_owned), wire_id.to_owned());
+        self.pending_removals.insert(key.clone());
+        cx.notify();
+
+        let lifecycle = self.lifecycle.clone();
+        let (host, wire_id) = key.clone();
+        cx.spawn(async move |this, cx| {
+            let forgotten = cx
+                .background_spawn(async move {
+                    lifecycle.forget_workspace(host.as_deref(), &wire_id).await
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // The mutation is over: refreshes started during it are stale
+                // too, and the tombstone has nothing left to hide.
+                this.refresh_ticket += 1;
+                this.pending_removals.remove(&key);
+                match forgotten {
+                    // Not refreshed on failure: a pass that succeeded would
+                    // clear this line, and the row it would put back is the
+                    // very thing the line is about. The next refresh shows both
+                    // again.
+                    Err(error) => {
+                        this.error = Some(format!("{error:#}").into());
+                        cx.notify();
+                    }
+                    Ok(()) => this.refresh(cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Whether this entry names a removal that is still being written.
+    ///
+    /// Matched by daemon: the entry may be filed under another spelling of the
+    /// host the removal was asked for, and it is the same workspace.
+    fn removal_pending(&self, entry: &WorkspaceEntry) -> bool {
+        let daemon = self.daemon_of(entry.remote_host());
+        entry.wire_id().is_some_and(|wire_id| {
+            self.pending_removals
+                .iter()
+                .any(|(host, id)| id == wire_id && self.daemon_of(host.as_deref()) == daemon)
+        })
+    }
+
+    fn daemon_of(&self, host: Option<&str>) -> DaemonKey {
+        match self.daemons.get(&host.map(str::to_owned)) {
+            Some(instance) => DaemonKey::Instance(instance.clone()),
+            None => DaemonKey::Host(host.map(str::to_owned)),
+        }
+    }
+
     /// Asks the session backend what is actually running and replaces the
     /// entries with the answer. Cheap by design (one listing per host), so it
     /// is safe to call after every action; observers are notified once it lands.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let lifecycle = self.lifecycle.clone();
+        self.refresh_ticket += 1;
+        let ticket = self.refresh_ticket;
         self.refresh_task = cx.spawn(async move |this, cx| {
             // Blocking: drives the session backend and reads sqlite.
             let reconciled = cx
@@ -255,6 +398,12 @@ impl AdeWorkspaceStore {
                 .await;
 
             this.update(cx, |this, cx| {
+                // Something has happened since this pass listed, so its answer
+                // is a description of a world that is gone.
+                if this.refresh_ticket != ticket {
+                    return;
+                }
+
                 match reconciled {
                     Ok(reconciled) => {
                         this.error = None;
@@ -267,7 +416,12 @@ impl AdeWorkspaceStore {
                                 SharedString::from(format!("host {host}: {message}"))
                             })
                             .collect();
-                        this.entries = reconciled.entries;
+                        this.daemons = reconciled.daemons;
+                        this.entries = reconciled
+                            .entries
+                            .into_iter()
+                            .filter(|entry| !this.removal_pending(entry))
+                            .collect();
                         // A title outlives its watcher — the session runs on in
                         // the daemon with every window closed — but not its
                         // session: a workspace whose session is gone reads by
@@ -276,10 +430,15 @@ impl AdeWorkspaceStore {
                         // claimed about the session.
                         let entries = &this.entries;
                         this.session_titles.retain(|id, _| {
-                            entries.iter().any(|(workspace, state)| {
-                                &workspace.id == id
-                                    && matches!(state, SessionState::Alive | SessionState::Unknown)
-                            })
+                            entries.iter().filter_map(WorkspaceEntry::persisted).any(
+                                |(workspace, state)| {
+                                    &workspace.id == id
+                                        && matches!(
+                                            state,
+                                            SessionState::Alive | SessionState::Unknown
+                                        )
+                                },
+                            )
                         });
                     }
                     Err(error) => this.error = Some(format!("{error:#}").into()),

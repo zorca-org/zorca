@@ -12,9 +12,9 @@ use editor::{
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, DismissEvent, Entity, EventEmitter, ExternalPaths,
-    FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton, MouseDownEvent,
-    Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription, Task, TaskExt,
-    WeakEntity, actions, anchored, deferred, div,
+    FocusHandle, Focusable, Font, Global, KeyContext, KeyDownEvent, Keystroke, MouseButton,
+    MouseDownEvent, Pixels, Point as GpuiPoint, Render, ScrollWheelEvent, Styled, Subscription,
+    Task, TaskExt, WeakEntity, Window, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -106,6 +106,36 @@ actions!(
 #[action(namespace = terminal)]
 pub struct RenameTerminal;
 
+type CloneSessionTerminalHook = Arc<
+    dyn Fn(
+            WeakEntity<Workspace>,
+            &mut Window,
+            &mut App,
+        ) -> Option<Task<Option<Entity<TerminalView>>>>
+        + Send
+        + Sync,
+>;
+
+struct CloneSessionTerminal(CloneSessionTerminalHook);
+
+impl Global for CloneSessionTerminal {}
+
+/// Lets the owner of a workspace's centre pane answer a split on one of its
+/// session terminals with a fresh session terminal instead of a local clone.
+pub fn on_clone_session_terminal(
+    cx: &mut App,
+    hook: impl Fn(
+        WeakEntity<Workspace>,
+        &mut Window,
+        &mut App,
+    ) -> Option<Task<Option<Entity<TerminalView>>>>
+    + Send
+    + Sync
+    + 'static,
+) {
+    cx.set_global(CloneSessionTerminal(Arc::new(hook)));
+}
+
 pub fn init(cx: &mut App) {
     terminal_panel::init(cx);
 
@@ -150,6 +180,14 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
+    /// Runs when the pointer settles on the terminal, and on every keystroke.
+    /// Lets a host follow the active view without the view knowing what for.
+    /// The `bool` is `true` when the claim is hover-born, `false` when it is
+    /// a keystroke or focus claim.
+    hover_enter_callback: Option<Rc<dyn Fn(&mut Context<TerminalView>, bool)>>,
+    /// Delays [`Self::hover_enter_callback`] until the pointer rests; a
+    /// pass-through drops it on hover exit.
+    hover_claim_task: Task<()>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
     workspace_id: Option<WorkspaceId>,
@@ -315,6 +353,8 @@ impl TerminalView {
             scroll_handle,
             needs_serialize: false,
             custom_title: None,
+            hover_enter_callback: None,
+            hover_claim_task: Task::ready(()),
             ime_state: None,
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
@@ -440,6 +480,13 @@ impl TerminalView {
 
     pub fn custom_title(&self) -> Option<&str> {
         self.custom_title.as_deref()
+    }
+
+    pub fn set_hover_enter_callback(
+        &mut self,
+        callback: impl Fn(&mut Context<Self>, bool) + 'static,
+    ) {
+        self.hover_enter_callback = Some(Rc::new(callback));
     }
 
     pub fn set_custom_title(&mut self, label: Option<String>, cx: &mut Context<Self>) {
@@ -1302,6 +1349,14 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        // Typing outranks a resting pointer: another window's hover claim can
+        // take the pty size while this view keeps focus; take it back so the
+        // echo lands where the user sees the cursor. Repeat claims are no-ops
+        // daemon-side.
+        if let Some(callback) = self.hover_enter_callback.clone() {
+            callback(cx, false);
+        }
+
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
@@ -1384,6 +1439,21 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::rerun_task))
             .on_action(cx.listener(TerminalView::rename_terminal))
             .on_key_down(cx.listener(Self::key_down))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                // Settle before firing: with two client windows on one desktop
+                // a mouse pass across a window is a hover too, and an instant
+                // claim would flip the shared pty's size on every transit.
+                if *hovered && let Some(callback) = this.hover_enter_callback.clone() {
+                    this.hover_claim_task = cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(300))
+                            .await;
+                        this.update(cx, |_, cx| callback(cx, true)).ok();
+                    });
+                } else if !*hovered {
+                    this.hover_claim_task = Task::ready(());
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1768,6 +1838,21 @@ impl Item for TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
+        // A session terminal's split must be another session terminal: a local
+        // clone has no session id, so the layout capture drops it and no other
+        // client ever sees the pane.
+        if self
+            .terminal
+            .read(cx)
+            .task()
+            .is_some_and(|task| task.spawned_task.id.is_ade_session())
+            && let Some(hook) = cx
+                .try_global::<CloneSessionTerminal>()
+                .map(|hook| hook.0.clone())
+            && let Some(task) = hook(self.workspace.clone(), window, cx)
+        {
+            return task;
+        }
         let Ok(terminal) = self.project.update(cx, |project, cx| {
             let cwd = project
                 .active_project_directory(cx)

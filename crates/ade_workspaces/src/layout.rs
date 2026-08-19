@@ -50,7 +50,7 @@ use crate::{
     WorkspaceLifecycleService,
     terminal_pane::{create_session_terminal, open_session_terminal},
 };
-use ade_session::{LayoutDoc, LayoutNode, SplitDir, Tab};
+use ade_session::{LayoutDoc, LayoutNode, SplitDir, Tab, proto};
 use anyhow::Result;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, AsyncWindowContext, Axis, Context, Entity, EntityId,
@@ -133,6 +133,7 @@ fn is_running_terminal(item: &dyn ItemHandle, cx: &App) -> bool {
 /// `cx.propagate()`, so a plain Zed window keeps getting a plain shell.
 pub(crate) fn init(cx: &mut App) {
     terminal_panel::on_add_center_terminal(cx, open_new_session_terminal);
+    terminal_view::on_clone_session_terminal(cx, clone_split_session_terminal);
     cx.observe_new(|zed_workspace: &mut Workspace, _, _| {
         // Both actions, because ZOrca is terminal-first and `NewTerminal`
         // already opens in the centre (`TerminalPanel::new_terminal`) — two
@@ -256,6 +257,7 @@ fn open_new_session_terminal_at(
         })
         .unwrap_or_else(|| ade_workspace.repository_path.clone());
     let lifecycle = crate::lifecycle_service(cx);
+    let view_id = new_view_id();
     let pane = zed_workspace.active_pane().downgrade();
     let zed_workspace = zed_workspace.weak_handle();
     // Weak across the await: a strong handle would keep the sync alive past the
@@ -269,8 +271,13 @@ fn open_new_session_terminal_at(
                 let working_directory = working_directory.clone();
                 // Blocking: creating the session and resolving its argv are two
                 // round trips to the backend.
+                let view_id = view_id.clone();
                 async move {
-                    lifecycle.create_session_in_workspace(&ade_workspace, &working_directory)
+                    lifecycle.create_session_in_workspace(
+                        &ade_workspace,
+                        &working_directory,
+                        &view_id,
+                    )
                 }
             })
             .await;
@@ -301,6 +308,7 @@ fn open_new_session_terminal_at(
             &ade_workspace,
             cwd,
             argv,
+            &view_id,
             None,
             cx,
         )
@@ -330,6 +338,85 @@ fn open_new_session_terminal_at(
         .log_err();
 
         Ok(terminal_view.read_with(cx, |terminal_view, _| terminal_view.terminal().downgrade()))
+    }))
+}
+
+/// Answers a split on a session terminal with a terminal on a *new* session,
+/// or `None` in a window ADE does not own — which falls back to a local clone.
+///
+/// Nothing here touches the layout or the session map: the split flow adds the
+/// returned view to the new pane, `ItemAdded` records its session, and the
+/// window's own capture pushes the new arrangement.
+fn clone_split_session_terminal(
+    zed_workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Task<Option<Entity<TerminalView>>>> {
+    // Runs inside the Workspace's own update (`split_and_clone` holds the
+    // lease), so the Workspace cannot be read here — reads of it wait for the
+    // task. A registered sync implies `ade_owns_layout`: ownership is set
+    // before the sync and is permanent.
+    let strong = zed_workspace.upgrade()?;
+    let sync = AdeLayouts::sync_for(strong.entity_id(), cx)?;
+    let ade_workspace = sync.read(cx).ade_workspace.clone();
+    let lifecycle = crate::lifecycle_service(cx);
+    let view_id = new_view_id();
+    Some(window.spawn(cx, async move |cx| {
+        let working_directory = zed_workspace
+            .read_with(cx, |zed_workspace, cx| {
+                zed_workspace
+                    .project()
+                    .read(cx)
+                    .active_project_directory(cx)
+                    .map(|path| path.to_path_buf())
+            })
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ade_workspace.repository_path.clone());
+        let created = cx
+            .background_spawn({
+                let ade_workspace = ade_workspace.clone();
+                let working_directory = working_directory.clone();
+                let view_id = view_id.clone();
+                async move {
+                    lifecycle.create_session_in_workspace(
+                        &ade_workspace,
+                        &working_directory,
+                        &view_id,
+                    )
+                }
+            })
+            .await;
+        let (session_id, argv) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                log::error!(
+                    "creating a session for a split in ADE workspace {} failed: {error:#}",
+                    ade_workspace.id
+                );
+                // The split produces no tab either way; saying so is the
+                // difference between a failure and a gesture that did nothing.
+                let message = format!("{error:#}");
+                zed_workspace
+                    .update(cx, |zed_workspace, cx| {
+                        zed_workspace.show_error(message, cx)
+                    })
+                    .ok();
+                return None;
+            }
+        };
+        let cwd = (!ade_workspace.is_remote()).then_some(working_directory);
+        create_session_terminal(
+            &zed_workspace,
+            &session_id,
+            &ade_workspace,
+            cwd,
+            argv,
+            &view_id,
+            cx,
+        )
+        .await
+        .log_err()
     }))
 }
 
@@ -669,6 +756,34 @@ fn render_layout_if_unchanged(
                 });
                 false
             });
+            // **A render must not orphan a live session.** A running attach the
+            // document does not name is the tab the user just opened, not one
+            // somebody closed: the write that would tell the daemon about it is
+            // still debounced, and the rebuild below drops old panes through
+            // `force_remove_pane`, which emits no `ItemRemoved` — so the tab
+            // would vanish, nothing would kill the session, and the only handle
+            // on that process would be gone. It is carried into the new tree
+            // instead, and the capture this render schedules puts it in the
+            // document. A session that really did end is not carried: its
+            // attach has exited, so the terminal is no longer running.
+            for terminal in std::mem::take(&mut reusable_terminals)
+                .into_values()
+                .flatten()
+            {
+                if !is_running_terminal(terminal.as_ref(), cx) {
+                    continue;
+                }
+                let Some(source) = zed_workspace.pane_for(terminal.as_ref()) else {
+                    continue;
+                };
+                let terminal_id = terminal.item_id();
+                active_pane.update(cx, |pane, cx| {
+                    pane.add_item(terminal, false, false, None, window, cx)
+                });
+                source.update(cx, |pane, cx| {
+                    pane.remove_item(terminal_id, false, false, window, cx)
+                });
+            }
             let unused = created
                 .into_iter()
                 .filter(|created| !installed.iter().any(|installed| installed == created))
@@ -702,7 +817,7 @@ fn render_layout_if_unchanged(
         // host's, set when it was created.
         let cwd = (!ade_workspace.is_remote()).then(|| ade_workspace.repository_path.clone());
         for (placeholder, session_id) in pending_terminals {
-            if let Some(argv) = argvs.get(&session_id) {
+            if let Some((argv, view_id)) = argvs.get(&session_id) {
                 let placeholder_is_open = zed_workspace
                     .read_with(cx, |zed_workspace, _| {
                         zed_workspace.pane_for(&placeholder).is_some()
@@ -717,6 +832,7 @@ fn render_layout_if_unchanged(
                     let ade_workspace = ade_workspace.clone();
                     let cwd = cwd.clone();
                     let argv = argv.clone();
+                    let view_id = view_id.clone();
                     async move |cx| {
                         let terminal_view = create_session_terminal(
                             &zed_workspace,
@@ -724,6 +840,7 @@ fn render_layout_if_unchanged(
                             &ade_workspace,
                             cwd,
                             argv,
+                            &view_id,
                             cx,
                         )
                         .await
@@ -767,7 +884,15 @@ fn activate_layout_tabs(
     }
 }
 
-/// One attach argv per session, skipping the ones the backend refuses.
+/// A fresh id for one terminal view, minted per view lifetime and never
+/// reused: a focus claim naming a view that is gone can then only be inert,
+/// never bound to whatever took its place.
+fn new_view_id() -> String {
+    db::uuid::Uuid::new_v4().to_string()
+}
+
+/// One attach argv — and the view id baked into it — per session, skipping the
+/// ones the backend refuses.
 ///
 /// Blocking, so callers run it on the background executor. A session the
 /// backend will not attach to is left out rather than failing the whole render:
@@ -776,12 +901,15 @@ fn attach_argvs(
     lifecycle: &WorkspaceLifecycleService,
     ade_workspace: &AdeWorkspace,
     sessions: &[String],
-) -> HashMap<String, Vec<String>> {
+) -> HashMap<String, (Vec<String>, String)> {
     let mut argvs = HashMap::with_capacity(sessions.len());
     for session in sessions {
-        match lifecycle.attach_session_command(ade_workspace, session) {
+        // One view id per terminal about to be built, minted here because this
+        // is where the argv that carries it is made.
+        let view_id = new_view_id();
+        match lifecycle.attach_session_command(ade_workspace, session, &view_id) {
             Ok(argv) => {
-                argvs.insert(session.clone(), argv);
+                argvs.insert(session.clone(), (argv, view_id));
             }
             Err(error) => {
                 log::warn!("cannot attach to session {session}: {error:#}");
@@ -1243,8 +1371,13 @@ impl LayoutSync {
     }
 
     /// The workspace this window is syncing, as the daemon names it.
-    pub fn daemon_workspace_id(&self) -> String {
-        self.ade_workspace.daemon_workspace_id()
+    ///
+    /// A sync exists only for a workspace whose record was opened, so the id is
+    /// always there. The empty string stands in for the impossible case: it
+    /// matches no workspace, so every comparison below reads "not this one"
+    /// rather than routing a broadcast into the wrong window.
+    pub fn daemon_workspace_id(&self) -> &str {
+        self.ade_workspace.daemon_workspace_id().unwrap_or_default()
     }
 
     /// Re-arms the debounce. Called on every mutation; only the last one in a
@@ -1282,6 +1415,8 @@ impl LayoutSync {
         self.rev = rev;
         let lifecycle = self.lifecycle.clone();
         let ade_workspace = self.ade_workspace.clone();
+        let remote_host = self.ade_workspace.remote_host.clone();
+        let workspace_id = self.daemon_workspace_id().to_owned();
         let stored = layout;
         cx.spawn(async move |this, cx| {
             let outcome = cx
@@ -1291,6 +1426,20 @@ impl LayoutSync {
                 })
                 .await;
             if let Err(error) = outcome {
+                // A workspace the daemon does not have is not a race to
+                // re-read: it was killed, and a sync that missed the removal
+                // would refetch forever and recreate the record with its next
+                // push. Torn down through the same path the broadcast takes,
+                // so the window's ownership and binding go with it. Every other
+                // refusal keeps the re-read.
+                if crate::refusal_code(&error) == Some(proto::error_code::NOT_FOUND) {
+                    log::info!(
+                        "layout rev {rev} for workspace {workspace_id} was refused: the daemon \
+                         has no such workspace, so this window stops syncing it"
+                    );
+                    cx.update(|cx| AdeLayouts::forget(remote_host.as_deref(), &workspace_id, cx));
+                    return;
+                }
                 this.update(cx, |this, cx| {
                     if this.rev == rev && this.known == stored {
                         this.rev = previous_rev;
@@ -1402,7 +1551,7 @@ impl LayoutSync {
                     } else {
                         this.on_layout_event(
                             &LayoutEvent {
-                                workspace_id: this.ade_workspace.daemon_workspace_id(),
+                                workspace_id: this.daemon_workspace_id().to_owned(),
                                 layout,
                                 rev,
                             },
@@ -1449,7 +1598,7 @@ impl LayoutSync {
 
     /// Applies one broadcast layout, if it is news. See [`broadcast_action`].
     pub fn on_layout_event(&mut self, event: &LayoutEvent, cx: &mut Context<Self>) {
-        let workspace_id = self.ade_workspace.daemon_workspace_id();
+        let workspace_id = self.daemon_workspace_id().to_owned();
         if broadcast_action(&workspace_id, self.rev, event) == Broadcast::Ignore {
             return;
         }
@@ -1475,7 +1624,7 @@ impl LayoutSync {
     /// backwards. The window still owns the same workspace; only its revision
     /// history was replaced while the event stream was disconnected.
     fn on_workspace_reset(&mut self, event: &LayoutEvent, cx: &mut Context<Self>) {
-        if event.workspace_id != self.ade_workspace.daemon_workspace_id() {
+        if event.workspace_id != self.daemon_workspace_id() {
             return;
         }
         self.pending = None;
@@ -1594,7 +1743,8 @@ impl LayoutSync {
 #[derive(Default)]
 pub struct AdeLayouts {
     syncs: HashMap<EntityId, Entity<LayoutSync>>,
-    /// The one reader of the merged layout stream, started with the first sync.
+    /// The one reader of the merged layout stream — see
+    /// [`start_event_stream`].
     _stream: Option<Task<()>>,
 }
 
@@ -1617,6 +1767,10 @@ impl AdeLayouts {
         window: &mut Window,
         cx: &mut App,
     ) {
+        // The retry for an init-time subscribe failure: without the stream no
+        // removal is ever consumed, and the `is_none` guard makes every later
+        // install free.
+        start_event_stream(cx);
         let sync = LayoutSync::new(zed_workspace, ade_workspace, layout, rev, window, cx);
         let id = zed_workspace.entity_id();
         // The window going away is what ends its sync — held here rather than
@@ -1642,11 +1796,6 @@ impl AdeLayouts {
             sync.schedule(cx);
         });
         cx.default_global::<Self>().syncs.insert(id, sync);
-        // Windows come and go; the stream is opened once and outlives them.
-        if cx.default_global::<Self>()._stream.is_none() {
-            let stream = Self::stream(cx);
-            cx.default_global::<Self>()._stream = stream;
-        }
     }
 
     /// Feeds every host's accepted layouts — and every killed workspace — to
@@ -1695,9 +1844,11 @@ impl AdeLayouts {
         ade_workspace: &AdeWorkspace,
         cx: &App,
     ) -> bool {
-        Self::sync_for(zed_workspace, cx).is_some_and(|sync| {
-            sync.read(cx).daemon_workspace_id() == ade_workspace.daemon_workspace_id()
-        })
+        let Some(workspace_id) = ade_workspace.daemon_workspace_id() else {
+            return false;
+        };
+        Self::sync_for(zed_workspace, cx)
+            .is_some_and(|sync| sync.read(cx).daemon_workspace_id() == workspace_id)
     }
 
     pub(crate) fn forget_window(zed_workspace: EntityId, cx: &mut App) {
@@ -1724,11 +1875,14 @@ impl AdeLayouts {
         let Some(sync) = Self::sync_for(zed_workspace, cx) else {
             return false;
         };
-        if sync.read(cx).daemon_workspace_id() != ade_workspace.daemon_workspace_id() {
+        let Some(workspace_id) = ade_workspace.daemon_workspace_id() else {
+            return false;
+        };
+        if sync.read(cx).daemon_workspace_id() != workspace_id {
             return false;
         }
         let event = LayoutEvent {
-            workspace_id: ade_workspace.daemon_workspace_id(),
+            workspace_id: workspace_id.to_owned(),
             layout: stored.layout.clone(),
             rev: stored.rev,
         };
@@ -1801,11 +1955,29 @@ impl AdeLayouts {
                     .log_err();
             });
         }
-        // The row is the other view of the same fact. Only if something has
-        // already brought the store up: a broadcast must not be what starts it.
+        // The runtime entry and the row are the other views of the same fact.
+        // Only if something has already brought the store up: a broadcast must
+        // not be what starts it.
         if let Some(store) = crate::AdeWorkspaceStore::try_global(cx) {
-            store.update(cx, |store, cx| store.refresh(cx));
+            store.update(cx, |store, cx| {
+                store.forget_workspace(remote_host, workspace_id, cx)
+            });
         }
+    }
+}
+
+/// Starts the one reader of the merged layout stream, which is also how a
+/// removal reaches this client.
+///
+/// **At ADE init, not at the first [`AdeLayouts::install`].** A process with
+/// only the sidebar open has no sync installed, and starting the reader with
+/// the first one would drop every removal until a window opened a workspace —
+/// exactly the ghost row this is here to prevent. An event with no matching
+/// sync is a no-op.
+pub(crate) fn start_event_stream(cx: &mut App) {
+    if cx.default_global::<AdeLayouts>()._stream.is_none() {
+        let stream = AdeLayouts::stream(cx);
+        cx.default_global::<AdeLayouts>()._stream = stream;
     }
 }
 
@@ -2203,9 +2375,24 @@ mod tests {
                 .insert(workspace_id.to_owned(), WorkspaceLayout { layout, rev });
         }
 
+        /// The sessions the backend will admit to having, so a push naming one
+        /// is accepted rather than refused.
+        fn declare_live_sessions(&self, sessions: &[&str]) {
+            *self.live_sessions.lock().unwrap() =
+                sessions.iter().map(|id| (*id).to_owned()).collect();
+        }
+
         /// Stands in for another client writing to the same workspace.
         fn write_behind_the_clients_back(&self, workspace_id: &str, layout: LayoutDoc, rev: u64) {
             self.seed_layout(workspace_id, layout, rev);
+        }
+
+        fn stored_layout(&self, workspace_id: &str) -> Option<LayoutDoc> {
+            self.layouts
+                .lock()
+                .unwrap()
+                .get(workspace_id)
+                .map(|stored| stored.layout.clone())
         }
 
         fn stored_rev(&self, workspace_id: &str) -> Option<u64> {
@@ -2246,6 +2433,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        /// Unreachable here too, rather than the default empty listing: an
+        /// authoritative "this host holds nothing" would have a reconcile sweep
+        /// the rows these tests set up, and the sweep is not what they are
+        /// about.
+        fn list_workspaces(&self) -> anyhow::Result<crate::WorkspaceListing> {
+            bail!("no route to the host");
+        }
+
         fn exists(&self, _id: &SeamSessionId) -> anyhow::Result<bool> {
             Ok(false)
         }
@@ -2258,7 +2453,7 @@ mod tests {
             bail!("no route to the host");
         }
 
-        fn attach_session(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        fn attach_session(&self, session_id: &str, _view_id: &str) -> anyhow::Result<Vec<String>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2318,9 +2513,14 @@ mod tests {
                 .unwrap()
                 .push(format!("update_layout:{workspace_id}@{rev}"));
             let mut layouts = self.layouts.lock().unwrap();
-            let stored = layouts
-                .get_mut(workspace_id)
-                .with_context(|| format!("no such workspace {workspace_id}"))?;
+            // Typed, like the daemon's: "there is no such workspace" is the one
+            // refusal a sync must not treat as a race to re-read.
+            let stored = layouts.get_mut(workspace_id).ok_or_else(|| {
+                anyhow::Error::new(crate::DaemonRefusal {
+                    code: proto::error_code::NOT_FOUND.to_owned(),
+                    message: format!("no such workspace {workspace_id}"),
+                })
+            })?;
             if rev <= stored.rev {
                 bail!(
                     "stale layout rev {rev} for workspace {workspace_id}, which is at {}",
@@ -2400,8 +2600,24 @@ mod tests {
         let project = test_project(cx).await;
         let (workspace, cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
-        let ade_workspace = AdeWorkspace::new("Vector DB spike", "zed", ROOT);
-        (workspace, ade_workspace, cx.clone())
+        (workspace, linked_workspace(), cx.clone())
+    }
+
+    /// A workspace with a daemon record, which is the only kind that can be
+    /// synced: the id is what a layout is stored and broadcast under.
+    fn linked_workspace() -> AdeWorkspace {
+        let mut ade_workspace = AdeWorkspace::new("Vector DB spike", "zed", ROOT);
+        ade_workspace.terminal_session_id = Some(WORKSPACE_ID.to_owned());
+        ade_workspace
+    }
+
+    const WORKSPACE_ID: &str = "ws-4c1f9a";
+
+    fn daemon_id(ade_workspace: &AdeWorkspace) -> String {
+        ade_workspace
+            .daemon_workspace_id()
+            .expect("a synced workspace has a daemon record")
+            .to_owned()
     }
 
     /// The same window inside the [`MultiWorkspace`] that renders it.
@@ -2418,8 +2634,7 @@ mod tests {
         let (multi_workspace, cx) = cx
             .add_window_view(|window, cx| workspace::MultiWorkspace::test_new(project, window, cx));
         let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
-        let ade_workspace = AdeWorkspace::new("Vector DB spike", "zed", ROOT);
-        (workspace, ade_workspace, cx.clone())
+        (workspace, linked_workspace(), cx.clone())
     }
 
     async fn render(
@@ -2599,6 +2814,35 @@ mod tests {
         assert!(!backend.killed_anything(), "{:?}", backend.calls());
     }
 
+    /// **A subscribe that failed at init must be retried.** The stream is the
+    /// only path a removal reaches this client on, and starting it exactly
+    /// once turned a transient init-time failure — the local pump refusing to
+    /// spawn — into a process that never hears that a workspace was killed.
+    #[gpui::test]
+    async fn test_installing_a_sync_retries_the_event_stream(cx: &mut TestAppContext) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        install_lifecycle("test_install_retries_the_stream", &mut cx).await;
+        cx.update(|_, cx| {
+            assert!(
+                cx.default_global::<AdeLayouts>()._stream.is_none(),
+                "nothing has started the stream yet"
+            )
+        });
+
+        let document = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
+        render(&workspace, &ade_workspace, document.clone(), &mut cx).await;
+        cx.update(|window, cx| {
+            AdeLayouts::install(&workspace, ade_workspace.clone(), document, 1, window, cx)
+        });
+
+        cx.update(|_, cx| {
+            assert!(
+                cx.default_global::<AdeLayouts>()._stream.is_some(),
+                "installing a sync must try again"
+            )
+        });
+    }
+
     /// Closing a tab that is *not* a terminal is layout-only: an editor tab, or
     /// the placeholder standing in for a session that would not attach. Neither
     /// is a session this window owns, so neither may end one — the placeholder
@@ -2737,7 +2981,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_terminal_scrub_keeps_local_closes", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let stored = LayoutDoc::new(leaf(
             vec![
                 editor(&path("a.rs")),
@@ -2823,7 +3067,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_terminal_scrub_across_panes", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(split(
             SplitDir::Horizontal,
             0.5,
@@ -2922,7 +3166,7 @@ mod tests {
     async fn test_closing_the_last_tab_persists_an_empty_layout(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_closing_the_last_tab", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let stored = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
         backend.seed_layout(&workspace_id, stored.clone(), 1);
         render(&workspace, &ade_workspace, stored.clone(), &mut cx).await;
@@ -2958,7 +3202,7 @@ mod tests {
     async fn test_rapid_layout_broadcasts_finish_on_the_latest_revision(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let _backend = install_lifecycle("test_rapid_layout_broadcasts", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
         render(&workspace, &ade_workspace, initial.clone(), &mut cx).await;
         cx.update(|window, cx| {
@@ -3002,7 +3246,7 @@ mod tests {
     async fn test_a_local_close_during_a_remote_render_is_not_reopened(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_close_during_remote_render", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(leaf(
             vec![editor(&path("a.rs")), editor(&path("b.rs"))],
             0,
@@ -3136,7 +3380,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_change_during_layout_write", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(split(
             SplitDir::Horizontal,
             0.5,
@@ -3281,7 +3525,7 @@ mod tests {
     async fn test_a_rejected_push_does_not_rebuild_the_window(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_a_rejected_push_keeps_the_tabs", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
 
         // A terminal pane whose session the backend does not have — no
         // `live_sessions` were declared — beside an editor.
@@ -3348,7 +3592,7 @@ mod tests {
     async fn test_a_push_that_lost_a_race_still_re_renders(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_a_lost_race_still_re_renders", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
 
         let stored = LayoutDoc::new(leaf(vec![editor(&path("b.rs"))], 0, true));
         backend.seed_layout(&workspace_id, stored.clone(), 1);
@@ -3395,7 +3639,7 @@ mod tests {
     async fn test_a_tab_switch_echo_at_a_newer_revision_does_not_reattach(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_a_tab_switch_echo_at_newer_rev", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
 
         let stored = LayoutDoc::new(leaf(
             vec![editor(&path("a.rs")), editor(&path("b.rs"))],
@@ -3446,7 +3690,7 @@ mod tests {
     async fn test_another_clients_tab_switch_does_not_rebuild_the_pane(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let _backend = install_lifecycle("test_remote_tab_switch_keeps_pane", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let stored = LayoutDoc::new(leaf(
             vec![editor(&path("a.rs")), editor(&path("b.rs"))],
             0,
@@ -3491,7 +3735,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let _backend = install_lifecycle("test_switch_then_structural_revision", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(leaf(
             vec![editor(&path("a.rs")), editor(&path("b.rs"))],
             0,
@@ -3555,7 +3799,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_catch_up_keeps_local_close", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(leaf(
             vec![editor(&path("a.rs")), editor(&path("b.rs"))],
             0,
@@ -3630,7 +3874,7 @@ mod tests {
     ) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_open_file_before_broadcast", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
         let initial = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
         backend.seed_layout(&workspace_id, initial.clone(), 1);
         render(&workspace, &ade_workspace, initial.clone(), &mut cx).await;
@@ -3685,7 +3929,7 @@ mod tests {
     async fn test_a_project_diff_tab_survives_its_debounced_layout_echo(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
         let backend = install_lifecycle("test_a_project_diff_survives_its_echo", &mut cx).await;
-        let workspace_id = ade_workspace.daemon_workspace_id();
+        let workspace_id = daemon_id(&ade_workspace);
 
         let stored = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
         backend.seed_layout(&workspace_id, stored.clone(), 1);
@@ -3752,6 +3996,81 @@ mod tests {
         );
     }
 
+    /// A push the daemon answers `not_found` is not a race to re-read: the
+    /// workspace is gone. A sync that missed the removal refetched forever, and
+    /// its next push would have recreated the record the kill deleted — so it
+    /// is torn down through the same path the broadcast takes.
+    #[gpui::test(iterations = 10)]
+    async fn test_a_push_into_a_workspace_the_daemon_lost_stops_the_sync(cx: &mut TestAppContext) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let _backend = install_lifecycle("test_push_into_a_lost_workspace", &mut cx).await;
+        let document = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
+        render(&workspace, &ade_workspace, document, &mut cx).await;
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_ade_owns_layout(window, cx)
+            });
+            // Installed at a layout this window does not show, so the push
+            // below has something to send. The backend holds no layout for this
+            // workspace at all, which is what a killed one looks like.
+            AdeLayouts::install(
+                &workspace,
+                ade_workspace.clone(),
+                LayoutDoc::new(leaf(vec![editor(&path("b.rs"))], 0, true)),
+                1,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let sync = cx
+            .update(|_, cx| AdeLayouts::sync_for(workspace.entity_id(), cx))
+            .expect("the window is syncing");
+        sync.update(&mut cx, |sync, cx| sync.push(cx));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            assert!(
+                cx.default_global::<AdeLayouts>().syncs.is_empty(),
+                "a workspace the daemon does not have leaves nothing to sync"
+            )
+        });
+        assert!(
+            !workspace.read_with(&mut cx, |workspace, _| workspace.ade_owns_layout()),
+            "and the window goes back to ordinary terminal ownership"
+        );
+    }
+
+    /// A split whose session could not be created says so. It used to log and
+    /// return nothing, which on screen is a gesture that did nothing at all.
+    #[gpui::test]
+    async fn test_a_failed_split_surfaces_instead_of_doing_nothing(cx: &mut TestAppContext) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let _backend = install_lifecycle("test_failed_split_surfaces", &mut cx).await;
+        let document = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
+        render(&workspace, &ade_workspace, document.clone(), &mut cx).await;
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_ade_owns_layout(window, cx)
+            });
+            AdeLayouts::install(&workspace, ade_workspace.clone(), document, 1, window, cx)
+        });
+        cx.run_until_parked();
+
+        let split = cx
+            .update(|window, cx| clone_split_session_terminal(workspace.downgrade(), window, cx))
+            .expect("ADE owns this window, so the split is its to answer");
+        assert!(split.await.is_none(), "the failed create makes no tab");
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(&mut cx, |workspace, _| workspace.notification_ids().len()),
+            1,
+            "the failure reaches the user"
+        );
+    }
+
     /// A workspace somebody else killed: this window stops syncing it, so no
     /// later push can write panes back into a record the daemon has deleted.
     #[gpui::test(iterations = 10)]
@@ -3802,7 +4121,7 @@ mod tests {
             AdeLayouts::handle_event(
                 WorkspaceEvent::Removed {
                     remote_host: Some("h1".to_owned()),
-                    workspace_id: ade_workspace.daemon_workspace_id(),
+                    workspace_id: daemon_id(&ade_workspace),
                 },
                 cx,
             )
@@ -3813,7 +4132,7 @@ mod tests {
             "another host's removal must not release this window"
         );
 
-        cx.update(|_, cx| AdeLayouts::forget(None, &ade_workspace.daemon_workspace_id(), cx));
+        cx.update(|_, cx| AdeLayouts::forget(None, &daemon_id(&ade_workspace), cx));
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert!(
@@ -3838,6 +4157,47 @@ mod tests {
         // Being told a workspace died is not a reason to kill anything: the
         // kill already happened, on the client whose control said so.
         assert!(!backend.killed_anything(), "{:?}", backend.calls());
+    }
+
+    /// **A removal with no window syncing anything.** The reader is started at
+    /// ADE init rather than at the first layout install, so a client that has
+    /// only the sidebar open still drops the row instead of leaving a ghost
+    /// until some later reconcile sweeps it.
+    #[gpui::test]
+    async fn test_a_removal_drops_the_row_with_no_window_open(cx: &mut TestAppContext) {
+        init_test(cx);
+        let registry =
+            crate::AdeWorkspaceRegistry::open_test_db("test_removal_without_a_window").await;
+        let service = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            Arc::new(UnreachableBackend::default()),
+        ));
+        let mut row = crate::AdeWorkspace::new("main", "zed", ROOT);
+        row.terminal_session_id = Some("ws-1".to_owned());
+        service
+            .registry()
+            .create_workspace(row.clone())
+            .await
+            .unwrap();
+        cx.update(|cx| {
+            cx.set_global(GlobalLifecycleService(service.clone()));
+            crate::AdeWorkspaceStore::global(cx);
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                cx.try_global::<AdeLayouts>()
+                    .is_none_or(|l| l.syncs.is_empty())
+            )
+        });
+
+        cx.update(|cx| AdeLayouts::forget(None, "ws-1", cx));
+        cx.run_until_parked();
+
+        assert!(
+            service.registry().list_workspaces().unwrap().is_empty(),
+            "the killed workspace's row goes with it"
+        );
     }
 
     #[gpui::test(iterations = 10)]
@@ -3865,7 +4225,7 @@ mod tests {
                 WorkspaceEvent::Reset {
                     remote_host: None,
                     event: LayoutEvent {
-                        workspace_id: ade_workspace.daemon_workspace_id(),
+                        workspace_id: daemon_id(&ade_workspace),
                         layout: reset.clone(),
                         rev: 1,
                     },
@@ -3972,6 +4332,107 @@ mod tests {
         assert!(!backend.killed_anything(), "{:?}", backend.calls());
     }
 
+    /// **A render must not orphan a live session.** The user opens a terminal,
+    /// the window pushes it, and then a revision that has not caught up with it
+    /// arrives. Rebuilding from that document used to drop the pane the attach
+    /// was in — and dropping a pane emits no `ItemRemoved`, so the tab went
+    /// without even the close that would have killed the session, leaving a
+    /// process nothing could reach and a terminal that flashed and vanished.
+    #[gpui::test]
+    async fn test_a_render_keeps_a_live_session_the_document_has_not_caught_up_with(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let backend = install_lifecycle("test_a_render_keeps_a_live_session", &mut cx).await;
+        let workspace_id = daemon_id(&ade_workspace);
+        backend.declare_live_sessions(&["fresh-session"]);
+
+        let stored = LayoutDoc::new(leaf(vec![editor(&path("b.rs"))], 0, true));
+        backend.seed_layout(&workspace_id, stored.clone(), 1);
+        render(&workspace, &ade_workspace, stored.clone(), &mut cx).await;
+        cx.update(|window, cx| {
+            AdeLayouts::install(&workspace, ade_workspace.clone(), stored, 1, window, cx)
+        });
+        cx.run_until_parked();
+
+        // "New terminal": an attach running in a tab of this window, carrying
+        // its session on its spawn task exactly as `open_session_terminal`
+        // leaves it.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            terminal_panel::TerminalPanel::insert_test_task_terminal(
+                workspace,
+                session_task_id("fresh-session"),
+                window,
+                cx,
+            )
+        });
+        cx.executor().advance_clock(PUSH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert_eq!(
+            backend.stored_rev(&workspace_id),
+            Some(2),
+            "the new tab should have been pushed: {:?}",
+            backend.calls()
+        );
+
+        // Somebody else's arrangement, a revision on and still without this
+        // tab — the state every client is in until it sees the write above.
+        let theirs = LayoutDoc::new(leaf(vec![editor(&path("c.rs"))], 0, true));
+        backend.write_behind_the_clients_back(&workspace_id, theirs.clone(), 3);
+        cx.update(|_, cx| {
+            let sync = AdeLayouts::sync_for(workspace.entity_id(), cx).expect("the window syncs");
+            sync.update(cx, |sync, cx| {
+                sync.on_layout_event(
+                    &LayoutEvent {
+                        workspace_id: workspace_id.clone(),
+                        layout: theirs,
+                        rev: 3,
+                    },
+                    cx,
+                )
+            });
+        });
+        cx.run_until_parked();
+
+        let sessions = workspace.read_with(&mut cx, |workspace, cx| {
+            workspace
+                .panes()
+                .iter()
+                .flat_map(|pane| {
+                    pane.read(cx)
+                        .items()
+                        .filter_map(|item| session_of_item(item.as_ref(), cx))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            sessions,
+            vec!["fresh-session".to_owned()],
+            "a live attach the incoming document does not name must survive the rebuild"
+        );
+        // Dropping it would not even have been a close, so nothing was killed
+        // either way — the session would simply have been unreachable.
+        assert!(!backend.killed_anything(), "{:?}", backend.calls());
+
+        // And the capture that follows the render puts it back in the
+        // document, so the other client learns about it.
+        cx.executor().advance_clock(PUSH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let sessions_stored = backend
+            .stored_layout(&workspace_id)
+            .expect("the workspace still stores a layout")
+            .terminal_sessions();
+        assert_eq!(
+            sessions_stored
+                .iter()
+                .map(|id| id.0.clone())
+                .collect::<Vec<_>>(),
+            vec!["fresh-session".to_owned()],
+            "the render's own capture should have restored the tab to the document"
+        );
+    }
+
     #[gpui::test]
     async fn test_opening_a_file_keeps_the_session_tab(cx: &mut TestAppContext) {
         let (workspace, ade_workspace, mut cx) = test_window(cx).await;
@@ -4036,10 +4497,7 @@ mod tests {
                 .iter()
                 .filter(|call| call.starts_with("create_in:"))
                 .collect::<Vec<_>>(),
-            vec![&format!(
-                "create_in:{}",
-                ade_workspace.daemon_workspace_id()
-            )],
+            vec![&format!("create_in:{}", daemon_id(&ade_workspace))],
             "{:?}",
             backend.calls()
         );
@@ -4131,10 +4589,7 @@ mod tests {
                 .iter()
                 .filter(|call| call.starts_with("create_in:"))
                 .collect::<Vec<_>>(),
-            vec![&format!(
-                "create_in:{}",
-                ade_workspace.daemon_workspace_id()
-            )],
+            vec![&format!("create_in:{}", daemon_id(&ade_workspace))],
             "{:?}",
             backend.calls()
         );

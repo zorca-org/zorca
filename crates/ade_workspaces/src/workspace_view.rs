@@ -39,10 +39,7 @@
 use crate::{AdeWorkspace, WorkspaceId};
 use anyhow::{Context as _, Result, ensure};
 use gpui::{App, AsyncWindowContext, EntityId, Global, SharedString, WeakEntity};
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::Path};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -104,8 +101,6 @@ pub(crate) async fn ensure_repository_worktree(
 /// window that inherited one.
 struct BoundWorkspace {
     id: WorkspaceId,
-    repository_path: PathBuf,
-    remote_host: Option<String>,
 }
 
 #[derive(Default)]
@@ -125,21 +120,6 @@ pub(crate) fn clear_window_binding(zed_workspace: EntityId, cx: &mut App) {
     if cx.has_global::<BoundWorkspaces>() {
         cx.global_mut::<BoundWorkspaces>().0.remove(&zed_workspace);
     }
-}
-
-/// The bound ADE workspace, only when it is the exact worktree row the user
-/// acted on. One Zed workspace can expose several repository roots, so its last
-/// binding alone is not enough to select a destructive action safely.
-pub(crate) fn bound_workspace_for_worktree<'a>(
-    zed_workspace: EntityId,
-    repository_path: &Path,
-    remote_host: Option<&str>,
-    cx: &'a App,
-) -> Option<&'a WorkspaceId> {
-    let workspace = cx.try_global::<BoundWorkspaces>()?.0.get(&zed_workspace)?;
-    (workspace.repository_path == repository_path
-        && workspace.remote_host.as_deref() == remote_host)
-        .then_some(&workspace.id)
 }
 
 /// Binds the window to the workspace and puts its name in the header — the OS
@@ -193,8 +173,6 @@ pub(crate) fn name_window_after_workspace(
     let zed_workspace = zed_workspace.upgrade().context("the window is gone")?;
     let binding = BoundWorkspace {
         id: ade_workspace.id.clone(),
-        repository_path: ade_workspace.repository_path.clone(),
-        remote_host: ade_workspace.remote_host.clone(),
     };
     cx.update(|_, cx| {
         let entity_id = zed_workspace.entity_id();
@@ -309,46 +287,6 @@ mod tests {
         assert_eq!(
             cx.update(|_, cx| bound_workspace(workspace.entity_id(), cx).cloned()),
             Some(sibling.id.clone())
-        );
-    }
-
-    #[gpui::test]
-    async fn test_a_binding_only_targets_its_exact_worktree_and_host(cx: &mut TestAppContext) {
-        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
-        bind(&workspace, &ade_workspace, &mut cx)
-            .await
-            .expect("the workspace should bind");
-
-        assert_eq!(
-            cx.update(|_, cx| {
-                bound_workspace_for_worktree(workspace.entity_id(), Path::new(ROOT), None, cx)
-                    .cloned()
-            }),
-            Some(ade_workspace.id.clone())
-        );
-        assert!(
-            cx.update(|_, cx| {
-                bound_workspace_for_worktree(
-                    workspace.entity_id(),
-                    Path::new("/repos/sibling"),
-                    None,
-                    cx,
-                )
-                .is_none()
-            }),
-            "another root in the same Zed workspace must not inherit the destructive target"
-        );
-        assert!(
-            cx.update(|_, cx| {
-                bound_workspace_for_worktree(
-                    workspace.entity_id(),
-                    Path::new(ROOT),
-                    Some("other@build-box"),
-                    cx,
-                )
-                .is_none()
-            }),
-            "the same path on another destination must not inherit the destructive target"
         );
     }
 

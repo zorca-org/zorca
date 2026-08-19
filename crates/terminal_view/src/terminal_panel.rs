@@ -793,6 +793,43 @@ impl TerminalPanel {
         workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
     }
 
+    /// The same display-only terminal, tagged as a *running task* under
+    /// `task_id` — what a caller that reads a tab's session off its spawn task
+    /// needs in place of an attach it cannot run under the test scheduler.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_test_task_terminal(
+        workspace: &mut Workspace,
+        task_id: task::TaskId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<TerminalView> {
+        let terminal = cx.new(|cx| {
+            let mut terminal = terminal::TerminalBuilder::new_display_only(
+                terminal::terminal_settings::CursorShape::default(),
+                terminal::terminal_settings::AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                util::paths::PathStyle::local(),
+            )
+            .subscribe(cx);
+            terminal.set_running_task_for_test(task_id);
+            terminal
+        });
+        let view = cx.new(|cx| {
+            TerminalView::new(
+                terminal,
+                workspace.weak_handle(),
+                workspace.database_id(),
+                workspace.project().downgrade(),
+                window,
+                cx,
+            )
+        });
+        workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+        view
+    }
+
     /// Activates the centre-pane terminal opened for `terminal_id`, when one
     /// is still live. Returns false if no view carries that id, leaving the
     /// caller to decide whether to open one.
