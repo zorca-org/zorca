@@ -15,7 +15,7 @@ use anyhow::{Result, bail};
 use futures::io::{AsyncRead, AsyncWrite};
 
 use crate::framing::{ReadFrameError, bounded, bounded_debug, read_frame, write_frame};
-use crate::proto::{Frame, Hello, HelloAck, MAX_GENERATION, MIN_GENERATION};
+use crate::proto::{Frame, Hello, HelloAck};
 
 /// What a handshake that ends in EOF with nothing read most likely means.
 ///
@@ -63,23 +63,27 @@ where
     /// [`HelloAck`]. A [`Frame::Error`] reply is surfaced as an error; so is
     /// any other frame, since `Hello` must be answered before anything else.
     ///
-    /// The ack's `generation` is **verified** against this build's
-    /// `[MIN_GENERATION, MAX_GENERATION]`. The daemon selects it and this side
-    /// checks that it landed inside the client's own range (§3.1): a daemon
-    /// answering with a generation the client cannot speak is a failed
-    /// negotiation, and continuing on it would decode nonsense one frame later
-    /// instead of failing here with both ranges named. Everything else about
-    /// the ack — `degraded`, `capabilities`, `upgrade_ready` — is returned
-    /// as-is and remains the caller's policy.
+    /// The ack's `generation` is **verified against the range `hello` itself
+    /// announced**, not against the crate constants: a caller that pinned a
+    /// narrower range than this build can serve must be held to the range it
+    /// offered, or a daemon answering above it would be accepted. The daemon
+    /// selects, this side checks (§3.1); continuing on a generation the sender
+    /// did not offer would decode nonsense one frame later instead of failing
+    /// here with both ranges named.
+    ///
+    /// The selected generation is [`HelloAck::generation`] — every caller that
+    /// gates a frame on it reads it there. Everything else about the ack —
+    /// `degraded`, `capabilities`, `upgrade_ready` — is returned as-is and
+    /// remains the caller's policy.
     pub async fn handshake(&mut self, hello: Hello) -> Result<HelloAck> {
+        let (min, max) = (hello.min_generation, hello.max_generation);
         self.send(&Frame::Hello(hello)).await?;
         match self.recv().await? {
             Frame::HelloAck(ack) => {
-                if ack.generation < MIN_GENERATION || ack.generation > MAX_GENERATION {
+                if ack.generation < min || ack.generation > max {
                     bail!(
-                        "daemon {} selected protocol generation {}, outside this client's \
-                         supported range {MIN_GENERATION}..={MAX_GENERATION} (the daemon offers \
-                         {}..={})",
+                        "daemon {} selected protocol generation {}, outside the {min}..={max} \
+                         this connection offered (the daemon offers {}..={})",
                         bounded(&ack.daemon_version),
                         ack.generation,
                         ack.min_generation,

@@ -210,6 +210,12 @@ fn test_open_group_filter_ignores_runtime_ssh_fields() {
 }
 
 fn init_test(cx: &mut TestAppContext) {
+    // A test must never reach this machine's real daemon: the sidebar's flows
+    // spawn the proxy on their own, and a box with a live `~/.ade` would hand
+    // the test real workspaces — and a real pty under the test scheduler.
+    // SAFETY: nextest runs one test per process, and this bootstrap runs
+    // before any thread reads the environment.
+    unsafe { std::env::set_var(ade_workspaces::DAEMON_BIN_ENV, "/nonexistent/ade-daemon") };
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);

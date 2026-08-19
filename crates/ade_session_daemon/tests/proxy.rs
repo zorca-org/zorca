@@ -79,10 +79,36 @@ async fn reply_until<T>(
     }
 }
 
+/// A workspace to put sessions in: the daemon holds no record for an id it was
+/// never asked to create, and refuses a session naming one.
+async fn workspace(connection: &mut ChildConnection, root: &Path) -> String {
+    connection
+        .send(&Frame::CreateWorkspace {
+            root: root.display().to_string(),
+            name: Some("proxied".into()),
+            request_id: Some(6),
+            env: Vec::new(),
+            cols: None,
+            rows: None,
+        })
+        .await
+        .expect("sending CreateWorkspace");
+    reply_until(connection, "Workspace", |frame| match frame {
+        Frame::Workspace {
+            workspace,
+            request_id: Some(6),
+            ..
+        } => Some(workspace.id.clone()),
+        _ => None,
+    })
+    .await
+}
+
 async fn create(connection: &mut ChildConnection, cwd: &Path, command: &str) -> SessionInfo {
+    let workspace_id = workspace(connection, cwd).await;
     connection
         .send(&Frame::CreateSession {
-            workspace_id: "ws-proxy".into(),
+            workspace_id,
             cwd: cwd.display().to_string(),
             command: command.into(),
             env: Vec::new(),
@@ -99,6 +125,7 @@ async fn create(connection: &mut ChildConnection, cwd: &Path, command: &str) -> 
         Frame::Created {
             session,
             request_id,
+            ..
         } => {
             assert_eq!(*request_id, Some(7));
             Some(session.clone())
@@ -150,6 +177,7 @@ async fn attach_until(connection: &mut ChildConnection, id: &SessionId, needle: 
     connection
         .send(&Frame::Attach {
             session_id: id.clone(),
+            view_id: None,
             request_id: Some(21),
         })
         .await

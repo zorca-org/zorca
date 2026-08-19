@@ -188,6 +188,15 @@ impl SessionGrid {
         self.scanner.scroll_region = None;
     }
 
+    /// The screen's size, for the tests that check it against the pty's.
+    #[cfg(test)]
+    pub fn size(&self) -> (u16, u16) {
+        (
+            self.term.grid().columns() as u16,
+            self.term.grid().screen_lines() as u16,
+        )
+    }
+
     /// The bytes that reproduce this screen on a freshly opened terminal.
     ///
     /// Assumes a terminal at the grid's own size and otherwise at its defaults,

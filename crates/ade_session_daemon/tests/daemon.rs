@@ -104,9 +104,20 @@ async fn send_raw(stream: &mut UnixStream, payload: &[u8]) {
     stream.flush().await.expect("flushing a raw frame");
 }
 
-fn create_frame(cwd: &Path, command: &str, request_id: u64, scrollback: Option<u64>) -> Frame {
+/// The name the shared workspace every plain [`create`] puts its session in is
+/// made under. Sessions exist only inside a record now, so the helpers make one
+/// rather than naming an id out of thin air.
+const SHARED_WORKSPACE: &str = "ws-1";
+
+fn create_frame(
+    workspace_id: &str,
+    cwd: &Path,
+    command: &str,
+    request_id: u64,
+    scrollback: Option<u64>,
+) -> Frame {
     Frame::CreateSession {
-        workspace_id: "ws-1".into(),
+        workspace_id: workspace_id.to_owned(),
         cwd: cwd.display().to_string(),
         command: command.into(),
         env: vec![("ADE_TEST".into(), "1".into())],
@@ -119,6 +130,22 @@ fn create_frame(cwd: &Path, command: &str, request_id: u64, scrollback: Option<u
     }
 }
 
+/// This server's shared workspace, made on first use. Which record a session
+/// sits in is not what most of these tests are about, but it has to be a real
+/// one — the daemon refuses a session in a workspace it does not hold.
+async fn shared_workspace(connection: &mut Connection<UnixStream>, root: &Path) -> String {
+    if let Some(existing) = list_workspaces(connection)
+        .await
+        .into_iter()
+        .find(|workspace| workspace.name == SHARED_WORKSPACE)
+    {
+        return existing.id;
+    }
+    empty_workspace(connection, root, Some(SHARED_WORKSPACE))
+        .await
+        .id
+}
+
 async fn create(connection: &mut Connection<UnixStream>, cwd: &Path, command: &str) -> SessionInfo {
     create_with_scrollback(connection, cwd, command, None).await
 }
@@ -129,20 +156,37 @@ async fn create_with_scrollback(
     command: &str,
     scrollback: Option<u64>,
 ) -> SessionInfo {
+    let workspace_id = shared_workspace(connection, cwd).await;
+    create_in(connection, &workspace_id, cwd, command, scrollback).await
+}
+
+async fn create_in(
+    connection: &mut Connection<UnixStream>,
+    workspace_id: &str,
+    cwd: &Path,
+    command: &str,
+    scrollback: Option<u64>,
+) -> SessionInfo {
     connection
-        .send(&create_frame(cwd, command, 7, scrollback))
+        .send(&create_frame(workspace_id, cwd, command, 7, scrollback))
         .await
         .expect("sending CreateSession");
-    match connection.recv().await.expect("reply") {
+    // By correlation id: a subscribed connection is told about its own new
+    // session as an event too, ahead of its reply.
+    event_until(connection, "the CreateSession reply", |frame| match frame {
         Frame::Created {
             session,
-            request_id,
-        } => {
-            assert_eq!(request_id, Some(7));
-            session
-        }
-        other => panic!("expected Created, got {other:?}"),
-    }
+            request_id: Some(7),
+            ..
+        } => Some(session.clone()),
+        Frame::Error {
+            message,
+            request_id: Some(7),
+            ..
+        } => panic!("CreateSession failed: {message}"),
+        _ => None,
+    })
+    .await
 }
 
 async fn list(connection: &mut Connection<UnixStream>) -> Vec<SessionInfo> {
@@ -254,6 +298,7 @@ async fn attach(connection: &mut Connection<UnixStream>, id: &SessionId) -> (Vec
     connection
         .send(&Frame::Attach {
             session_id: id.clone(),
+            view_id: None,
             request_id: Some(21),
         })
         .await
@@ -427,39 +472,66 @@ async fn replay_containing(
 
 // ---- workspaces ----
 
-/// `CreateWorkspace`, asserting the daemon answers with the whole thing.
-async fn create_workspace(
+/// `CreateWorkspace`: the record alone, which is all the op does. A workspace
+/// with no sessions is a normal state, so the reply's `sessions` is always
+/// empty.
+async fn empty_workspace(
     connection: &mut Connection<UnixStream>,
     root: &Path,
     name: Option<&str>,
-) -> (WorkspaceInfo, Vec<SessionInfo>) {
+) -> WorkspaceInfo {
     connection
         .send(&Frame::CreateWorkspace {
             root: root.display().to_string(),
             name: name.map(str::to_owned),
-            env: vec![("ADE_TEST".into(), "1".into())],
-            cols: Some(80),
-            rows: Some(24),
             request_id: Some(61),
+            env: Vec::new(),
+            cols: None,
+            rows: None,
         })
         .await
         .expect("sending CreateWorkspace");
     // By correlation id, not by frame kind: a subscribed client is also told
     // about its own new workspace, ahead of its reply.
-    event_until(
-        connection,
-        "the CreateWorkspace reply",
-        |frame| match frame {
-            Frame::Workspace {
-                workspace,
-                sessions,
-                request_id: Some(61),
-            } => Some((workspace.clone(), sessions.clone())),
-            Frame::Error { message, .. } => panic!("CreateWorkspace failed: {message}"),
-            _ => None,
-        },
-    )
-    .await
+    let (workspace, sessions) =
+        event_until(
+            connection,
+            "the CreateWorkspace reply",
+            |frame| match frame {
+                Frame::Workspace {
+                    workspace,
+                    sessions,
+                    request_id: Some(61),
+                    ..
+                } => Some((workspace.clone(), sessions.clone())),
+                Frame::Error { message, .. } => panic!("CreateWorkspace failed: {message}"),
+                _ => None,
+            },
+        )
+        .await;
+    assert!(sessions.is_empty(), "an empty create spawned {sessions:?}");
+    workspace
+}
+
+/// The client's "add a workspace" gesture, which is three ops now that the
+/// daemon's combined create is gone: make the record, put the first login shell
+/// in it, then write the one-leaf layout holding its tab. Returned as the
+/// daemon now holds it, so the tests downstream of it are unchanged.
+async fn create_workspace(
+    connection: &mut Connection<UnixStream>,
+    root: &Path,
+    name: Option<&str>,
+) -> (WorkspaceInfo, Vec<SessionInfo>) {
+    let mut workspace = empty_workspace(connection, root, name).await;
+    let session = create_in(connection, &workspace.id, root, "", None).await;
+    let layout = LayoutDoc::single_terminal(session.id.clone());
+    match update_layout(connection, &workspace.id, layout.clone(), 1).await {
+        Frame::LayoutChanged { .. } => {}
+        other => panic!("the first layout write was refused: {other:?}"),
+    }
+    workspace.layout = layout;
+    workspace.layout_rev = 1;
+    (workspace, vec![session])
 }
 
 async fn open_workspace(
@@ -478,6 +550,7 @@ async fn open_workspace(
             workspace,
             sessions,
             request_id: Some(62),
+            ..
         } => Some((workspace.clone(), sessions.clone())),
         Frame::Error { message, .. } => panic!("OpenWorkspace failed: {message}"),
         _ => None,
@@ -602,11 +675,11 @@ fn killing_a_session_scrubs_its_tab_from_the_layout() {
     let (dir, server) = server();
     smol::block_on(async {
         let mut connection = client(server.socket_path()).await;
-        // Both in one workspace: `create` puts every session in `ws-1`, which
-        // the daemon mints on the first one.
+        // Both in one workspace: `create` puts every session in the shared one.
         let first = create(&mut connection, dir.path(), CAT).await.id;
         let second = create(&mut connection, dir.path(), CAT).await.id;
-        let (workspace, _) = open_workspace(&mut connection, "ws-1").await;
+        let shared = shared_workspace(&mut connection, dir.path()).await;
+        let (workspace, _) = open_workspace(&mut connection, &shared).await;
 
         // Two tabs in one leaf, the second of them active.
         let layout = LayoutDoc::new(LayoutNode::Leaf {
@@ -906,9 +979,10 @@ fn a_kill_racing_a_layout_update_leaves_no_tab_naming_a_dead_session() {
         let mut connection = client(&socket).await;
         let survivor = create(&mut connection, dir.path(), "sleep 300").await.id;
         let victim = create(&mut connection, dir.path(), "sleep 300").await.id;
-        // `create` puts every session in `ws-1`, which the daemon minted at
-        // rev 1 on the first one; this takes it to rev 2 with both tabs in it.
-        let (workspace, _) = open_workspace(&mut connection, "ws-1").await;
+        // `create` puts every session in the shared workspace, whose layout is
+        // still the empty rev-0 one; this takes it to rev 1 with both tabs.
+        let shared = shared_workspace(&mut connection, dir.path()).await;
+        let (workspace, _) = open_workspace(&mut connection, &shared).await;
         update_layout(
             &mut connection,
             &workspace.id,
@@ -925,9 +999,9 @@ fn a_kill_racing_a_layout_update_leaves_no_tab_naming_a_dead_session() {
         smol::block_on(async move {
             let mut connection = client(&socket).await;
             gate.wait();
-            // Rev 3: what a client holding the rev-2 document would send,
+            // Rev 2: what a client holding the rev-1 document would send,
             // and what the scrub itself moves the document to.
-            update_layout(&mut connection, &racing_id, stale, 3).await;
+            update_layout(&mut connection, &racing_id, stale, 2).await;
         });
     });
 
@@ -1006,21 +1080,23 @@ fn two_concurrent_kills_stay_killed_across_a_restart() {
 
 /// `KillWorkspace` racing a `CreateSession` naming the same workspace.
 ///
-/// Naming the doomed sessions and dropping the record are one transaction, so
-/// the create is either wholly before the kill — and its session goes with the
-/// workspace — or wholly after, and the daemon records the workspace again for
-/// it. What can never be left behind is a session claiming a workspace the
-/// daemon has announced as removed.
+/// The kill wins outright now: nothing re-creates a record for a session, so
+/// the create either lands wholly before the kill — and its session goes with
+/// the workspace — or is refused. What can never be left behind is a session
+/// claiming a workspace the daemon has announced as removed.
 #[test]
 fn killing_a_workspace_while_a_session_is_created_leaves_no_orphaned_session() {
     let (dir, server) = server();
     let socket = server.socket_path().to_owned();
-    smol::block_on(async {
+    let doomed = smol::block_on(async {
         let mut connection = client(&socket).await;
         create(&mut connection, dir.path(), "sleep 300").await;
+        shared_workspace(&mut connection, dir.path()).await
     });
 
     let cwd = dir.path().to_owned();
+    let killed = doomed.clone();
+    let raced = doomed.clone();
     race(
         &socket,
         move |socket, gate| {
@@ -1029,7 +1105,7 @@ fn killing_a_workspace_while_a_session_is_created_leaves_no_orphaned_session() {
                 gate.wait();
                 connection
                     .send(&Frame::KillWorkspace {
-                        workspace_id: "ws-1".to_owned(),
+                        workspace_id: killed,
                         request_id: Some(65),
                     })
                     .await
@@ -1056,7 +1132,27 @@ fn killing_a_workspace_while_a_session_is_created_leaves_no_orphaned_session() {
             smol::block_on(async move {
                 let mut connection = client(&socket).await;
                 gate.wait();
-                create(&mut connection, &cwd, "sleep 300").await;
+                // Either answer is legal; only the aftermath is asserted.
+                connection
+                    .send(&create_frame(&raced, &cwd, "sleep 300", 7, None))
+                    .await
+                    .expect("sending CreateSession");
+                event_until(
+                    &mut connection,
+                    "the CreateSession reply",
+                    |frame| match frame {
+                        Frame::Created {
+                            request_id: Some(7),
+                            ..
+                        }
+                        | Frame::Error {
+                            request_id: Some(7),
+                            ..
+                        } => Some(()),
+                        _ => None,
+                    },
+                )
+                .await;
             });
         },
     );
@@ -1066,13 +1162,13 @@ fn killing_a_workspace_while_a_session_is_created_leaves_no_orphaned_session() {
         let claimants: Vec<SessionId> = list(&mut connection)
             .await
             .into_iter()
-            .filter(|session| session.workspace_id == "ws-1")
+            .filter(|session| session.workspace_id == doomed)
             .map(|session| session.id)
             .collect();
         let recorded = list_workspaces(&mut connection)
             .await
             .iter()
-            .any(|workspace| workspace.id == "ws-1");
+            .any(|workspace| workspace.id == doomed);
         assert!(
             claimants.is_empty() || recorded,
             "sessions {claimants:?} claim a workspace that was announced removed"
@@ -1090,7 +1186,8 @@ fn a_killed_session_and_its_tab_do_not_survive_a_restart() {
         let mut connection = client(first.socket_path()).await;
         let survivor = create(&mut connection, dir.path(), "sleep 300").await.id;
         let victim = create(&mut connection, dir.path(), "sleep 300").await.id;
-        let (workspace, _) = open_workspace(&mut connection, "ws-1").await;
+        let shared = shared_workspace(&mut connection, dir.path()).await;
+        let (workspace, _) = open_workspace(&mut connection, &shared).await;
         update_layout(
             &mut connection,
             &workspace.id,
@@ -1160,8 +1257,10 @@ fn killing_a_workspace_announces_its_removal_and_not_a_layout_change() {
     });
 }
 
-/// The whole gesture in one round trip: a workspace, its login shell, and a
-/// layout holding that shell's terminal tab.
+/// The client's "add a workspace" gesture, end to end: the record, its login
+/// shell, and a layout holding that shell's terminal tab. Three ops since
+/// generation 3 retired the daemon's combined create — the state they leave is
+/// what everything downstream of it still expects.
 #[test]
 fn creating_a_workspace_returns_its_session_and_a_one_leaf_layout() {
     let (dir, server) = server();
@@ -1189,6 +1288,48 @@ fn creating_a_workspace_returns_its_session_and_a_one_leaf_layout() {
         // And the workspace is listed, alone.
         let listed = list_workspaces(&mut connection).await;
         assert_eq!(listed, vec![workspace]);
+    });
+}
+
+/// The op on its own: the record alone, which is what a panel row is before
+/// anything is put in it. Nothing spawns and no layout is invented.
+#[test]
+fn creating_an_empty_workspace_returns_a_row_with_no_sessions() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let workspace = empty_workspace(&mut connection, dir.path(), Some("row")).await;
+
+        assert_eq!(workspace.name, "row");
+        assert!(workspace.layout.terminal_sessions().is_empty());
+        // Zero, so the client's first layout write is revision 1.
+        assert_eq!(workspace.layout_rev, 0);
+        assert!(list(&mut connection).await.is_empty(), "something spawned");
+        assert_eq!(
+            list_workspaces(&mut connection).await,
+            vec![workspace.clone()]
+        );
+
+        // A row with nothing in it is still killable: today's NOT_FOUND rule is
+        // about a workspace nothing knows, not about an empty one.
+        connection
+            .send(&Frame::KillWorkspace {
+                workspace_id: workspace.id.clone(),
+                request_id: Some(67),
+            })
+            .await
+            .expect("sending KillWorkspace");
+        event_until(&mut connection, "WorkspaceRemoved", |frame| match frame {
+            Frame::WorkspaceRemoved {
+                workspace_id,
+                request_id: Some(67),
+                ..
+            } if *workspace_id == workspace.id => Some(()),
+            Frame::Error { message, .. } => panic!("KillWorkspace failed: {message}"),
+            _ => None,
+        })
+        .await;
+        assert!(list_workspaces(&mut connection).await.is_empty());
     });
 }
 
@@ -1419,8 +1560,10 @@ fn an_accepted_layout_is_pushed_to_the_other_clients() {
         let mut writer = client(server.socket_path()).await;
         let mut observer = client(server.socket_path()).await;
         subscribe(&mut writer).await;
-        subscribe(&mut observer).await;
         let (workspace, sessions) = create_workspace(&mut writer, dir.path(), None).await;
+        // Subscribed after the gesture's own layout write, so the first
+        // broadcast this observer sees is the one under test.
+        subscribe(&mut observer).await;
 
         let wanted = terminal_beside_editor(&sessions[0].id, "/src/lib.rs");
         // The broadcast is queued before the reply, so an unfiltered fan-out
@@ -1437,6 +1580,7 @@ fn an_accepted_layout_is_pushed_to_the_other_clients() {
                     layout,
                     rev,
                     request_id,
+                    ..
                 } if *workspace_id == workspace.id => Some((layout.clone(), *rev, *request_id)),
                 _ => None,
             })
@@ -1469,6 +1613,7 @@ fn killing_a_workspace_kills_every_session_in_it() {
             Frame::WorkspaceRemoved {
                 workspace_id,
                 request_id,
+                ..
             } => {
                 assert_eq!(workspace_id, workspace.id);
                 assert_eq!(request_id, Some(66));
@@ -1807,7 +1952,34 @@ fn handshake_succeeds_and_reports_the_daemon() {
         assert_eq!(ack.request_id, Some(1));
         assert_eq!(ack.host_os, std::env::consts::OS);
         assert!(!ack.daemon_version.is_empty());
+        assert!(
+            ack.instance_id.is_some_and(|id| !id.is_empty()),
+            "the daemon names itself, so two spellings of this host are one"
+        );
     });
+}
+
+/// The identity is the state dir's, not the process's: a client that knows a
+/// host by it must still know that host after the daemon restarts.
+#[test]
+fn the_instance_id_outlives_the_daemon() {
+    async fn identity(socket: &Path) -> Option<String> {
+        let stream = UnixStream::connect(socket).await.expect("connecting");
+        Connection::new(stream)
+            .handshake(Hello::current())
+            .await
+            .expect("handshake")
+            .instance_id
+    }
+
+    let (dir, server) = server();
+    let first = smol::block_on(identity(server.socket_path()));
+    assert!(first.is_some());
+    drop(server);
+
+    let server = server_named(&dir, "daemon-2.sock");
+    let second = smol::block_on(identity(server.socket_path()));
+    assert_eq!(second, first);
 }
 
 /// The one negotiation outcome that is fatal by design: no generation is common
@@ -2074,6 +2246,35 @@ fn hello_reports_degraded_when_the_ledger_is_newer() {
     });
 }
 
+/// The other read-only cause, and the one that used to be invisible: a ledger
+/// that exists and did not parse. The daemon serves from an empty table, so a
+/// client that took the flag for "everything is fine" would read that emptiness
+/// as the truth about the host and delete its own rows on the strength of it.
+#[test]
+fn hello_reports_degraded_when_the_ledger_could_not_be_read() {
+    let dir = TempDir::new().expect("temp dir");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).expect("the state dir");
+    std::fs::write(state.join("sessions.json"), b"this was never json")
+        .expect("seeding an unreadable ledger");
+
+    let config = ServerConfig::new(dir.path().join("daemon.sock"), &state);
+    let server = Server::spawn(config).expect("spawning server");
+    smol::block_on(async {
+        let stream = UnixStream::connect(server.socket_path())
+            .await
+            .expect("connecting");
+        let ack = Connection::new(stream)
+            .handshake(Hello::current())
+            .await
+            .expect("handshake");
+        assert!(
+            ack.degraded,
+            "a ledger this daemon could not read is one it must not write over"
+        );
+    });
+}
+
 /// A duplicate identifier is an encoding artefact with one unambiguous reading
 /// — the peer is capable — so it is deduplicated and the handshake stands.
 #[test]
@@ -2184,7 +2385,11 @@ fn created_session_is_listed() {
     smol::block_on(async {
         let mut connection = client(server.socket_path()).await;
         let session = create(&mut connection, dir.path(), "sleep 300").await;
-        assert_eq!(session.workspace_id, "ws-1");
+        assert_eq!(
+            session.workspace_id,
+            shared_workspace(&mut connection, dir.path()).await,
+            "the session is in the record the client named, not one minted for it"
+        );
         // A just-launched agent is booting, not idle.
         assert_eq!(session.status, SessionStatus::Working);
 
@@ -2513,32 +2718,6 @@ fn attach_replays_output_produced_before_attaching() {
     });
 }
 
-#[test]
-fn attach_replays_history_beyond_the_visible_screen() {
-    let (dir, server) = server();
-    smol::block_on(async {
-        let mut connection = client(server.socket_path()).await;
-        let session = cat_session(&server, &mut connection, dir.path()).await;
-
-        write_to(&mut connection, &session.id, b"oldest-marker\n").await;
-        wait_for_ring(server.socket_path(), &session.id, b"oldest-marker").await;
-
-        let output = (1..=40)
-            .map(|line| format!("line-{line}\n"))
-            .collect::<String>();
-        write_to(&mut connection, &session.id, output.as_bytes()).await;
-        wait_for_ring(server.socket_path(), &session.id, b"line-40").await;
-
-        let mut viewer = client(server.socket_path()).await;
-        let (replayed, truncated) = attach(&mut viewer, &session.id).await;
-        assert!(
-            contains(&replayed, b"oldest-marker"),
-            "history outside the visible screen was not replayed: {replayed:?}"
-        );
-        assert!(!truncated, "the 2 MiB scrollback ring did not wrap");
-    });
-}
-
 /// A late attach gets the terminal ending after its replay. This is what lets
 /// a client reconnect after an outage in which the child exited.
 #[test]
@@ -2594,9 +2773,9 @@ fn attach_streams_live_output() {
 /// live stream covers everything after it, and nothing is dropped or repeated
 /// at the seam.
 ///
-/// The history and repaint are built under the same lock that fans out live
-/// output. `alpha` is entirely in the replay and `beta` entirely in the live
-/// stream; neither crosses the seam.
+/// The replay is history plus a repaint synthesized under the same lock that
+/// fans out live output, so `alpha` appears exactly twice — raw and painted —
+/// both before `beta`, which arrived after and appears once, live.
 #[test]
 fn replay_and_live_output_neither_gap_nor_duplicate() {
     let (dir, server) = server();
@@ -2613,10 +2792,19 @@ fn replay_and_live_output_neither_gap_nor_duplicate() {
         write_to(&mut connection, &session.id, b"beta\n").await;
         let live = output_until(&mut connection, &session.id, b"beta\r\n").await;
 
-        assert!(contains(&replayed, b"alpha"), "{replayed:?}");
-        assert!(!contains(&replayed, b"beta"), "{replayed:?}");
-        assert!(!contains(&live, b"alpha"), "{live:?}");
-        assert_eq!(occurrences(&live, b"beta"), 1, "{live:?}");
+        let mut seen = replayed;
+        seen.extend_from_slice(&live);
+        assert_eq!(occurrences(&seen, b"alpha"), 2, "{seen:?}");
+        assert_eq!(occurrences(&seen, b"beta"), 1, "{seen:?}");
+        let alpha = seen
+            .windows(5)
+            .rposition(|window| window == b"alpha")
+            .expect("alpha");
+        let beta = seen
+            .windows(4)
+            .position(|window| window == b"beta")
+            .expect("beta");
+        assert!(alpha < beta, "replay must precede live output");
     });
 }
 
@@ -2708,8 +2896,10 @@ fn dropping_a_connection_detaches_but_never_kills() {
 
         let mut reconnected = client(server.socket_path()).await;
         let (replayed, _) = attach(&mut reconnected, &session.id).await;
-        assert!(contains(&replayed, b"before"), "{replayed:?}");
-        assert!(contains(&replayed, b"while-away"), "{replayed:?}");
+        // History replays the raw lines, and the repaint paints them again
+        // with `CUP`: twice each, nothing more.
+        assert_eq!(occurrences(&replayed, b"before"), 2, "{replayed:?}");
+        assert_eq!(occurrences(&replayed, b"while-away"), 2, "{replayed:?}");
 
         let mut observer = client(server.socket_path()).await;
         let sessions = list(&mut observer).await;
@@ -2755,6 +2945,10 @@ fn attach_repaints_at_the_last_resized_size() {
             })
             .await
             .expect("sending Resize");
+        // Resize carries no ack; a replied request on the same connection
+        // proves the sequential request loop has applied it before the viewer
+        // attaches from its own connection.
+        let _ = list(&mut connection).await;
 
         let mut viewer = client(server.socket_path()).await;
         let (replayed, truncated) = attach(&mut viewer, &session.id).await;
@@ -2765,7 +2959,77 @@ fn attach_repaints_at_the_last_resized_size() {
         );
         // The newest output is what survives a shrink, and the screen says so.
         assert!(contains(&replayed, b"line12"), "{replayed:?}");
-        assert!(!truncated, "the scrollback ring still contains every byte");
+        assert!(
+            !truncated,
+            "the scrolled-off lines are in the replayed history; nothing was omitted"
+        );
+    });
+}
+
+/// A focus claim that arrives before its view attaches is honored the moment
+/// the view does: the repaint comes out at the focused ask, not at the
+/// smallest sibling's ask that stood in for it while the claim was pending.
+#[test]
+fn a_focus_claim_resolved_by_attach_repaints_at_the_focused_ask() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut connection,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+        // A small sibling holds the minimum down at eight rows.
+        connection
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending Resize");
+        let _ = list(&mut connection).await;
+
+        // The viewer claims focus for its view and asks for a taller screen
+        // before attaching; the claim can only resolve at the attach.
+        let mut viewer = client(server.socket_path()).await;
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-tall".to_owned(),
+                hover: false,
+            })
+            .await
+            .expect("sending FocusSession");
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sending Resize");
+        let _ = list(&mut viewer).await;
+        viewer
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-tall".to_owned()),
+                request_id: Some(31),
+            })
+            .await
+            .expect("sending Attach");
+        match recv(&mut viewer, "Replay").await {
+            Frame::Replay { bytes, .. } => assert!(
+                contains(&bytes, b"\x1b[12;1H"),
+                "repainted at the focused 24 rows, not the sibling's 8: {bytes:?}"
+            ),
+            other => panic!("expected Replay, got {other:?}"),
+        }
     });
 }
 
@@ -2804,27 +3068,41 @@ fn the_alternate_screen_is_replayed_and_then_given_back() {
         assert!(contains(&in_app, b"ALTSCREEN"), "{in_app:?}");
         detach(&mut viewer, &session.id).await;
 
-        // The app exits.
+        // The app exits. The needle is the leave sequence itself, as cat
+        // echoes it back — "primary-output" has been in the ring since before
+        // the trip and would not wait for anything.
         write_to(&mut connection, &session.id, b"\x1b[?1049l\n").await;
-        wait_for_ring(server.socket_path(), &session.id, b"primary-output").await;
+        wait_for_ring(server.socket_path(), &session.id, b"\x1b[?1049l").await;
 
         let (after, _) = attach(&mut viewer, &session.id).await;
-        let repaint_start = after
-            .windows(b"\x1b[?2026h".len())
-            .rposition(|window| window == b"\x1b[?2026h")
-            .expect("the current-screen repaint");
-        let repaint = &after[repaint_start..];
+        // The history replays the app's whole alternate-screen trip, so the
+        // client visits it again — what matters is that it is left again.
+        assert_eq!(
+            occurrences(&after, b"\x1b[?1049h"),
+            occurrences(&after, b"\x1b[?1049l"),
+            "an alternate screen was entered and never left: {after:?}"
+        );
+        let last_enter = after
+            .windows(8)
+            .rposition(|window| window == b"\x1b[?1049h")
+            .expect("the history enters the alternate screen");
+        let last_leave = after
+            .windows(8)
+            .rposition(|window| window == b"\x1b[?1049l")
+            .expect("the history leaves the alternate screen");
         assert!(
-            !contains(repaint, b"\x1b[?1049h"),
-            "back on the primary screen: {repaint:?}"
+            last_enter < last_leave,
+            "back on the primary screen: {after:?}"
+        );
+        // Past the trip, only the primary screen is painted.
+        let back = &after[last_leave..];
+        assert!(
+            contains(back, b"primary-output"),
+            "the primary screen survived the app: {after:?}"
         );
         assert!(
-            contains(repaint, b"primary-output"),
-            "the primary screen survived the app: {repaint:?}"
-        );
-        assert!(
-            !contains(repaint, b"ALTSCREEN"),
-            "and none of the app is left on it: {repaint:?}"
+            !contains(back, b"ALTSCREEN"),
+            "and none of the app is left on it: {after:?}"
         );
     });
 }
@@ -3060,6 +3338,7 @@ fn created_and_removed_events_reach_a_subscriber() {
             Frame::Created {
                 session,
                 request_id,
+                ..
             } => Some((session.clone(), *request_id)),
             _ => None,
         })
@@ -3076,50 +3355,50 @@ fn created_and_removed_events_reach_a_subscriber() {
     });
 }
 
-/// A session event must never name a workspace the subscriber has not learned
-/// about yet. This is the direct `CreateSession` path, where the daemon mints
-/// the missing workspace automatically.
+/// There is no implicit workspace any more: a `CreateSession` naming a record
+/// the daemon does not hold is refused, and an empty id is a different refusal
+/// because it is a different mistake. Nothing is spawned and nothing is
+/// recorded either way — the wire-level half of the spec's "sessions are
+/// created only inside an existing workspace".
 #[test]
-fn an_implicit_workspace_is_announced_before_its_first_session() {
+fn a_session_naming_a_workspace_the_daemon_does_not_hold_is_refused() {
     let (dir, server) = server();
     smol::block_on(async {
         let mut watcher = client(server.socket_path()).await;
         assert!(subscribe_and_snapshot(&mut watcher).await.is_empty());
 
         let mut owner = client(server.socket_path()).await;
-        let created = create(&mut owner, dir.path(), "sleep 300").await;
-        match event_until(
-            &mut watcher,
-            "Workspace before Created",
-            |frame| match frame {
-                Frame::Workspace {
-                    workspace,
-                    sessions,
-                    ..
-                } => Some(Ok((workspace.clone(), sessions.clone()))),
-                Frame::Created { session, .. } if session.id == created.id => {
-                    Some(Err(session.clone()))
+        for (workspace_id, expected) in [
+            ("no-such-workspace", error_code::NOT_FOUND),
+            ("", error_code::INVALID_ARGUMENT),
+        ] {
+            owner
+                .send(&create_frame(workspace_id, dir.path(), CAT, 7, None))
+                .await
+                .expect("sending CreateSession");
+            match recv(&mut owner, "the refusal").await {
+                Frame::Error { code, message, .. } => {
+                    assert_eq!(code, expected, "for {workspace_id:?}: {message}");
                 }
-                _ => None,
-            },
-        )
-        .await
-        {
-            Ok((workspace, sessions)) => {
-                assert_eq!(workspace.id, created.workspace_id);
-                assert_eq!(sessions.len(), 1);
-                assert_eq!(sessions[0].id, created.id);
+                other => panic!("expected Error for {workspace_id:?}, got {other:?}"),
             }
-            Err(session) => panic!(
-                "session {} was announced before workspace {}",
-                session.id, session.workspace_id
-            ),
         }
+
+        assert!(
+            list(&mut owner).await.is_empty(),
+            "a refused create spawned"
+        );
+        assert!(
+            list_workspaces(&mut owner).await.is_empty(),
+            "a refused create minted a workspace"
+        );
     });
 }
 
-/// `CreateWorkspace` is the same transaction through a different request: its
-/// observer event also precedes the session event it makes meaningful.
+/// A session event must never name a workspace the subscriber has not learned
+/// about yet, and the client's two calls are what put them in that order: the
+/// record is announced — empty, since that is all `CreateWorkspace` makes —
+/// before any `Created` naming it.
 #[test]
 fn a_created_workspace_is_announced_before_its_first_session() {
     let (dir, server) = server();
@@ -3147,7 +3426,7 @@ fn a_created_workspace_is_announced_before_its_first_session() {
         )
         .await
         {
-            Ok(announced) => assert_eq!(announced, vec![session]),
+            Ok(announced) => assert!(announced.is_empty(), "{announced:?}"),
             Err(seen) => panic!(
                 "session {} was announced before workspace {}",
                 seen.id, seen.workspace_id
@@ -3410,6 +3689,14 @@ fn non_forced_shutdown_and_create_cannot_both_succeed() {
     for attempt in 0..4 {
         let (dir, server) = server();
         let socket = server.socket_path().to_owned();
+        // Made ahead of the race: the create has to be refusable only by the
+        // shutdown, never by a workspace that is not there.
+        let workspace = smol::block_on(async {
+            let mut connection = client(&socket).await;
+            empty_workspace(&mut connection, dir.path(), Some(SHARED_WORKSPACE))
+                .await
+                .id
+        });
         let gate = Arc::new(Barrier::new(2));
         let (sent, received) = std::sync::mpsc::channel();
 
@@ -3442,6 +3729,7 @@ fn non_forced_shutdown_and_create_cannot_both_succeed() {
         let create = {
             let socket = socket.clone();
             let cwd = dir.path().to_owned();
+            let workspace = workspace.clone();
             let gate = gate.clone();
             let sent = sent.clone();
             std::thread::spawn(move || {
@@ -3449,7 +3737,7 @@ fn non_forced_shutdown_and_create_cannot_both_succeed() {
                     let mut connection = client(&socket).await;
                     gate.wait();
                     connection
-                        .send(&create_frame(&cwd, "sleep 300", 91, None))
+                        .send(&create_frame(&workspace, &cwd, "sleep 300", 91, None))
                         .await
                         .expect("sending CreateSession");
                     let accepted = matches!(
@@ -3713,4 +4001,545 @@ fn an_idle_timer_never_fires_over_a_live_session() {
         "a live session was abandoned by its daemon"
     );
     assert!(server.socket_path().exists());
+}
+
+// ---- the previous generation, served ----
+
+/// A peer pinned to the previous generation: what a build from the cut, and
+/// every client made against one, advertises.
+fn gen2_hello() -> Hello {
+    Hello {
+        min_generation: MIN_GENERATION,
+        max_generation: MIN_GENERATION,
+        capabilities: Vec::new(),
+        request_id: Some(1),
+    }
+}
+
+async fn gen2_client(socket: &Path) -> Connection<UnixStream> {
+    let stream = UnixStream::connect(socket).await.expect("connecting");
+    let mut connection = Connection::new(stream);
+    let ack = connection.handshake(gen2_hello()).await.expect("handshake");
+    assert_eq!(
+        ack.generation, MIN_GENERATION,
+        "a peer that can only speak the window's lower end must be served there"
+    );
+    connection
+}
+
+/// The env the combined create is asked to put in its first shell. Distinctive
+/// enough that the echo of the command asking for it cannot be mistaken for the
+/// expansion.
+const COMBINED_ENV: &str = "combined-env-ok";
+
+/// The reply to `request_id`, ignoring the events that overtake it on a
+/// subscribed connection.
+async fn reply_to(connection: &mut Connection<UnixStream>, request_id: u64, what: &str) -> Frame {
+    event_until(connection, what, |frame| {
+        (frame.request_id() == Some(request_id)).then(|| frame.clone())
+    })
+    .await
+}
+
+/// `create_workspace` as a client from the cut sends it, the three session
+/// fields populated. The dialect is the connection's and never the frame's, so
+/// this is also what a generation-3 connection must answer with the record
+/// alone.
+///
+/// Returns the reply whatever it is: the refusal is half of what is pinned here.
+async fn legacy_create_workspace(
+    connection: &mut Connection<UnixStream>,
+    root: &Path,
+    name: Option<&str>,
+    request_id: u64,
+) -> Frame {
+    connection
+        .send(&Frame::CreateWorkspace {
+            root: root.display().to_string(),
+            name: name.map(str::to_owned),
+            env: vec![("ADE_COMBINED".to_owned(), COMBINED_ENV.to_owned())],
+            cols: Some(120),
+            rows: Some(40),
+            request_id: Some(request_id),
+        })
+        .await
+        .expect("sending CreateWorkspace");
+    reply_to(connection, request_id, "the CreateWorkspace reply").await
+}
+
+/// An empty command, i.e. the login shell every generation-2 auto-create path
+/// spawns.
+async fn legacy_create_session(
+    connection: &mut Connection<UnixStream>,
+    workspace_id: &str,
+    cwd: &Path,
+    label: &str,
+    request_id: u64,
+) -> Frame {
+    connection
+        .send(&Frame::CreateSession {
+            workspace_id: workspace_id.to_owned(),
+            cwd: cwd.display().to_string(),
+            command: String::new(),
+            env: Vec::new(),
+            cols: 90,
+            rows: 25,
+            agent_kind: "shell".to_owned(),
+            instance_label: label.to_owned(),
+            scrollback_bytes: None,
+            request_id: Some(request_id),
+        })
+        .await
+        .expect("sending CreateSession");
+    reply_to(connection, request_id, "the CreateSession reply").await
+}
+
+fn workspace_named<'a>(workspaces: &'a [WorkspaceInfo], id: &str) -> Option<&'a WorkspaceInfo> {
+    workspaces.iter().find(|workspace| workspace.id == id)
+}
+
+/// A directory that exists, for a create whose shell has to start in it.
+fn project_root(dir: &TempDir, name: &str) -> PathBuf {
+    let root = dir.path().join(name);
+    std::fs::create_dir_all(&root).expect("the project root");
+    root
+}
+
+/// A root the daemon's own user cannot enter, i.e. a create whose shell cannot
+/// start.
+///
+/// It has to *be* a directory: `portable-pty` drops a cwd that is not one and
+/// silently starts the shell in `$HOME` instead, so a path that merely does not
+/// exist spawns happily. Readable, so the temp dir can still be swept up. Root
+/// enters it anyway, and the tests using it then fail loudly rather than pass.
+fn unenterable_root(dir: &TempDir, name: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = project_root(dir, name);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600))
+        .expect("barring the project root");
+    root
+}
+
+/// At generation 2 `create_workspace` is the combined create: the record, one
+/// login shell at the size and env the request named, and the one-leaf layout
+/// holding it. Breaking this leaves every client from the cut with a workspace
+/// that never opens a terminal.
+#[test]
+fn a_generation_two_peer_gets_the_combined_workspace_create() {
+    let (dir, server) = server();
+    let root = project_root(&dir, "proj");
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+        let (workspace, sessions) =
+            match legacy_create_workspace(&mut daemon, &root, Some("proj"), 71).await {
+                Frame::Workspace {
+                    workspace,
+                    sessions,
+                    ..
+                } => (workspace, sessions),
+                other => panic!("expected a workspace, got {other:?}"),
+            };
+        assert_eq!(sessions.len(), 1, "the combined create makes one session");
+        assert_eq!(
+            workspace.layout.terminal_sessions(),
+            vec![sessions[0].id.clone()],
+            "the one-leaf layout must hold that session"
+        );
+        assert_eq!(workspace.name, "proj");
+        assert_eq!(workspace.project_root, root.display().to_string());
+        assert_eq!(workspace.layout_rev, 1, "the create's own layout write");
+
+        let listed = list(&mut daemon).await;
+        assert_eq!(listed.len(), 1, "one shell, neither none nor two");
+        assert_eq!(listed[0].id, sessions[0].id);
+
+        // The legacy request fields reach the pty and not only the record: a
+        // shell at 80x24 without the env is the silent half of this regression.
+        attach(&mut daemon, &sessions[0].id).await;
+        write_to(
+            &mut daemon,
+            &sessions[0].id,
+            b"printf '[%s]\\n' \"$ADE_COMBINED\"; stty size\n",
+        )
+        .await;
+        let seen = output_until(&mut daemon, &sessions[0].id, b"40 120").await;
+        assert!(
+            contains(&seen, format!("[{COMBINED_ENV}]").as_bytes()),
+            "the request's env never reached the shell: {}",
+            String::from_utf8_lossy(&seen)
+        );
+    });
+}
+
+/// The other half of the same op: at generation 3 the record is all there is,
+/// and the legacy request fields mean nothing.
+#[test]
+fn a_generation_three_peer_gets_the_record_alone() {
+    let (dir, server) = server();
+    let root = project_root(&dir, "proj");
+    smol::block_on(async {
+        let mut daemon = client(server.socket_path()).await;
+        let workspace = match legacy_create_workspace(&mut daemon, &root, Some("proj"), 72).await {
+            Frame::Workspace {
+                workspace,
+                sessions,
+                ..
+            } => {
+                assert!(sessions.is_empty(), "generation 3 spawns nothing");
+                workspace
+            }
+            other => panic!("expected a workspace, got {other:?}"),
+        };
+        assert_eq!(workspace.layout, LayoutDoc::empty());
+        assert_eq!(workspace.layout_rev, 0, "nothing has written a layout yet");
+        assert!(
+            list(&mut daemon).await.is_empty(),
+            "a gen-3 create_workspace spawned a terminal"
+        );
+    });
+}
+
+/// Generation 2 never refused a session for want of a workspace — it made one,
+/// under the id the client named or a fresh one when it named none. A refusal
+/// here is a client from the cut that can no longer open a terminal at all.
+#[test]
+fn a_generation_two_create_session_makes_the_workspace_it_names() {
+    let (dir, server) = server();
+    let cwd = project_root(&dir, "from-the-cut");
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+
+        let named =
+            match legacy_create_session(&mut daemon, "ws-from-the-cut", &cwd, "labelled", 73).await
+            {
+                Frame::Created { session, .. } => session,
+                other => panic!("expected the session, got {other:?}"),
+            };
+        assert_eq!(
+            named.workspace_id, "ws-from-the-cut",
+            "auto-create must keep the id the old client already named"
+        );
+
+        let minted = match legacy_create_session(&mut daemon, "", &cwd, "", 74).await {
+            Frame::Created { session, .. } => session,
+            other => panic!("expected the session, got {other:?}"),
+        };
+        assert!(
+            !minted.workspace_id.is_empty() && minted.workspace_id != named.workspace_id,
+            "an empty id must mint a fresh workspace, got {:?}",
+            minted.workspace_id
+        );
+
+        let workspaces = list_workspaces(&mut daemon).await;
+        assert_eq!(workspaces.len(), 2, "both auto-creates left a record");
+        for (session, expected_name) in [(&named, "labelled"), (&minted, "from-the-cut")] {
+            let workspace = workspace_named(&workspaces, &session.workspace_id)
+                .expect("the auto-created record");
+            assert_eq!(workspace.name, expected_name);
+            assert_eq!(workspace.project_root, cwd.display().to_string());
+            assert_eq!(
+                workspace.layout.terminal_sessions(),
+                vec![session.id.clone()],
+                "the auto-created record must hold its session in a one-leaf layout"
+            );
+        }
+    });
+}
+
+/// `focus_session` is a generation-3 operation. A gen-2 connection is told so
+/// and keeps serving — refusing the request, not the stream, which is the
+/// difference between one lost gesture and a client that has to reconnect.
+#[test]
+fn focus_session_is_refused_at_generation_two_without_ending_the_connection() {
+    let (_dir, server) = server();
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+        daemon
+            .send(&Frame::FocusSession {
+                session_id: SessionId::new("s-1"),
+                view_id: "view-1".to_owned(),
+                hover: false,
+            })
+            .await
+            .expect("sending FocusSession");
+        match recv(&mut daemon, "the refusal").await {
+            Frame::Error { code, .. } => assert_eq!(code, error_code::UNCAPABLE_PEER),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            list(&mut daemon).await.is_empty(),
+            "the refusal cost one request and nothing else"
+        );
+    });
+}
+
+/// §4.2's composed create, in order: the record appears before it holds
+/// anything, and the layout arrives last. A subscriber that assumes a workspace
+/// is complete the moment it first sees it is what this order breaks.
+#[test]
+fn the_generation_two_combined_create_publishes_its_steps_in_order() {
+    let (dir, server) = server();
+    let root = project_root(&dir, "stepwise");
+    smol::block_on(async {
+        let mut observer = client(server.socket_path()).await;
+        subscribe(&mut observer).await;
+        let mut daemon = gen2_client(server.socket_path()).await;
+
+        let (workspace, sessions) =
+            match legacy_create_workspace(&mut daemon, &root, Some("stepwise"), 75).await {
+                Frame::Workspace {
+                    workspace,
+                    sessions,
+                    ..
+                } => (workspace, sessions),
+                other => panic!("expected a workspace, got {other:?}"),
+            };
+        let session = sessions[0].id.clone();
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut steps: Vec<&str> = Vec::new();
+        loop {
+            match recv(&mut observer, "the combined create's events").await {
+                Frame::Workspace {
+                    workspace: seen, ..
+                } if seen.id == workspace.id => {
+                    assert_eq!(seen.layout, LayoutDoc::empty());
+                    assert_eq!(seen.layout_rev, 0);
+                    steps.push("workspace");
+                }
+                Frame::Created { session: seen, .. } if seen.id == session => {
+                    steps.push("created");
+                }
+                Frame::LayoutChanged {
+                    workspace_id,
+                    layout,
+                    rev,
+                    ..
+                } if workspace_id == workspace.id => {
+                    assert_eq!(rev, 1);
+                    assert_eq!(layout.terminal_sessions(), vec![session.clone()]);
+                    steps.push("layout");
+                    break;
+                }
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the create's layout event never arrived, saw {steps:?}"
+            );
+        }
+        assert_eq!(steps, ["workspace", "created", "layout"]);
+    });
+}
+
+/// The failing half of §4.2's composed create: a subscriber sees the record
+/// appear and then vanish, and nothing is left behind to become an empty row
+/// nobody owns.
+#[test]
+fn a_failed_generation_two_combined_create_publishes_the_removal_it_caused() {
+    let (dir, server) = server();
+    let gone = unenterable_root(&dir, "gone");
+    smol::block_on(async {
+        let mut observer = client(server.socket_path()).await;
+        subscribe(&mut observer).await;
+        let mut daemon = gen2_client(server.socket_path()).await;
+
+        let workspace_id = match legacy_create_workspace(&mut daemon, &gone, Some("gone"), 76).await
+        {
+            Frame::Error { workspace_id, .. } => {
+                workspace_id.expect("the refusal names the record it took back")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut steps: Vec<&str> = Vec::new();
+        loop {
+            match recv(&mut observer, "the failed create's events").await {
+                Frame::Workspace { workspace, .. } if workspace.id == workspace_id => {
+                    steps.push("workspace");
+                }
+                Frame::WorkspaceRemoved {
+                    workspace_id: removed,
+                    ..
+                } if removed == workspace_id => {
+                    steps.push("removed");
+                    break;
+                }
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the compensating removal never arrived, saw {steps:?}"
+            );
+        }
+        assert_eq!(steps, ["workspace", "removed"]);
+
+        let workspaces = list_workspaces(&mut daemon).await;
+        assert!(
+            workspace_named(&workspaces, &workspace_id).is_none(),
+            "the record outlived the create that failed: {workspaces:?}"
+        );
+    });
+}
+
+/// §4.2: a name is trimmed, and a blank one falls back to the root's basename,
+/// at both generations. A row the user cannot tell from another is not a name.
+#[test]
+fn workspace_names_are_trimmed_and_fall_back_to_the_root_basename() {
+    let (dir, server) = server();
+    let root = project_root(&dir, "named-root");
+    smol::block_on(async {
+        // The gen-2 arm spawns a shell per create, so the root has to be real.
+        let mut connections = [
+            ("generation 2", gen2_client(server.socket_path()).await),
+            ("generation 3", client(server.socket_path()).await),
+        ];
+        let mut request_id = 80;
+        for (generation, daemon) in &mut connections {
+            for (given, expected) in [
+                (Some("  project  "), "project"),
+                (Some("   "), "named-root"),
+                (None, "named-root"),
+            ] {
+                request_id += 1;
+                match legacy_create_workspace(daemon, &root, given, request_id).await {
+                    Frame::Workspace { workspace, .. } => assert_eq!(
+                        workspace.name, expected,
+                        "{generation} stored {given:?} verbatim"
+                    ),
+                    other => panic!("expected a workspace, got {other:?}"),
+                }
+            }
+        }
+    });
+}
+
+/// A create that cannot be completed takes back the record it made, and a retry
+/// takes back its own — or a client hammering a dead cwd fills the panel with
+/// empty rows.
+#[test]
+fn a_generation_two_auto_create_leaves_no_workspace_when_the_spawn_fails() {
+    let (dir, server) = server();
+    let barred = unenterable_root(&dir, "barred");
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+
+        for request_id in [90, 91] {
+            match legacy_create_session(&mut daemon, "ws-doomed", &barred, "doomed", request_id)
+                .await
+            {
+                Frame::Error { .. } => {}
+                other => panic!("a shell cannot start in {barred:?}, got {other:?}"),
+            }
+            let workspaces = list_workspaces(&mut daemon).await;
+            assert!(
+                workspace_named(&workspaces, "ws-doomed").is_none(),
+                "attempt {request_id} left its auto-created record behind: {workspaces:?}"
+            );
+        }
+
+        // The minting form compensates the same way, and has no id to look for.
+        let before = list_workspaces(&mut daemon).await.len();
+        match legacy_create_session(&mut daemon, "", &barred, "", 92).await {
+            Frame::Error { .. } => {}
+            other => panic!("a shell cannot start in {barred:?}, got {other:?}"),
+        }
+        assert_eq!(
+            list_workspaces(&mut daemon).await.len(),
+            before,
+            "a minted workspace outlived the create that failed"
+        );
+    });
+}
+
+/// Compensation is scoped to what the request made: a create that fails over a
+/// workspace it merely reused must not take that workspace, and the sessions in
+/// it, with it.
+#[test]
+fn a_reused_auto_create_record_survives_a_later_failed_create() {
+    let (dir, server) = server();
+    let cwd = project_root(&dir, "shared");
+    let barred = unenterable_root(&dir, "barred");
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+
+        let session =
+            match legacy_create_session(&mut daemon, "ws-shared", &cwd, "shared", 95).await {
+                Frame::Created { session, .. } => session,
+                other => panic!("expected the session, got {other:?}"),
+            };
+        match legacy_create_session(&mut daemon, "ws-shared", &barred, "shared", 96).await {
+            Frame::Error { .. } => {}
+            other => panic!("a shell cannot start in {barred:?}, got {other:?}"),
+        }
+
+        let workspaces = list_workspaces(&mut daemon).await;
+        let workspace = workspace_named(&workspaces, "ws-shared")
+            .expect("the failed create took a workspace it did not make");
+        assert_eq!(
+            workspace.layout.terminal_sessions(),
+            vec![session.id.clone()],
+            "the survivor lost the layout naming its first session"
+        );
+        let sessions = list(&mut daemon).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.id);
+    });
+}
+
+/// §4.2's one layout write that does not exclude its writer: `Created` carries
+/// no layout, so a gen-2 client subscribed on the connection it creates from
+/// would otherwise believe its own workspace is still empty. Every other layout
+/// write excludes the connection that asked for it.
+#[test]
+fn the_requesting_connection_learns_the_auto_created_layout() {
+    let (dir, server) = server();
+    let cwd = project_root(&dir, "self-taught");
+    smol::block_on(async {
+        let mut daemon = gen2_client(server.socket_path()).await;
+        subscribe(&mut daemon).await;
+        daemon
+            .send(&Frame::CreateSession {
+                workspace_id: "ws-self-taught".to_owned(),
+                cwd: cwd.display().to_string(),
+                command: String::new(),
+                env: Vec::new(),
+                cols: 90,
+                rows: 25,
+                agent_kind: "shell".to_owned(),
+                instance_label: "self-taught".to_owned(),
+                scrollback_bytes: None,
+                request_id: Some(97),
+            })
+            .await
+            .expect("sending CreateSession");
+
+        // The event precedes the reply, so both come off one stream.
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let (mut created, mut installed) = (None, None);
+        while created.is_none() || installed.is_none() {
+            match recv(&mut daemon, "the auto-create's reply and layout").await {
+                Frame::Created { session, .. } => created = Some(session),
+                Frame::LayoutChanged {
+                    workspace_id,
+                    layout,
+                    rev,
+                    ..
+                } if workspace_id == "ws-self-taught" => installed = Some((layout, rev)),
+                Frame::Error { message, .. } => panic!("the auto-create failed: {message}"),
+                _ => {}
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the requester was never told its own layout"
+            );
+        }
+        let (layout, rev) = installed.expect("the layout event");
+        assert_eq!(rev, 1);
+        assert_eq!(
+            layout.terminal_sessions(),
+            vec![created.expect("the session").id]
+        );
+    });
 }

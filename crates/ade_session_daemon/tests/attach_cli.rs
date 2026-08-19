@@ -149,10 +149,40 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
     }
 }
 
+/// A workspace to put sessions in: the daemon refuses a session in a record it
+/// does not hold, and the attach CLI cannot make one.
+async fn workspace(connection: &mut Connection<UnixStream>, root: &Path) -> String {
+    connection
+        .send(&Frame::CreateWorkspace {
+            root: root.display().to_string(),
+            name: Some("attached".into()),
+            request_id: Some(2),
+            env: Vec::new(),
+            cols: None,
+            rows: None,
+        })
+        .await
+        .expect("sending CreateWorkspace");
+    within("Workspace", async {
+        loop {
+            if let Frame::Workspace {
+                workspace,
+                request_id: Some(2),
+                ..
+            } = connection.recv().await.expect("receiving a frame")
+            {
+                return workspace.id;
+            }
+        }
+    })
+    .await
+}
+
 async fn create(connection: &mut Connection<UnixStream>, cwd: &Path, command: &str) -> SessionInfo {
+    let workspace_id = workspace(connection, cwd).await;
     connection
         .send(&Frame::CreateSession {
-            workspace_id: "ws-attach".into(),
+            workspace_id,
             cwd: cwd.display().to_string(),
             command: command.into(),
             env: Vec::new(),
@@ -203,6 +233,7 @@ async fn watch_until(connection: &mut Connection<UnixStream>, id: &SessionId, ne
     connection
         .send(&Frame::Attach {
             session_id: id.clone(),
+            view_id: None,
             request_id: Some(3),
         })
         .await
@@ -252,8 +283,13 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
-/// The whole point of attaching: the session's history and current screen
-/// arrive as data, and the client writes them out untouched.
+/// The whole point of attaching: the session's output arrives first, as data,
+/// and the client writes it out untouched.
+///
+/// The stream opens with the retained history, raw, and a *repaint* of the
+/// session's screen follows to repair the visible rows at the current size.
+/// So HELLO arrives twice: once as history, once painted at its position
+/// inside the repaint's synchronized-output block.
 #[test]
 fn attaching_replays_the_sessions_output_first() {
     let (dir, server) = server();
@@ -266,14 +302,14 @@ fn attaching_replays_the_sessions_output_first() {
 
         let mut client = attach(server.socket_path(), session.id.as_str());
         let mut stdout = client.stdout.take().expect("piped stdout");
-        let seen = read_until(&mut stdout, b"HELLO").await;
+        let seen = read_until(&mut stdout, b"\x1b[1;1HHELLO").await;
         assert!(
             seen.starts_with(b"HELLO"),
-            "history leads the screen repaint: {seen:?}"
+            "the retained history leads the stream, got {seen:?}"
         );
         assert!(
-            contains(&seen, b"\x1b[1;1HHELLO"),
-            "the current screen was repainted where the session put it: {seen:?}"
+            contains(&seen, b"\x1b[?2026h"),
+            "the repaint follows the history, got {seen:?}"
         );
 
         kill(&mut control, &session.id).await;
@@ -335,9 +371,16 @@ fn killing_the_session_elsewhere_ends_the_client() {
 
 /// The session has to exist: attach never creates one, so an unknown id is an
 /// error and not a quietly empty terminal.
+///
+/// **The attach CLI is attach-only**, which is the whole of its place in the
+/// spec — a legitimate pipe peer that is not a zorca client. It sends `attach`,
+/// `write` and `resize` and nothing else, so no path through it can create a
+/// session or a workspace. Asserted here on the daemon it just talked to: the
+/// failed attach left the table and the ledger exactly as empty as it found
+/// them.
 #[test]
-fn attaching_to_an_unknown_session_fails() {
-    let (_dir, server) = server();
+fn attaching_to_an_unknown_session_fails_and_creates_nothing() {
+    let (dir, server) = server();
     smol::block_on(async {
         let client = attach(server.socket_path(), "no-such-session");
         let output = within("the client to exit", client.output())
@@ -348,6 +391,42 @@ fn attaching_to_an_unknown_session_fails() {
         assert!(
             stderr.contains("no-such-session"),
             "the error names the session: {stderr}"
+        );
+
+        let mut control = control(server.socket_path()).await;
+        control
+            .send(&Frame::ListSessions {
+                request_id: Some(80),
+            })
+            .await
+            .expect("sending ListSessions");
+        match within("the session list", control.recv())
+            .await
+            .expect("reply")
+        {
+            Frame::SessionList { sessions, .. } => {
+                assert!(sessions.is_empty(), "the attach created {sessions:?}")
+            }
+            other => panic!("expected SessionList, got {other:?}"),
+        }
+        control
+            .send(&Frame::ListWorkspaces {
+                request_id: Some(81),
+            })
+            .await
+            .expect("sending ListWorkspaces");
+        match within("the workspace list", control.recv())
+            .await
+            .expect("reply")
+        {
+            Frame::WorkspaceList { workspaces, .. } => {
+                assert!(workspaces.is_empty(), "the attach created {workspaces:?}")
+            }
+            other => panic!("expected WorkspaceList, got {other:?}"),
+        }
+        assert!(
+            !dir.path().join("state").join("sessions.json").exists(),
+            "an attach-only client made the daemon write a ledger"
         );
     });
 }

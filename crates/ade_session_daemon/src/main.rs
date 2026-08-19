@@ -21,6 +21,32 @@
 //! All logic lives in the library half of this crate; `main` is argument
 //! parsing plus a call into it.
 
+/// Exactly one mode per run.
+///
+/// Branch order must not be the arbiter: `--stdio-proxy --ensure` would
+/// silently run ensure, `attach <id> --ensure` would silently attach. Refused
+/// by name here, the same way `--socket`/`--tcp` already are. No mode at all
+/// is the fourth mode — the daemon itself — and cannot conflict.
+#[cfg(unix)]
+fn one_mode(attach: bool, stdio_proxy: bool, ensure: bool) -> anyhow::Result<()> {
+    let given: Vec<&str> = [
+        ("attach", attach),
+        ("--stdio-proxy", stdio_proxy),
+        ("--ensure", ensure),
+    ]
+    .into_iter()
+    .filter(|(_, given)| *given)
+    .map(|(mode, _)| mode)
+    .collect();
+    if given.len() > 1 {
+        anyhow::bail!(
+            "{} are different modes: give exactly one\n\n{USAGE}",
+            given.join(" and ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn main() -> anyhow::Result<()> {
     use ade_session_daemon::{
@@ -36,6 +62,7 @@ fn main() -> anyhow::Result<()> {
     // "exactly one address" can only be checked against what was *given*.
     let mut socket_given = false;
     let mut tcp = None;
+    let mut view_id = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -68,9 +95,15 @@ fn main() -> anyhow::Result<()> {
                 Some(path) => config.state_dir = path.into(),
                 None => bail!("--state-dir needs a path"),
             },
+            "--view-id" => match args.next() {
+                Some(id) => view_id = Some(id),
+                None => bail!("--view-id needs an id"),
+            },
             other => bail!("unknown argument {other:?}\n\n{USAGE}"),
         }
     }
+
+    one_mode(attach_to.is_some(), stdio_proxy, ensure)?;
 
     // `env_logger` writes to stderr, which is what makes it safe in proxy mode:
     // stdout carries protocol frames and nothing else may ever touch it. In
@@ -87,7 +120,8 @@ fn main() -> anyhow::Result<()> {
         let attach_config = match tcp {
             Some(address) => AttachConfig::tcp(address, session_id),
             None => AttachConfig::new(config.socket_path, session_id),
-        };
+        }
+        .with_view_id(view_id);
         return smol::block_on(attach::run(attach_config));
     }
 
@@ -130,6 +164,7 @@ Usage: ade-daemon [--socket <path>] [--state-dir <dir>]
        ade-daemon --stdio-proxy [--socket <path>] [--state-dir <dir>]
        ade-daemon --ensure [--socket <path>] [--state-dir <dir>]
        ade-daemon attach <session-id> [--socket <path> | --tcp <address>]
+                                      [--view-id <id>]
 
 Options:
       --stdio-proxy       Pipe stdin/stdout to the daemon socket, starting a
@@ -149,6 +184,9 @@ Options:
                           127.0.0.1:7654 — the local end of an `ssh -L` forward
                           on a client whose ssh cannot bind a Unix socket.
                           Attach only, and never together with --socket.
+      --view-id <id>      Which terminal view this attach draws, so the daemon
+                          can hold the pty at this view's size while it has
+                          focus. Attach only.
       --state-dir <dir>   Where sessions.json lives (default: ~/.ade/daemon)
   -V, --version           Print the version and exit
   -h, --help              Print this help and exit";
@@ -166,6 +204,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut attach_to = None;
     let mut tcp = None;
+    let mut view_id = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -184,6 +223,10 @@ fn main() -> anyhow::Result<()> {
             "--tcp" => match args.next() {
                 Some(address) => tcp = Some(address),
                 None => bail!("--tcp needs an address, e.g. 127.0.0.1:7654"),
+            },
+            "--view-id" => match args.next() {
+                Some(id) => view_id = Some(id),
+                None => bail!("--view-id needs an id"),
             },
             // Not "unsupported flag": there is no Unix socket to name on this
             // client, which is the whole reason `--tcp` exists.
@@ -206,14 +249,16 @@ fn main() -> anyhow::Result<()> {
     let Some(address) = tcp else {
         bail!("attach needs --tcp <address> on Windows\n\n{USAGE}");
     };
-    smol::block_on(attach::run(AttachConfig::tcp(address, session_id)))
+    smol::block_on(attach::run(
+        AttachConfig::tcp(address, session_id).with_view_id(view_id),
+    ))
 }
 
 #[cfg(windows)]
 const USAGE: &str = "\
 ade-daemon — the ADE per-host session daemon (Windows: attach only)
 
-Usage: ade-daemon attach <session-id> --tcp <address>
+Usage: ade-daemon attach <session-id> --tcp <address> [--view-id <id>]
 
 Options:
       attach <id>         Attach this terminal to a session on a host's daemon:
@@ -223,10 +268,52 @@ Options:
                           the local end of an `ssh -L` forward. Required here:
                           Windows ssh cannot bind a Unix socket, so --socket is
                           not available.
+      --view-id <id>      Which terminal view this attach draws, so the daemon
+                          can hold the pty at this view's size while it has
+                          focus.
   -V, --version           Print the version and exit
   -h, --help              Print this help and exit
 
 The daemon itself (no mode, --stdio-proxy, --ensure) runs on unix hosts only.";
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The answer names the conflict, not whichever branch this file happens
+    /// to test first.
+    #[test]
+    fn two_modes_at_once_are_refused_by_name() {
+        for (attach, stdio_proxy, ensure, named) in [
+            (true, true, false, "attach and --stdio-proxy"),
+            (true, false, true, "attach and --ensure"),
+            (false, true, true, "--stdio-proxy and --ensure"),
+            (true, true, true, "attach and --stdio-proxy and --ensure"),
+        ] {
+            let error = one_mode(attach, stdio_proxy, ensure)
+                .err()
+                .unwrap_or_else(|| panic!("{named} are two modes and must be refused"));
+            assert!(
+                error.to_string().contains(named),
+                "the refusal does not name the conflict: {error:#}"
+            );
+        }
+    }
+
+    /// And every invocation that was legal before still is — including no mode
+    /// at all, which is the daemon itself.
+    #[test]
+    fn one_mode_at_a_time_is_still_legal() {
+        for (attach, stdio_proxy, ensure) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            one_mode(attach, stdio_proxy, ensure).expect("exactly one mode is what is allowed");
+        }
+    }
+}
 
 #[cfg(not(any(unix, windows)))]
 fn main() {

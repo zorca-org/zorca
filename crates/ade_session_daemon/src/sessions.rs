@@ -43,11 +43,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ade_session::proto::{
-    Frame, LayoutDoc, SessionId, SessionInfo, SessionStatus, WorkspaceInfo, error_code,
+    Frame, LayoutDoc, LayoutNode, SessionId, SessionInfo, SessionStatus, Tab, WorkspaceInfo,
+    error_code,
 };
 use anyhow::{Context as _, Result};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -78,6 +79,9 @@ const DRAIN_CHUNK_BYTES: usize = 8192;
 /// holds the old session's files or locks.
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(1);
+
+/// How long after input a hover claim keeps yielding.
+const TYPING_HOLD: Duration = Duration::from_secs(3);
 
 /// The byte an agent sends when it wants a human: `BEL`, 0x07.
 const BELL: u8 = 0x07;
@@ -226,8 +230,10 @@ impl Activity {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).dead = true;
     }
 
-    /// The child has been waited on, so its pid may already belong to someone
-    /// else — the kill paths' reason to stand down.
+    /// The child has been waited on (or, on Windows, its exit was observed),
+    /// so its pid may already belong to someone else — the kill paths' reason
+    /// to stand down, and a lost row's only evidence that its terminal really
+    /// is gone. See `keeps_a_live_terminal`.
     fn is_dead(&self) -> bool {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).dead
     }
@@ -239,35 +245,192 @@ impl Activity {
     }
 }
 
+/// What one queued frame costs the bound: its payload, plus a flat charge for
+/// being a frame at all. The flat part keeps a flood of *empty* frames — status
+/// events, one per session per sweep — bounded too, and is deliberately generous
+/// next to the JSON an envelope really costs. Only the two frames that carry a
+/// session's bytes have a payload worth counting.
+fn frame_bytes(frame: &Frame) -> u64 {
+    /// Enough that the byte bound also caps the frame count at a few thousand.
+    const OVERHEAD: u64 = 256;
+
+    let payload = match frame {
+        Frame::Output { bytes, .. } | Frame::Replay { bytes, .. } => bytes.len() as u64,
+        _ => 0,
+    };
+    payload + OVERHEAD
+}
+
+/// Headroom the attach replay leaves in the outbound bound, so the ending
+/// frame and the first live output still fit behind a full replay — without
+/// it, serving the replay would close the connection it just caught up. It
+/// also absorbs the replay frame's own flat overhead, which the budget math
+/// does not count.
+const ATTACH_RESERVE_BYTES: u64 = 64 * 1024;
+
+/// One connection's outbound queue: the frames waiting for its writer task, and
+/// the byte count that bounds them.
+///
+/// **Bounded in bytes, not in frames.** A frame count only bounds memory if
+/// every frame is the same size, and how much output one frame carries is the
+/// transport's business, not this queue's. 2 MiB is the point past which a
+/// reader can only be caught up by a repaint anyway.
+///
+/// Which is also why the channel underneath is unbounded in messages: the
+/// accounting here is the bound, and a push must never block and never await,
+/// because publishers hold session locks while they push and a pty that stops
+/// being drained is a child that stops running.
+#[derive(Clone)]
+pub struct Outbound {
+    frames: Sender<Frame>,
+    /// Bytes queued and not yet written, shared with [`OutboundQueue`], which
+    /// is what gives them back.
+    queued: Arc<AtomicU64>,
+    max_bytes: u64,
+}
+
+/// The receiving half of an [`Outbound`], for one connection's writer task.
+pub struct OutboundQueue {
+    frames: smol::channel::Receiver<Frame>,
+    queued: Arc<AtomicU64>,
+}
+
+impl Outbound {
+    pub fn new(max_bytes: u64) -> (Self, OutboundQueue) {
+        let (frames, receiver) = smol::channel::unbounded();
+        let queued = Arc::new(AtomicU64::new(0));
+        (
+            Self {
+                frames,
+                queued: queued.clone(),
+                max_bytes,
+            },
+            OutboundQueue {
+                frames: receiver,
+                queued,
+            },
+        )
+    }
+
+    /// Queue one frame, and say whether that connection is still worth keeping.
+    ///
+    /// **The one delivery rule** for every fan-out in this module, because each
+    /// runs on a thread that must not block: a pty drain thread, the sweeper, or
+    /// a request holding the session lock. Queued → the connection stays; closed
+    /// → it was already gone; **over the bound** → the peer really has stopped
+    /// reading, a whole default scrollback behind, so the queue is *closed* and
+    /// the subscription dropped. Closing ends the whole connection and not just
+    /// this subscription: the writer task stops on a closed queue, and the
+    /// request loop's next send fails and breaks.
+    pub fn push(&self, frame: Frame) -> bool {
+        // Non-request-scoped errors are unsolicited — not the answer to one
+        // frame the peer sent — and per `error_code::is_request_scoped` that
+        // is exactly the kind that ends whatever this connection was doing
+        // (an attach included). Request-scoped ones are routine per-request
+        // replies and stay quiet.
+        if let Frame::Error {
+            code,
+            message,
+            session_id,
+            workspace_id,
+            ..
+        } = &frame
+            && !error_code::is_request_scoped(code)
+        {
+            let subject = session_id
+                .as_ref()
+                .map(|id| format!("session {id}"))
+                .or_else(|| workspace_id.as_ref().map(|id| format!("workspace {id}")))
+                .unwrap_or_else(|| "no subject".to_owned());
+            log::warn!("sending {code} to a client ({subject}): {message}");
+        }
+        let cost = frame_bytes(&frame);
+        // Reserve, then send. A concurrent push may overshoot the bound by one
+        // frame between the two, which is why this is `>` on the total rather
+        // than an exact fill: the point is a ceiling on memory, not a quota.
+        let before = self.queued.fetch_add(cost, Ordering::SeqCst);
+        if before + cost > self.max_bytes {
+            self.queued.fetch_sub(cost, Ordering::SeqCst);
+            log::warn!(
+                "a client is {before} byte(s) behind on its outbound queue; dropping its \
+                 connection"
+            );
+            self.frames.close();
+            return false;
+        }
+        if self.frames.try_send(frame).is_err() {
+            // Unbounded, so the only failure is a queue somebody already closed.
+            self.queued.fetch_sub(cost, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
+    /// The room left under the bound right now — what an attach budgets its
+    /// replay against. Reading it beats assuming an empty queue: a multiplexed
+    /// connection may already hold another session's replay.
+    fn free_bytes(&self) -> u64 {
+        self.max_bytes
+            .saturating_sub(self.queued.load(Ordering::SeqCst))
+    }
+
+    /// Whether this connection's queue has already been closed on. Only the
+    /// bound's own tests ask; production code reads the answer from
+    /// [`Self::push`] returning `false`.
+    #[cfg(test)]
+    fn is_closed(&self) -> bool {
+        self.frames.is_closed()
+    }
+}
+
+impl OutboundQueue {
+    /// Everything queued so far, without waiting for more. The shape a test
+    /// drains with; a writer task always wants [`Self::recv`].
+    #[cfg(test)]
+    pub(crate) fn try_recv(&self) -> Option<Frame> {
+        let frame = self.frames.try_recv().ok()?;
+        self.queued.fetch_sub(frame_bytes(&frame), Ordering::SeqCst);
+        Some(frame)
+    }
+
+    /// The next frame to write, or `None` once the connection's last
+    /// [`Outbound`] is gone and the queue has drained.
+    pub async fn recv(&self) -> Option<Frame> {
+        let frame = self.frames.recv().await.ok()?;
+        self.queued.fetch_sub(frame_bytes(&frame), Ordering::SeqCst);
+        Some(frame)
+    }
+}
+
 /// The connections that asked for the event stream.
 ///
 /// Same shape as [`OutputHub`]'s subscriber list and for the same reason: a
-/// send can only fail on a closed channel, which means that connection is
-/// gone, so it is dropped here. Event subscription and output attachment are
+/// send that does not land means that connection is gone or is going, so it is
+/// dropped here — see [`deliver`]. Event subscription and output attachment are
 /// independent — a connection may be either, both, or neither.
 #[derive(Default)]
 struct EventHub {
-    subscribers: Vec<(SubscriberId, Sender<Frame>)>,
+    subscribers: Vec<(SubscriberId, Outbound)>,
 }
 
 impl EventHub {
     fn publish(&mut self, frame: &Frame) {
         self.subscribers
-            .retain(|(_, sender)| sender.try_send(frame.clone()).is_ok());
+            .retain(|(_, outbound)| outbound.push(frame.clone()));
     }
 
     /// Subscribing twice is idempotent: the second call replaces the first
     /// registration rather than doubling the fan-out.
-    fn subscribe(&mut self, subscriber: SubscriberId, sender: &Sender<Frame>) {
+    fn subscribe(&mut self, subscriber: SubscriberId, outbound: &Outbound) {
         self.subscribers.retain(|(id, _)| *id != subscriber);
-        self.subscribers.push((subscriber, sender.clone()));
+        self.subscribers.push((subscriber, outbound.clone()));
     }
 
     /// Publish to everyone but `except` — the client whose own request caused
     /// the event and which is answered directly instead.
     fn publish_except(&mut self, except: SubscriberId, frame: &Frame) {
         self.subscribers
-            .retain(|(id, sender)| *id == except || sender.try_send(frame.clone()).is_ok());
+            .retain(|(id, outbound)| *id == except || outbound.push(frame.clone()));
     }
 
     fn unsubscribe(&mut self, subscriber: SubscriberId) {
@@ -344,10 +507,33 @@ impl TableError {
         }
     }
 
+    /// The mutation applied and the ledger could not be written (§8.1). For a
+    /// class-A mutation this reads "this happened and I could not record it" —
+    /// the published events stand and the client must not try to undo them.
+    pub fn persist_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: error_code::PERSIST_FAILED,
+            message: message.into(),
+        }
+    }
+
     /// The daemon failed at something of its own.
     pub fn internal(message: impl Into<String>) -> Self {
         Self {
             code: error_code::INTERNAL,
+            message: message.into(),
+        }
+    }
+
+    /// A request this build understood and cannot serve on this platform.
+    ///
+    /// [`error_code::DECLINED`] and not `unknown_op`: the op is known and the
+    /// request well formed, so a client must not read it as "old daemon" and go
+    /// deploy an upgrade. §2's "understood and not honoured", and
+    /// request-scoped: the connection keeps serving every other op.
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: error_code::DECLINED,
             message: message.into(),
         }
     }
@@ -393,18 +579,47 @@ pub struct CreateRequest {
 /// [`Frame::CreateWorkspace`](ade_session::Frame::CreateWorkspace).
 #[derive(Clone, Debug)]
 pub struct WorkspaceRequest {
-    /// Project root, and the cwd of the workspace's first session.
+    /// Project root.
     pub root: String,
     /// `None` means the last component of `root`.
     pub name: Option<String>,
-    pub env: Vec<(String, String)>,
-    pub cols: u16,
-    pub rows: u16,
+    /// The id to record this workspace under. `None` mints one — the only
+    /// thing a client ever gets. Set only by the generation-2 `create_session`
+    /// auto-create, which must keep the id the old client already named.
+    pub id: Option<String>,
 }
 
-/// The pty size a client that named none gets.
-pub const DEFAULT_COLS: u16 = 80;
-pub const DEFAULT_ROWS: u16 = 24;
+/// Add a terminal tab to the first leaf in tree order — deterministic, so two
+/// daemons converging on the same document put the tab in the same place.
+fn append_terminal(node: &mut LayoutNode, session: &SessionId) {
+    match node {
+        LayoutNode::Leaf { tabs, .. } => tabs.push(Tab::Terminal {
+            session_id: session.clone(),
+        }),
+        LayoutNode::Split { children, .. } => append_terminal(&mut children[0], session),
+    }
+}
+
+/// A fresh record for `request`, unwritten and unannounced.
+///
+/// The name is trimmed and a blank one falls back to the root's basename at
+/// **both** generations — a deliberate cross-generation hardening, docs §4.2.
+fn new_workspace(request: WorkspaceRequest) -> WorkspaceInfo {
+    WorkspaceInfo {
+        id: request.id.unwrap_or_else(new_id),
+        name: request
+            .name
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| default_workspace_name(&request.root)),
+        project_root: request.root,
+        created_at: now_unix(),
+        // No document yet, and revision zero so the client's first layout
+        // write — which must exceed the stored rev — is 1.
+        layout_rev: 0,
+        layout: LayoutDoc::empty(),
+    }
+}
 
 /// What a workspace is called when the client did not say: the last component
 /// of the project root, or the root itself if it has none.
@@ -443,14 +658,24 @@ impl Ring {
         }
     }
 
-    /// The whole window, oldest byte first.
-    ///
-    fn snapshot(&self) -> Vec<u8> {
+    /// The newest `limit` bytes, oldest first — the history an attach replays.
+    /// Copied straight off the tail, so a large ring is never materialized
+    /// whole just to be sliced.
+    fn newest(&self, limit: usize) -> Vec<u8> {
+        let skip = self.bytes.len().saturating_sub(limit);
         let (head, tail) = self.bytes.as_slices();
-        let mut out = Vec::with_capacity(self.bytes.len());
-        out.extend_from_slice(head);
-        out.extend_from_slice(tail);
+        let mut out = Vec::with_capacity(self.bytes.len() - skip);
+        if skip < head.len() {
+            out.extend_from_slice(&head[skip..]);
+            out.extend_from_slice(tail);
+        } else {
+            out.extend_from_slice(&tail[skip - head.len()..]);
+        }
         out
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
     }
 }
 
@@ -466,8 +691,10 @@ struct OutputHub {
     /// has no pty and never will: painting a blank screen for it would assert
     /// something untrue, so it replays empty instead.
     grid: Option<SessionGrid>,
+    /// The frame that ended this session's stream, if it has. A late attacher
+    /// gets it right after the replay instead of waiting on a dead stream.
     ending: Option<Frame>,
-    subscribers: Vec<(SubscriberId, Sender<Frame>)>,
+    subscribers: Vec<(SubscriberId, Outbound)>,
 }
 
 impl OutputHub {
@@ -490,9 +717,9 @@ impl OutputHub {
 
     /// Record `chunk` and hand it to every attached connection.
     ///
-    /// Sending can only fail on a closed channel — the outbound queues are
-    /// unbounded, so a slow client never stalls the pty — and a closed channel
-    /// means that connection is gone, so it is dropped here.
+    /// This runs on the pty drain thread, so it never waits on a client:
+    /// [`Outbound::push`] queues or drops, and either way the pty keeps
+    /// being read.
     fn publish(&mut self, session_id: &SessionId, chunk: &[u8]) {
         self.ring.push(chunk);
         // The daemon's own copy of what the client is about to draw. Only this
@@ -500,48 +727,67 @@ impl OutputHub {
         if let Some(grid) = self.grid.as_mut() {
             grid.feed(chunk);
         }
-        self.subscribers.retain(|(_, sender)| {
-            sender
-                .try_send(Frame::Output {
-                    session_id: session_id.clone(),
-                    bytes: chunk.to_vec(),
-                })
-                .is_ok()
+        self.subscribers.retain(|(_, outbound)| {
+            outbound.push(Frame::Output {
+                session_id: session_id.clone(),
+                bytes: chunk.to_vec(),
+            })
         });
     }
 
     /// Queue the replay and subscribe. Re-attaching replaces the previous
     /// subscription rather than doubling it.
     ///
-    /// The retained ring is replayed first to restore scrollback, followed by
-    /// a screen repaint so the visible rows are correct at the current size.
-    /// A wrapped ring can start with a partial escape sequence, but that only
-    /// affects its oldest fragment; the repaint repairs the current screen.
-    fn attach(&mut self, session_id: &SessionId, subscriber: SubscriberId, sender: &Sender<Frame>) {
+    /// The retained ring is replayed first to restore scrollback, then a
+    /// repaint synthesized from the screen repairs the visible rows at the
+    /// current size — raw history renders right only at the width it was
+    /// produced at, and a wrapped ring may open mid-escape; the repaint fixes
+    /// what either garbles. History is capped so the replay leaves room under
+    /// the outbound bound: blowing it would close the connection the replay
+    /// was for.
+    fn attach(&mut self, session_id: &SessionId, subscriber: SubscriberId, outbound: &Outbound) {
         self.subscribers.retain(|(id, _)| *id != subscriber);
-        let mut bytes = self.ring.snapshot();
-        if let Some(grid) = self.grid.as_ref() {
-            bytes.extend(grid.repaint());
+        let mut repaint = match self.grid.as_ref() {
+            Some(grid) => grid.repaint(),
+            None => Vec::new(),
+        };
+        let free = outbound.free_bytes();
+        let mut dropped_repaint = false;
+        if repaint.len() as u64 + ATTACH_RESERVE_BYTES > free {
+            // A screen too large for the queue would close the connection this
+            // replay is meant to catch up; what history fits still goes.
+            repaint = Vec::new();
+            dropped_repaint = true;
         }
+        let budget = (outbound.max_bytes / 2)
+            .min(free.saturating_sub(repaint.len() as u64 + ATTACH_RESERVE_BYTES))
+            as usize;
+        let mut bytes = self.ring.newest(budget);
+        let capped = bytes.len() < self.ring.len();
+        bytes.extend(repaint);
         let replay = Frame::Replay {
             session_id: session_id.clone(),
             bytes,
-            truncated: self.ring.truncated,
+            // Only omission truncates: the ring dropped bytes, the cap cut the
+            // replay, or the screen could not be painted. A screen that merely
+            // scrolled is all still here.
+            truncated: self.ring.truncated || capped || dropped_repaint,
         };
-        if sender.try_send(replay).is_err() {
+        if !outbound.push(replay) {
             return;
         }
         if let Some(ending) = self.ending.as_ref() {
-            if sender.try_send(ending.clone()).is_err() {
-                return;
-            }
+            outbound.push(ending.clone());
         } else {
-            self.subscribers.push((subscriber, sender.clone()));
+            self.subscribers.push((subscriber, outbound.clone()));
         }
     }
 
-    fn detach(&mut self, subscriber: SubscriberId) {
+    /// `true` if `subscriber` was actually attached here.
+    fn detach(&mut self, subscriber: SubscriberId) -> bool {
+        let before = self.subscribers.len();
         self.subscribers.retain(|(id, _)| *id != subscriber);
+        self.subscribers.len() != before
     }
 
     /// Hand a session-level event to every *attached* connection.
@@ -555,7 +801,7 @@ impl OutputHub {
     fn publish_event(&mut self, frame: &Frame) {
         self.ending = Some(frame.clone());
         self.subscribers
-            .retain(|(_, sender)| sender.try_send(frame.clone()).is_ok());
+            .retain(|(_, outbound)| outbound.push(frame.clone()));
     }
 }
 
@@ -586,12 +832,83 @@ struct Session {
     hub: Arc<Mutex<OutputHub>>,
     /// Shared with the drain and reaper threads, which only write facts to it.
     activity: Arc<Activity>,
-    /// Last size applied by [`SessionTable::resize`]; reporting it to clients
-    /// is a later step.
-    #[allow(dead_code, reason = "reported to clients in a later step")]
+    /// Last size applied by [`SessionTable::resize`].
     cols: u16,
-    #[allow(dead_code, reason = "reported to clients in a later step")]
     rows: u16,
+    /// What each attached client last asked for. One pty, many clients: the pty
+    /// holds the element-wise smallest ask, so no client renders a stream drawn
+    /// for a grid larger than its own. Detaching gives the size back.
+    ///
+    /// **Generation-3 bookkeeping, and it never sees a generation-2 client.**
+    /// Generation 2 has no per-subscriber ask: a resize there sets the pty
+    /// directly ([`SessionTable::resize_legacy`]) and is recorded nowhere, so
+    /// this table, `view_ids` and `focused_view` hold only gen-3 connections.
+    /// Mixed attachments follow from that one rule — the minimum is over the
+    /// gen-3 asks alone, a gen-2 resize overrides it until the next gen-3 ask,
+    /// and a gen-2 detach has nothing to give back.
+    sizes: Vec<(SubscriberId, (u16, u16))>,
+    /// Which terminal view each attached client is the pty for, from its
+    /// `Frame::Attach`. The only thing that can resolve [`Self::focused_view`]
+    /// to a client, and therefore to an ask.
+    view_ids: Vec<(SubscriberId, String)>,
+    /// The view whose ask the pty follows verbatim, set by `Frame::FocusSession`
+    /// and cleared only when that view's own client detaches. A view that has
+    /// not attached — or has not asked — falls back to the minimum until it
+    /// does; view ids are never reused, so a claim that never resolves is inert
+    /// rather than wrong.
+    focused_view: Option<String>,
+    /// When a client last wrote input, so hover claims can yield to a typist.
+    last_input: Option<Instant>,
+}
+
+impl Session {
+    /// The size the pty should hold. `None` when nobody is asking — the current
+    /// size then stands.
+    ///
+    /// The focused view's ask wins outright, because a user typing into one
+    /// terminal wants that terminal's geometry and not the smallest sibling's.
+    /// Everything else is the element-wise minimum, so no client renders a
+    /// stream drawn for a grid larger than its own.
+    fn effective_size(&self) -> Option<(u16, u16)> {
+        if let Some(view) = self.focused_view.as_deref()
+            && let Some((owner, _)) = self.view_ids.iter().find(|(_, id)| id == view)
+            && let Some((_, size)) = self.sizes.iter().find(|(who, _)| who == owner)
+        {
+            return Some(*size);
+        }
+        self.sizes
+            .iter()
+            .map(|(_, size)| *size)
+            .reduce(|(c, r), (c2, r2)| (c.min(c2), r.min(r2)))
+    }
+
+    /// Record which view a client is attaching on behalf of.
+    fn remember_view(&mut self, subscriber: SubscriberId, view_id: &str) {
+        self.view_ids.retain(|(who, _)| *who != subscriber);
+        self.view_ids.push((subscriber, view_id.to_owned()));
+    }
+
+    /// Drop a departing client's ask and its view — including the focus, if it
+    /// was the one holding it — and report the size the rest now need if it
+    /// changed.
+    fn forget_client(&mut self, subscriber: SubscriberId) -> Option<(u16, u16)> {
+        let mut touched = false;
+        if let Some(index) = self.view_ids.iter().position(|(who, _)| *who == subscriber) {
+            let (_, view) = self.view_ids.swap_remove(index);
+            if self.focused_view.as_deref() == Some(view.as_str()) {
+                self.focused_view = None;
+                touched = true;
+            }
+        }
+        let before = self.sizes.len();
+        self.sizes.retain(|(id, _)| *id != subscriber);
+        touched |= self.sizes.len() != before;
+        if !touched {
+            return None;
+        }
+        let effective = self.effective_size()?;
+        (effective != (self.cols, self.rows)).then_some(effective)
+    }
 }
 
 fn workspace_sessions_in(
@@ -628,7 +945,20 @@ pub struct SessionTable {
     /// persists that only serialize their snapshots can still reach
     /// [`StateStore::save`] in the opposite order, and the older set is then
     /// the one left on disk: a killed session back as a lost row, with its tab.
+    ///
+    /// Also the serialization point for a class-B mutation (§8.3), which holds
+    /// it across apply → persist → publish so that no second writer can
+    /// supersede the record a failed write would roll back.
     persisting: Mutex<()>,
+    /// Rows written to the ledger *before* their terminal was spawned, and not
+    /// in `sessions` yet. Every persist merges them in, so a create running
+    /// alongside another mutation cannot have its reservation swept off the
+    /// disk during the window it exists to cover. See [`Self::reserve`].
+    pending: Mutex<Vec<PersistedSession>>,
+    /// Whether the ledger this table was built from was readable — see
+    /// [`PersistedState::authoritative`]. Read by anything that would destroy
+    /// a terminal for not being named in it.
+    ledger_authoritative: bool,
     /// Open client connections, counted by the server. Part of the idle-exit
     /// decision: a daemon someone is talking to is not idle, whatever its
     /// table holds.
@@ -641,6 +971,20 @@ pub struct SessionTable {
     /// by a dead client — loses nothing in a swap and reconnects to the
     /// replacement on its own.
     active_connections: std::sync::atomic::AtomicUsize,
+    /// Test-only rendezvous: announce arrival, then wait to be let go. Armed by
+    /// one test at a time, parked at [`Self::test_gate`]'s two call sites — a
+    /// create spawned but not yet in the table, and a rename written but not
+    /// yet published. Neither window is reachable by holding any of the locks
+    /// above, since every one of them is taken and released inside it, so the
+    /// only way to land a `kill_workspace` there deterministically is from
+    /// inside.
+    #[cfg(test)]
+    test_gate: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl SessionTable {
@@ -666,10 +1010,12 @@ impl SessionTable {
     pub fn load(state: StateStore, status: StatusConfig) -> Arc<Self> {
         let mut sessions = HashMap::new();
         let previous = state.load();
+        let ledger_authoritative = previous.authoritative;
         if !previous.sessions.is_empty() {
             log::warn!(
-                "{} session(s) from a previous daemon cannot be resurrected; reporting them as lost",
-                previous.sessions.len()
+                "{} session(s) from a previous daemon: reporting them as lost{}",
+                previous.sessions.len(),
+                "; a pty cannot be resurrected"
             );
         }
         let had_previous = !previous.sessions.is_empty();
@@ -742,6 +1088,10 @@ impl SessionTable {
                     activity: Arc::new(Activity::new()),
                     cols: 0,
                     rows: 0,
+                    sizes: Vec::new(),
+                    view_ids: Vec::new(),
+                    focused_view: None,
+                    last_input: None,
                 },
             );
         }
@@ -771,8 +1121,12 @@ impl SessionTable {
             status,
             state,
             persisting: Mutex::new(()),
+            pending: Mutex::new(Vec::new()),
+            ledger_authoritative,
             connections: std::sync::atomic::AtomicUsize::new(0),
             active_connections: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_gate: Mutex::new(None),
         });
         if dirty && let Err(err) = table.persist() {
             log::warn!("could not rewrite session state: {err:#}");
@@ -868,23 +1222,42 @@ impl SessionTable {
             })
     }
 
+    /// The workspace a create names has to exist already: only
+    /// [`Self::create_workspace`] makes a record, and nothing about a session
+    /// makes one as a side effect.
+    fn require_workspace(&self, id: &str) -> TableResult<()> {
+        if id.is_empty() {
+            return Err(TableError::invalid_argument(
+                "a session needs the id of an existing workspace",
+            ));
+        }
+        if !self
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
+        {
+            return Err(TableError::not_found(format!("no such workspace {id}")));
+        }
+        Ok(())
+    }
+
     /// Spawn `request.command` on a fresh PTY and record the session.
     ///
-    /// The session always ends up in a workspace: an id naming no record
-    /// creates one rooted at the session's cwd, and an empty id gets a fresh
-    /// one. That is what "no free-floating sessions" means in practice — the
-    /// daemon never refuses a session for want of a workspace, it makes the
-    /// workspace.
+    /// Refused outright unless `request.workspace_id` names a record this
+    /// daemon holds — see [`Self::require_workspace`]. The check is not a
+    /// guarantee: `kill_workspace` can still win the window that ends at
+    /// [`Self::commit_created`], which is where the losing create is undone.
     ///
-    /// Every failure in here is the daemon's own — an `openpty` that failed, a
-    /// command that would not spawn — so they all arrive as
+    /// Every other failure in here is the daemon's own — an `openpty` that
+    /// failed, a command that would not spawn — so they all arrive as
     /// [`error_code::INTERNAL`] through [`TableError`]'s `anyhow` conversion.
-    pub fn create(self: &Arc<Self>, request: CreateRequest) -> TableResult<SessionInfo> {
-        let workspace_id = if request.workspace_id.is_empty() {
-            new_id()
-        } else {
-            request.workspace_id.clone()
-        };
+    ///
+    /// `async` and awaiting nothing: one signature for both platforms is what
+    /// keeps this one table.
+    pub async fn create(self: &Arc<Self>, request: CreateRequest) -> TableResult<SessionInfo> {
+        self.require_workspace(&request.workspace_id)?;
+        let workspace_id = request.workspace_id.clone();
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: request.rows.max(1),
@@ -918,10 +1291,19 @@ impl SessionTable {
             command.env(key, value);
         }
 
-        let child = pty
-            .slave
-            .spawn_command(command)
-            .with_context(|| format!("spawning {launched:?}"))?;
+        // §8.3 class C, plus the precondition silent-kill rests on: the ledger
+        // row is on disk before there is a child that could outlive this
+        // daemon. A reservation that cannot be written refuses the create
+        // while refusing it is still free.
+        let id = SessionId::new(new_id());
+        self.reserve(Self::reservation(&id, &workspace_id, &request))?;
+        let child = match pty.slave.spawn_command(command) {
+            Ok(child) => child,
+            Err(err) => {
+                self.abandon_reservation(&id);
+                return Err(err.context(format!("spawning {launched:?}")).into());
+            }
+        };
         // The slave fd must not outlive the spawn, or the master never sees EOF.
         drop(pty.slave);
 
@@ -944,74 +1326,30 @@ impl SessionTable {
                 // Nothing holds this child yet — no row, no reaper — so
                 // returning here would leave a process the daemon can never
                 // name again. Signal and reap it before the error goes out.
+                self.abandon_reservation(&id);
                 abandon(child);
                 return Err(err.into());
             }
         };
 
-        let scrollback = request
-            .scrollback_bytes
-            .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
-            .unwrap_or(DEFAULT_SCROLLBACK_BYTES);
-        // The screen starts at the size the pty was opened at, so a client that
-        // attaches before ever resizing gets a repaint at the size it asked for.
-        let hub = Arc::new(Mutex::new(OutputHub::new(
-            scrollback,
-            Some(SessionGrid::new(request.cols, request.rows)),
-            None,
-        )));
-
-        let id = SessionId::new(new_id());
-        let created_at = now_unix();
-        let info = SessionInfo {
-            id: id.clone(),
-            workspace_id: workspace_id.clone(),
-            agent_kind: request.agent_kind,
-            instance_label: request.instance_label,
-            cwd: request.cwd,
-            created_at,
-            // What the first sweep would derive anyway: a just-launched agent
-            // is booting, not idle. Setting it here rather than letting the
-            // sweeper correct it keeps `Created` honest and saves every new
-            // session a spurious first transition.
-            status: SessionStatus::Working,
-        };
-        let activity = Arc::new(Activity::new());
-
-        {
-            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions.insert(
-                id.clone(),
-                Session {
-                    info: info.clone(),
-                    since: created_at,
-                    lost: false,
-                    live: Some(Live {
-                        master: pty.master,
-                        writer: Arc::new(Mutex::new(writer)),
-                        killer,
-                        pid,
-                    }),
-                    hub: hub.clone(),
-                    activity: activity.clone(),
-                    cols: request.cols,
-                    rows: request.rows,
-                },
-            );
-            // The workspace event makes the session event meaningful. Keep
-            // both under the session lock so kill/open cannot observe the row
-            // between them, and announce a newly minted workspace first.
-            self.ensure_workspace(&workspace_id, &info);
-            self.events
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .publish(&Frame::Created {
-                    session: info.clone(),
-                    request_id: None,
-                });
-        }
-        if let Err(err) = self.persist() {
-            log::warn!("could not persist session state: {err:#}");
+        let (info, hub, activity) = self.record_created(
+            id.clone(),
+            workspace_id,
+            request,
+            Live {
+                master: pty.master,
+                writer: Arc::new(Mutex::new(writer)),
+                killer,
+                pid,
+            },
+        );
+        if let Err(err) = self.commit_created(&info) {
+            // Class C's compensation: a live session that is unpersisted, or
+            // whose workspace was killed under it, is exactly the state a
+            // restart cannot describe — and this one is empty.
+            let _ = self.remove_session(&id).await;
+            abandon(child);
+            return Err(err);
         }
 
         let (exit_sender, exit_receiver) = std::sync::mpsc::sync_channel(1);
@@ -1027,77 +1365,275 @@ impl SessionTable {
         Ok(info)
     }
 
-    /// Create a workspace, its first login-shell session, and a one-leaf layout
-    /// holding that session's terminal tab.
-    ///
-    /// One call, because that is what the gesture is: "Add workspace" is a
-    /// single click and a window that opens with a terminal in it.
-    pub fn create_workspace(
-        self: &Arc<Self>,
-        request: WorkspaceRequest,
-    ) -> TableResult<(WorkspaceInfo, SessionInfo)> {
-        let id = new_id();
-        let name = request
-            .name
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| default_workspace_name(&request.root));
-        let project_root = request.root;
-        // Empty command: the login shell, resolved by this daemon on this host.
-        let session = self.create(CreateRequest {
-            workspace_id: id.clone(),
-            cwd: project_root.clone(),
-            command: String::new(),
-            env: request.env,
-            cols: request.cols,
-            rows: request.rows,
-            agent_kind: "shell".to_owned(),
-            instance_label: name.clone(),
-            scrollback_bytes: None,
-        })?;
-        let workspace = WorkspaceInfo {
-            id,
-            name,
-            project_root,
-            created_at: session.created_at,
-            layout_rev: 1,
-            layout: LayoutDoc::single_terminal(session.id.clone()),
-        };
-        Ok((workspace, session))
+    /// The ledger row a create writes before it spawns anything. Everything in
+    /// it is known from the request.
+    fn reservation(
+        id: &SessionId,
+        workspace_id: &str,
+        request: &CreateRequest,
+    ) -> PersistedSession {
+        PersistedSession {
+            id: id.clone(),
+            workspace_id: workspace_id.to_owned(),
+            agent_kind: request.agent_kind.clone(),
+            instance_label: request.instance_label.clone(),
+            cwd: request.cwd.clone(),
+            created_at: now_unix(),
+        }
     }
 
-    /// Record a workspace for a session that named one the daemon does not
-    /// have. Called with the session lock held; see [`Self::create`].
-    fn ensure_workspace(&self, id: &str, session: &SessionInfo) {
-        let created = {
-            let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
-            if workspaces.contains_key(id) {
-                return;
-            }
-            let name = if session.instance_label.is_empty() {
-                default_workspace_name(&session.cwd)
-            } else {
-                session.instance_label.clone()
-            };
-            let workspace = WorkspaceInfo {
-                id: id.to_owned(),
-                name,
-                project_root: session.cwd.clone(),
-                created_at: session.created_at,
-                layout_rev: 1,
-                layout: LayoutDoc::single_terminal(session.id.clone()),
-            };
-            workspaces.insert(id.to_owned(), workspace.clone());
-            workspace
+    /// The tail both [`create`](Self::create) halves share: from the platform's
+    /// [`Live`] value to the published, persisted row.
+    ///
+    /// Nothing is announced here: §8.3 class C wants the ledger row down before
+    /// any subscriber is told the session exists, so the events belong to
+    /// [`Self::commit_created`].
+    fn record_created(
+        self: &Arc<Self>,
+        id: SessionId,
+        workspace_id: String,
+        request: CreateRequest,
+        live: Live,
+    ) -> (SessionInfo, Arc<Mutex<OutputHub>>, Arc<Activity>) {
+        #[cfg(test)]
+        self.test_gate();
+        let scrollback = request
+            .scrollback_bytes
+            .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
+            .unwrap_or(DEFAULT_SCROLLBACK_BYTES);
+        // The screen starts at the size the pty was opened at, so a client that
+        // attaches before ever resizing gets a repaint at the size it asked for.
+        let hub = Arc::new(Mutex::new(OutputHub::new(
+            scrollback,
+            Some(SessionGrid::new(request.cols, request.rows)),
+            None,
+        )));
+
+        let created_at = now_unix();
+        let info = SessionInfo {
+            id: id.clone(),
+            workspace_id,
+            agent_kind: request.agent_kind,
+            instance_label: request.instance_label,
+            cwd: request.cwd,
+            created_at,
+            // What the first sweep would derive anyway: a just-launched agent
+            // is booting, not idle. Setting it here rather than letting the
+            // sweeper correct it keeps `Created` honest and saves every new
+            // session a spurious first transition.
+            status: SessionStatus::Working,
         };
+        let activity = Arc::new(Activity::new());
+
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id,
+                Session {
+                    info: info.clone(),
+                    since: created_at,
+                    lost: false,
+                    live: Some(live),
+                    hub: hub.clone(),
+                    activity: activity.clone(),
+                    cols: request.cols,
+                    rows: request.rows,
+                    sizes: Vec::new(),
+                    view_ids: Vec::new(),
+                    focused_view: None,
+                    last_input: None,
+                },
+            );
+        (info, hub, activity)
+    }
+
+    /// Put a just-created session's row on disk and only then announce it.
+    ///
+    /// §8.3 class C: the requester's ack and every subscriber's `created` come
+    /// after the write, so a failure here costs a session that is milliseconds
+    /// old and empty instead of leaving a live terminal the ledger cannot
+    /// describe. The caller compensates by killing it.
+    ///
+    /// The session lock is re-taken to publish: a kill that won the gap has
+    /// already removed the row and published its `removed`, and announcing a
+    /// `created` after that would describe a session that is gone.
+    ///
+    /// **The workspace is rechecked here, and this is the only place it can
+    /// be.** [`Self::require_workspace`] runs before the spawn, but a
+    /// `kill_workspace` whose critical section falls between `reserve` and the
+    /// insert above sweeps a session that is not in the map yet — so the record
+    /// can be gone by now, and nothing re-creates it. That create loses:
+    /// `NOT_FOUND` sends the caller down class C's compensation path, which
+    /// kills the shell and takes the row back off the disk. The doomed row this
+    /// persist just wrote is superseded by the compensating one.
+    fn commit_created(&self, info: &SessionInfo) -> TableResult<()> {
+        // The real row is in `sessions` now and supersedes the reservation.
+        self.release(&info.id);
+        self.persist().map_err(|err| {
+            TableError::persist_failed(format!("could not record session {}: {err:#}", info.id))
+        })?;
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        // Before the session check, because a `kill_workspace` takes both and
+        // the workspace is the one that says so whichever side of the insert it
+        // landed on.
+        if !self
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&info.workspace_id)
+        {
+            return Err(TableError::not_found(format!(
+                "workspace {} was killed while session {} was starting",
+                info.workspace_id, info.id
+            )));
+        }
+        if !sessions.contains_key(&info.id) {
+            return Ok(());
+        }
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        events.publish(&Frame::Created {
+            session: info.clone(),
+            persisted: self.persisted(),
+            request_id: None,
+        });
+        Ok(())
+    }
+
+    /// Create a workspace record — that alone, with no session and no layout.
+    ///
+    /// What a panel row is before anything is put in it; a workspace with no
+    /// sessions is a normal state. Nothing spawns, so nothing about a terminal
+    /// is involved. The row's first terminal is a separate [`Self::create`]
+    /// naming this id.
+    pub fn create_workspace(&self, request: WorkspaceRequest) -> TableResult<WorkspaceInfo> {
+        self.commit_workspace(new_workspace(request), None)
+    }
+
+    /// Generation 2's auto-create: the record under the id the client named, or
+    /// the one already there. `true` means this call made it.
+    ///
+    /// Check, insert, persist and publish are **one section under
+    /// `persisting`**, which is what a `contains_key` guard alone cannot give:
+    /// a row inserted before its write completed is a row a second requester
+    /// would adopt and the first requester's failing persist would then remove
+    /// out from under it. A reuse is therefore only ever returned after the
+    /// creating write landed — and only the creator is told it created, since
+    /// compensating a row someone else owns would take their sessions with it.
+    ///
+    /// An id-less request mints a fresh one and cannot collide, so it stays
+    /// [`Self::create_workspace`].
+    pub fn ensure_workspace(
+        &self,
+        request: WorkspaceRequest,
+    ) -> TableResult<(WorkspaceInfo, bool)> {
+        let Some(id) = request.id.clone() else {
+            return self.create_workspace(request).map(|w| (w, true));
+        };
+        let record = new_workspace(request);
+        let persisting = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = self
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+        {
+            return Ok((existing.clone(), false));
+        }
+        self.commit_workspace(record, Some(&persisting))
+            .map(|w| (w, true))
+    }
+
+    /// Take back a workspace this request created and nothing has used.
+    ///
+    /// Compensation for a generation-2 create that could not be completed. Only
+    /// *empty*, and emptiness is decided inside the removal's own critical
+    /// section: between the create and the failure a concurrent request may
+    /// have put a session in it, and that workspace is no longer this request's
+    /// to remove. Nothing left to compensate is `Ok`, not an error.
+    pub async fn remove_empty_workspace(&self, id: &str) -> TableResult<()> {
+        match self.remove_workspace(id, true).await {
+            Err(err) if err.code == error_code::NOT_FOUND => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Put a new workspace's record on disk and only then announce it.
+    ///
+    /// §8.3 class C: nothing was spawned, so a write the ledger refuses is
+    /// undone completely — the record goes back out of memory and the requester
+    /// is told, and the compensating `workspace_removed` covers the one thing
+    /// that cannot be taken back, a subscriber that saw the creation. A
+    /// workspace absent from the ledger cannot be described after a restart,
+    /// and nothing the user put there exists yet.
+    ///
+    /// The map is rechecked after the write because `kill_workspace` can take
+    /// the record during it, and then this create lost: publishing `workspace`
+    /// after that kill's `workspace_removed` would leave every subscriber a row
+    /// nothing will ever remove again. **The ledger needs no repair in that
+    /// case**: [`Self::persist`] snapshots the live map rather than a captured
+    /// value, and both writes serialize on `persisting`, so whichever lands
+    /// last still writes a map the removal has already left.
+    ///
+    /// `held` is `persisting` when the caller already has it, because its check
+    /// and this write must be one section ([`Self::ensure_workspace`]). A plain
+    /// create takes it inside the ledger write, as it always did.
+    fn commit_workspace(
+        &self,
+        workspace: WorkspaceInfo,
+        held: Option<&MutexGuard<'_, ()>>,
+    ) -> TableResult<WorkspaceInfo> {
+        self.workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(workspace.id.clone(), workspace.clone());
+        let recorded = match held {
+            Some(_) => self.persist_serialized(),
+            None => self.persist(),
+        };
+        if let Err(err) = recorded {
+            // Only what this create put there is taken back — a kill that got
+            // there first has already published its own removal.
+            let removed = self
+                .workspaces
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&workspace.id)
+                .is_some();
+            if removed {
+                self.events
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .publish(&Frame::WorkspaceRemoved {
+                        workspace_id: workspace.id.clone(),
+                        persisted: self.persisted(),
+                        request_id: None,
+                    });
+            }
+            return Err(TableError::persist_failed(format!(
+                "could not record workspace {}: {err:#}",
+                workspace.id
+            )));
+        }
+        // Held across the publish, the way `kill_workspace` holds it across its
+        // own: otherwise a kill in that gap publishes its removal first.
+        let workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+        if !workspaces.contains_key(&workspace.id) {
+            return Err(TableError::not_found(format!(
+                "workspace {} was killed while it was being created",
+                workspace.id
+            )));
+        }
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .publish(&Frame::Workspace {
-                workspace: created,
-                sessions: vec![session.clone()],
+                workspace: workspace.clone(),
+                sessions: Vec::new(),
+                persisted: self.persisted(),
                 request_id: None,
             });
+        Ok(workspace)
     }
 
     /// A workspace and every session in it. An id this daemon does not hold is
@@ -1137,19 +1673,29 @@ impl SessionTable {
     /// terminal tab names a session this daemon owns **in this workspace** —
     /// what an editor tab holds is the client's business.
     ///
-    /// On success the accepted layout is pushed to every *other* subscriber as
-    /// [`Frame::LayoutChanged`]; the writer gets its own reply from
-    /// [`crate::server`]. Contrast [`Self::scrub_layout`], which broadcasts to
-    /// everyone *including* the client that caused it — there the daemon
-    /// decided and nobody is already holding the document.
+    /// On success the accepted layout is pushed to every subscriber but
+    /// `writer` as [`Frame::LayoutChanged`]; the writer gets its own reply from
+    /// [`crate::server`]. `None` excludes nobody, for the one write whose
+    /// requester has no reply to learn the layout from — see
+    /// [`Self::install_legacy_layout`]. Contrast [`Self::scrub_layout`], which
+    /// always broadcasts to everyone: there the daemon decided and nobody is
+    /// already holding the document.
+    ///
+    /// **§8.3 class B**: nothing outside this process has changed, so the order
+    /// is strict — apply, persist, *then* publish. A write that cannot be
+    /// recorded is rolled back and never announced, so nothing ever observed
+    /// it. `persisting` is held across all three, which is what makes the
+    /// rollback safe without a revision test: no other writer can have taken
+    /// the record in between.
     pub fn update_layout(
         &self,
         id: &str,
         layout: LayoutDoc,
         rev: u64,
-        writer: SubscriberId,
+        writer: Option<SubscriberId>,
     ) -> TableResult<()> {
-        {
+        let _persisting = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
             let workspace = workspaces
@@ -1180,25 +1726,78 @@ impl SessionTable {
                     Some(_) => {}
                 }
             }
-            workspace.layout = layout.clone();
+            let previous = (
+                std::mem::replace(&mut workspace.layout, layout.clone()),
+                workspace.layout_rev,
+            );
             workspace.layout_rev = rev;
-            self.events
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .publish_except(
-                    writer,
-                    &Frame::LayoutChanged {
-                        workspace_id: id.to_owned(),
-                        layout,
-                        rev,
-                        request_id: None,
-                    },
-                );
+            previous
+        };
+        if let Err(err) = self.persist_serialized() {
+            let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(workspace) = workspaces.get_mut(id) {
+                (workspace.layout, workspace.layout_rev) = previous;
+            }
+            return Err(TableError::persist_failed(format!(
+                "could not record the layout of workspace {id}: {err:#}"
+            )));
         }
-        if let Err(err) = self.persist() {
-            log::warn!("could not persist workspace state: {err:#}");
+        let changed = Frame::LayoutChanged {
+            workspace_id: id.to_owned(),
+            layout,
+            rev,
+            persisted: self.persisted(),
+            request_id: None,
+        };
+        let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+        match writer {
+            Some(writer) => events.publish_except(writer, &changed),
+            None => events.publish(&changed),
         }
         Ok(())
+    }
+
+    /// Put `session`'s tab in the workspace's layout, converging with whoever
+    /// else is writing it.
+    ///
+    /// Generation 2 made the record, its first shell and its one-leaf layout
+    /// one outcome, so a lost revision race is retried rather than reported:
+    /// re-read, stop if the tab is already there, otherwise append it to the
+    /// document that won and write at *its* rev + 1. **The concurrent document
+    /// is never replaced** — a fresh one-leaf write would delete tabs a client
+    /// already has on screen.
+    ///
+    /// Published to everyone, the requester included: at generation 2 the
+    /// layout arrived inside the workspace event, so an old client that
+    /// subscribed on the connection it created from has no reply to learn it
+    /// from. The bound on the retries is a livelock guard, not a semantic — a
+    /// workspace being rewritten this hard has a live writer and the loser's
+    /// error is the honest answer.
+    pub fn install_legacy_layout(
+        &self,
+        workspace_id: &str,
+        session: &SessionId,
+    ) -> TableResult<()> {
+        /// Racing writers this converges with before giving up.
+        const ATTEMPTS: usize = 8;
+        let mut last = None;
+        for _ in 0..ATTEMPTS {
+            let (workspace, _) = self.open_workspace(workspace_id)?;
+            if workspace.layout.terminal_sessions().contains(session) {
+                return Ok(());
+            }
+            let mut layout = workspace.layout;
+            append_terminal(&mut layout.root, session);
+            match self.update_layout(workspace_id, layout, workspace.layout_rev + 1, None) {
+                Err(err) if err.code == error_code::STALE_REV => last = Some(err),
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            TableError::stale_rev(format!(
+                "workspace {workspace_id} was rewritten while its first tab was being added"
+            ))
+        }))
     }
 
     /// Give a workspace a new display name, keeping its id.
@@ -1228,28 +1827,51 @@ impl SessionTable {
                 "a workspace name cannot be empty",
             ));
         }
-        let (workspace, workspace_sessions) = {
+        // Class B, exactly as [`Self::update_layout`]: apply, persist, publish,
+        // all under `persisting` so a failed write can be rolled back onto a
+        // record no other writer can have taken meanwhile.
+        let _persisting = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        let (workspace, workspace_sessions, previous) = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
             let workspace = workspaces
                 .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such workspace {id}")))?;
-            workspace.name = name.to_owned();
+            let previous = std::mem::replace(&mut workspace.name, name.to_owned());
             let workspace = workspace.clone();
             let workspace_sessions = workspace_sessions_in(&sessions, id);
-            self.events
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .publish(&Frame::Workspace {
-                    workspace: workspace.clone(),
-                    sessions: workspace_sessions.clone(),
-                    request_id: None,
-                });
-            (workspace, workspace_sessions)
+            (workspace, workspace_sessions, previous)
         };
-        if let Err(err) = self.persist() {
-            log::warn!("could not persist workspace state: {err:#}");
+        if let Err(err) = self.persist_serialized() {
+            let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(workspace) = workspaces.get_mut(id) {
+                workspace.name = previous;
+            }
+            return Err(TableError::persist_failed(format!(
+                "could not record the new name of workspace {id}: {err:#}"
+            )));
         }
+        #[cfg(test)]
+        self.test_gate();
+        // [`Self::commit_workspace`]'s recheck, for the same reason and held
+        // across the publish the same way: a kill can take the record during
+        // the write, and a `workspace` frame after its `workspace_removed`
+        // leaves every subscriber a row nothing will remove again.
+        let workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+        if !workspaces.contains_key(id) {
+            return Err(TableError::not_found(format!(
+                "workspace {id} was killed while it was being renamed"
+            )));
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish(&Frame::Workspace {
+                workspace: workspace.clone(),
+                sessions: workspace_sessions.clone(),
+                persisted: self.persisted(),
+                request_id: None,
+            });
         Ok((workspace, workspace_sessions))
     }
 
@@ -1262,9 +1884,12 @@ impl SessionTable {
     /// **Naming the doomed sessions and dropping the record are one critical
     /// section**, `sessions` then `workspaces` as the note on the type
     /// requires. Between two separate acquisitions a `CreateSession` naming
-    /// this workspace can land its row *and* have [`Self::ensure_workspace`]
-    /// put the record back, so the removal would take out a workspace that had
-    /// just acquired a live session — announced as gone while it exists.
+    /// this workspace can land its row after the sweep and before the removal,
+    /// leaving a live session whose workspace was announced gone.
+    ///
+    /// A create still in flight is *not* covered by this section — its row is
+    /// not in the map yet — so the loser is caught at
+    /// [`Self::commit_created`] instead, which rechecks the record.
     ///
     /// Session rows and all removal events are committed under that same
     /// section. Their ptys are signalled only after the locks are released.
@@ -1272,7 +1897,21 @@ impl SessionTable {
     /// [`error_code::NOT_FOUND`] if there was no such workspace and no session
     /// claiming it — killing the same workspace twice is an error, not a second
     /// removal.
-    pub fn kill_workspace(&self, id: &str) -> TableResult<()> {
+    ///
+    /// **The kills run after the critical section, not before it**, which is
+    /// where this differs from [`Self::kill`]: a single session has nothing to
+    /// race, but a `CreateSession` naming this workspace can land a new session
+    /// between a kill pass and the section that removes the rows, leaving a child
+    /// the table has just forgotten and nothing ever killed. Remove first, kill
+    /// what was removed.
+    pub async fn kill_workspace(&self, id: &str) -> TableResult<()> {
+        self.remove_workspace(id, false).await
+    }
+
+    /// [`Self::kill_workspace`], with the emptiness test of
+    /// [`Self::remove_empty_workspace`] inside the same critical section that
+    /// decides what dies — the only place it cannot be raced.
+    async fn remove_workspace(&self, id: &str, only_if_empty: bool) -> TableResult<()> {
         let mut removed = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
@@ -1281,10 +1920,23 @@ impl SessionTable {
                 .filter(|session| session.info.workspace_id == id)
                 .map(|session| session.info.id.clone())
                 .collect();
+            if only_if_empty && !doomed.is_empty() {
+                return Ok(());
+            }
             let existed = workspaces.remove(id).is_some();
             if !existed && doomed.is_empty() {
                 return Err(TableError::not_found(format!("no such workspace {id}")));
             }
+            // A reservation naming this workspace goes with it, inside the same
+            // section: the create that wrote it is still spawning, and the
+            // persist below would otherwise leave a row whose workspace is gone
+            // — which the next daemon's load migrates back into a workspace.
+            // That create's own commit recheck answers NOT_FOUND and takes its
+            // terminal back down.
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|record| record.workspace_id != id);
             let removed: Vec<Session> = doomed
                 .iter()
                 .filter_map(|session_id| sessions.remove(session_id))
@@ -1303,6 +1955,7 @@ impl SessionTable {
             }
             events.publish(&Frame::WorkspaceRemoved {
                 workspace_id: id.to_owned(),
+                persisted: self.persisted(),
                 request_id: None,
             });
             removed
@@ -1315,22 +1968,26 @@ impl SessionTable {
             wait_for_termination(termination);
         }
         drop(removed);
-        if let Err(err) = self.persist() {
-            log::warn!("could not persist workspace state: {err:#}");
-        }
-        Ok(())
+        // Class A (§8.3): the children are dead and the events describing that
+        // have gone out unconditionally, because reality does not roll back.
+        // Only the ack can carry a failure to record it, so it does.
+        self.persist().map_err(|err| {
+            TableError::persist_failed(format!(
+                "workspace {id} was killed and could not be recorded: {err:#}"
+            ))
+        })
     }
 
-    /// Register `sender` for the event stream and push the initial snapshot:
+    /// Register `outbound` for the event stream and push the initial snapshot:
     /// one [`Frame::Status`] per session, including exited and lost ones.
     ///
     /// The snapshot is built and sent while the registration is in place and
     /// the session lock is held, so nothing can change status in the gap.
     /// Subscribing twice just resends the snapshot.
-    pub fn subscribe(&self, subscriber: SubscriberId, sender: &Sender<Frame>) {
+    pub fn subscribe(&self, subscriber: SubscriberId, outbound: &Outbound) {
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let mut events = self.events.lock().unwrap_or_else(|e| e.into_inner());
-        events.subscribe(subscriber, sender);
+        events.subscribe(subscriber, outbound);
         let mut snapshot: Vec<&Session> = sessions.values().collect();
         snapshot.sort_by(|a, b| {
             a.info
@@ -1339,21 +1996,18 @@ impl SessionTable {
                 .then(a.info.id.cmp(&b.info.id))
         });
         for session in snapshot {
-            if sender
-                .try_send(Frame::Status {
-                    session_id: session.info.id.clone(),
-                    status: session.info.status,
-                    since: session.since,
-                })
-                .is_err()
-            {
+            if !outbound.push(Frame::Status {
+                session_id: session.info.id.clone(),
+                status: session.info.status,
+                since: session.since,
+            }) {
                 events.unsubscribe(subscriber);
                 break;
             }
         }
     }
 
-    /// Queue a [`Frame::Replay`] of the whole ring on `sender`, then stream
+    /// Queue a [`Frame::Replay`] of the whole ring on `outbound`, then stream
     /// live [`Frame::Output`] there until detach or disconnect — followed by
     /// the [`Frame::Exited`] or [`Frame::Removed`] that ends the stream, so an
     /// attached client never has to subscribe just to learn its session is
@@ -1362,58 +2016,109 @@ impl SessionTable {
     /// [`error_code::NOT_FOUND`] for an unknown session. Attaching to an exited
     /// or lost session succeeds and replays whatever the ring holds — that is
     /// how a crashed agent's last words stay readable.
-    pub fn attach(
+    ///
+    /// `view_id` is which terminal view this client draws — absent from an
+    /// older client, and then this connection can never be a focus owner.
+    pub async fn attach(
         &self,
         id: &SessionId,
         subscriber: SubscriberId,
-        sender: &Sender<Frame>,
+        outbound: &Outbound,
+        view_id: Option<&str>,
     ) -> TableResult<()> {
-        let hub = {
-            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            match sessions.get(id) {
-                Some(session) => session.hub.clone(),
+        let (hub, resize) = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.get_mut(id) {
+                Some(session) => {
+                    let mut resize = None;
+                    if let Some(view_id) = view_id {
+                        session.remember_view(subscriber, view_id);
+                        // The view may resolve a focus claim that was waiting
+                        // for it; its ask then owns the pty from the first
+                        // painted byte, not from the next resize.
+                        if session.focused_view.as_deref() == Some(view_id) {
+                            resize = session
+                                .effective_size()
+                                .filter(|&size| size != (session.cols, session.rows));
+                        }
+                    }
+                    (session.hub.clone(), resize)
+                }
                 None => return Err(TableError::not_found(format!("no such session {id}"))),
             }
         };
+        if let Some((cols, rows)) = resize {
+            self.apply_size(id, cols, rows).await?;
+        }
         hub.lock()
             .unwrap_or_else(|e| e.into_inner())
-            .attach(id, subscriber, sender);
+            .attach(id, subscriber, outbound);
+        log::info!("session {id} attached (subscriber {subscriber})");
         Ok(())
     }
 
     /// Stop streaming this session to this connection. **Never touches the
-    /// session**, and detaching something that was not attached is a no-op.
-    pub fn detach(&self, id: &SessionId, subscriber: SubscriberId) {
-        let hub = {
-            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            match sessions.get(id) {
-                Some(session) => session.hub.clone(),
+    /// session** beyond giving back the size it was holding down — and the
+    /// focus, if this was the view holding it — and detaching something that
+    /// was not attached is a no-op.
+    pub async fn detach(&self, id: &SessionId, subscriber: SubscriberId) {
+        let (hub, grown) = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            match sessions.get_mut(id) {
+                Some(session) => (session.hub.clone(), session.forget_client(subscriber)),
                 None => return,
             }
         };
         hub.lock()
             .unwrap_or_else(|e| e.into_inner())
             .detach(subscriber);
+        if let Some((cols, rows)) = grown {
+            self.grow_back(id, cols, rows).await;
+        }
     }
 
     /// Detach `subscriber` from every session and from the event stream. This
     /// is what a dropped connection does — and all it does.
-    pub fn detach_all(&self, subscriber: SubscriberId) {
+    pub async fn detach_all(&self, subscriber: SubscriberId) {
         self.events
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .unsubscribe(subscriber);
-        let hubs: Vec<Arc<Mutex<OutputHub>>> = {
-            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        type Detaching = (SessionId, Arc<Mutex<OutputHub>>, Option<(u16, u16)>);
+        let hubs: Vec<Detaching> = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             sessions
-                .values()
-                .map(|session| session.hub.clone())
+                .values_mut()
+                .map(|session| {
+                    (
+                        session.info.id.clone(),
+                        session.hub.clone(),
+                        session.forget_client(subscriber),
+                    )
+                })
                 .collect()
         };
-        for hub in hubs {
-            hub.lock()
+        for (id, hub, grown) in hubs {
+            let was_attached = hub
+                .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .detach(subscriber);
+            if was_attached {
+                log::info!("session {id} attach ended (subscriber {subscriber} connection closed)");
+            }
+            if let Some((cols, rows)) = grown {
+                self.grow_back(&id, cols, rows).await;
+            }
+        }
+    }
+
+    /// Hand the size back to the clients still attached. Nobody asked for this
+    /// resize, so a session that cannot take it is a log line, not a refusal.
+    /// Callers hold `sizing`: the grow-back decision is `forget_client`, made
+    /// before this, and the two are one size operation.
+    async fn grow_back(&self, id: &SessionId, cols: u16, rows: u16) {
+        if let Err(error) = self.apply_size(id, cols, rows).await {
+            log::warn!("session {id} could not grow back to {cols}x{rows} after a detach: {error}");
         }
     }
 
@@ -1426,12 +2131,16 @@ impl SessionTable {
     /// daemon, or exited — is [`error_code::INVALID_ARGUMENT`] and not
     /// `not_found`: the id names a row the client can still see, so telling it
     /// the session is gone would send it looking for the wrong bug.
-    pub fn write(&self, id: &SessionId, bytes: &[u8]) -> TableResult<()> {
-        let writer = {
-            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+    ///
+    /// **The lookup is the whole critical section and the write happens after
+    /// it**: nothing that can block is done under the table lock.
+    pub async fn write(&self, id: &SessionId, bytes: &[u8]) -> TableResult<()> {
+        let target = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
-                .get(id)
+                .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
+            session.last_input = Some(Instant::now());
             let Some(live) = session.live.as_ref() else {
                 return Err(TableError::invalid_argument(format!(
                     "session {id} was lost when the daemon restarted"
@@ -1444,7 +2153,7 @@ impl SessionTable {
             }
             live.writer.clone()
         };
-        let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let mut writer = target.lock().unwrap_or_else(|e| e.into_inner());
         writer
             .write_all(bytes)
             .with_context(|| format!("writing to session {id}"))?;
@@ -1452,6 +2161,113 @@ impl SessionTable {
             .flush()
             .with_context(|| format!("flushing session {id}"))?;
         Ok(())
+    }
+
+    /// Record what this client wants and hold the pty at the smallest ask.
+    ///
+    /// A size that changes nothing is not applied at all, so a second client
+    /// mounting a larger split leaves the stream — and every other client's
+    /// screen — exactly where it was.
+    pub async fn resize(
+        &self,
+        id: &SessionId,
+        subscriber: SubscriberId,
+        cols: u16,
+        rows: u16,
+    ) -> TableResult<()> {
+        let effective = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
+            let asked = (cols.max(1), rows.max(1));
+            session.sizes.retain(|(who, _)| *who != subscriber);
+            session.sizes.push((subscriber, asked));
+            let effective = session.effective_size().unwrap_or(asked);
+            log::info!(
+                "session {id} ask from subscriber {subscriber}: {}x{}, effective {}x{}, pty {}x{}",
+                asked.0,
+                asked.1,
+                effective.0,
+                effective.1,
+                session.cols,
+                session.rows
+            );
+            if effective == (session.cols, session.rows) {
+                return Ok(());
+            }
+            effective
+        };
+        self.apply_size(id, effective.0, effective.1).await
+    }
+
+    /// The generation-2 resize: last request wins, applied straight to the pty.
+    ///
+    /// No ask is recorded, so this connection stays outside every gen-3 table
+    /// (see [`Session::sizes`]) — including on detach, where there is nothing
+    /// of its to give back.
+    pub async fn resize_legacy(&self, id: &SessionId, cols: u16, rows: u16) -> TableResult<()> {
+        self.apply_size(id, cols.max(1), rows.max(1)).await
+    }
+
+    /// Hand the pty to one view: its ask becomes the size, instead of the
+    /// smallest ask among everyone attached.
+    ///
+    /// No size travels with the claim — the owner's own `resize` frames keep
+    /// supplying it, and this only changes which of them the pty follows. A
+    /// view nothing has attached with yet, or one that has not asked, leaves
+    /// the minimum standing until it does.
+    ///
+    /// `hover` claims are declined while the session was typed into recently
+    /// and some other view already holds the claim, so a stray mouse-over
+    /// cannot steal size from a typist.
+    ///
+    /// Same lock discipline as [`Self::resize`], and for the same reason: the
+    /// decision is made under the table lock, the pty call is made after it.
+    pub async fn focus(&self, id: &SessionId, view_id: &str, hover: bool) -> TableResult<()> {
+        let effective = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions
+                .get_mut(id)
+                .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
+            if hover
+                && session
+                    .last_input
+                    .is_some_and(|t| t.elapsed() < TYPING_HOLD)
+                && session.focused_view.as_deref() != Some(view_id)
+            {
+                log::info!(
+                    "session {id} hover claim by view {view_id} deferred: the session is being typed into"
+                );
+                return Ok(());
+            }
+            let already = session.focused_view.as_deref() == Some(view_id);
+            session.focused_view = Some(view_id.to_owned());
+            let view_ask = session
+                .view_ids
+                .iter()
+                .find(|(_, id)| id == view_id)
+                .and_then(|(owner, _)| session.sizes.iter().find(|(who, _)| who == owner))
+                .map(|(_, size)| *size);
+            let effective = session.effective_size();
+            // Repeated claims from the size owner stay quiet; anything that
+            // changes the owner or the size is worth a line.
+            if !already || effective.is_some_and(|e| e != (session.cols, session.rows)) {
+                log::info!(
+                    "session {id} claim by view {view_id}: view ask {view_ask:?}, effective {effective:?}, pty {}x{}",
+                    session.cols,
+                    session.rows
+                );
+            }
+            let Some(effective) = effective else {
+                return Ok(());
+            };
+            if effective == (session.cols, session.rows) {
+                return Ok(());
+            }
+            effective
+        };
+        self.apply_size(id, effective.0, effective.1).await
     }
 
     /// Resize the screen, then the pty, and remember the new size.
@@ -1464,7 +2280,7 @@ impl SessionTable {
     /// for: a lost row that a client mounts into a small split has no pty to
     /// resize and no screen either, and erroring before recording the size
     /// would leave `cols`/`rows` lying about what the client asked for.
-    pub fn resize(&self, id: &SessionId, cols: u16, rows: u16) -> TableResult<()> {
+    async fn apply_size(&self, id: &SessionId, cols: u16, rows: u16) -> TableResult<()> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let session = sessions
             .get_mut(id)
@@ -1514,22 +2330,38 @@ impl SessionTable {
     /// scrub exists to prevent.
     ///
     /// [`error_code::NOT_FOUND`] if there is no such session.
-    pub fn kill(&self, id: &SessionId) -> TableResult<()> {
-        if self.remove_session(id) {
-            Ok(())
-        } else {
-            Err(TableError::not_found(format!("no such session {id}")))
+    pub async fn kill(&self, id: &SessionId) -> TableResult<()> {
+        match self.remove_session(id).await {
+            None => Err(TableError::not_found(format!("no such session {id}"))),
+            // Class A (§8.3): `removed` is already out and the child is already
+            // dead, so this error means "it happened and I could not record
+            // it" — never "try again".
+            Some(persisted) => persisted.map_err(|err| {
+                TableError::persist_failed(format!(
+                    "session {id} was killed and could not be recorded: {err:#}"
+                ))
+            }),
         }
     }
 
     /// [`Self::kill`]'s body, minus the classification.
     ///
     /// Returns `false` if there is no such session.
-    fn remove_session(&self, id: &SessionId) -> bool {
+    ///
+    /// Lookup and removal are two acquisitions of the session lock with the kill
+    /// between them, because nothing that can block may be done under it. A
+    /// second `kill` that wins the gap removes the row and this one answers
+    /// [`error_code::NOT_FOUND`] — what killing an already killed session means.
+    ///
+    /// `None` for a session that was not there; otherwise whether the removal
+    /// reached the ledger, which is the caller's to classify.
+    async fn remove_session(&self, id: &SessionId) -> Option<Result<()>> {
+        // `mut` for the unix killer below, which a Windows build does not have.
+        #[cfg_attr(windows, allow(unused_mut))]
         let mut session = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let Some(session) = sessions.remove(id) else {
-                return false;
+                return None;
             };
             let event = Frame::Removed {
                 session_id: id.clone(),
@@ -1552,10 +2384,11 @@ impl SessionTable {
             wait_for_termination(termination);
         }
         drop(session);
-        if let Err(err) = self.persist() {
-            log::warn!("could not persist session state: {err:#}");
-        }
-        true
+        // A reservation for this id, if the create that made it is being
+        // compensated, must not survive the removal it is being compensated
+        // for.
+        self.release(id);
+        Some(self.persist())
     }
 
     /// Take a killed session's terminal tab out of its workspace's layout.
@@ -1608,6 +2441,7 @@ impl SessionTable {
                 workspace_id: workspace_id.to_owned(),
                 layout: workspace.layout.clone(),
                 rev: workspace.layout_rev,
+                persisted: self.persisted(),
                 request_id: None,
             });
     }
@@ -1678,25 +2512,67 @@ impl SessionTable {
         &self.state
     }
 
-    /// Write every workspace, and the metadata of every *live* session. Lost
-    /// session rows are excluded on purpose (see [`SessionTable::load`]);
-    /// workspaces are not, because a workspace outlives the sessions in it.
+    /// Was the ledger behind this table readable? See
+    /// [`PersistedState::authoritative`]: `false` means "these rows are not
+    /// the whole truth", and nothing may be killed for being absent from them.
+    pub fn ledger_authoritative(&self) -> bool {
+        self.ledger_authoritative
+    }
+
+    /// What every mutation ack and every event this daemon publishes claims
+    /// about durability (§8.5): false while [`StateStore::save`] is a no-op —
+    /// a newer-schema ledger or one this daemon could not read — true
+    /// otherwise. Nothing clears either condition, so this is constant for the
+    /// process.
+    pub fn persisted(&self) -> bool {
+        !self.state.read_only()
+    }
+
+    /// Wait until this table is the whole truth about the sessions this daemon
+    /// serves.
     ///
-    /// Serialized end to end by `persisting`, and the two tables are snapshotted
-    /// under **one** acquisition — sessions then workspaces, the order the note
-    /// on the type gives. Both matter: taking them separately can pair a
-    /// session set with a workspace set that never coexisted, and writing
-    /// outside the guard lets a slower persist land its older pair last.
+    /// Every frame that reads or mutates the table waits here first; the
+    /// handshake deliberately does not — a client's connect budget is a process
+    /// start, never a replay. Returns at once when nothing is rehydrating, which
+    /// is every daemon here.
+    pub async fn ready(&self) {}
+
+    /// Write every workspace, and the metadata of every session whose terminal
+    /// may still exist. Lost session rows are excluded on purpose (see
+    /// [`SessionTable::load`]) — except the ones `keeps_a_live_terminal`
+    /// vouches for. Workspaces are never excluded, because a workspace outlives
+    /// the sessions in it.
+    ///
+    /// Serialized end to end by `persisting`, both tables snapshotted under
+    /// **one** acquisition — sessions then workspaces, the order the note on the
+    /// type gives. Both matter: separate acquisitions pair sets that never
+    /// coexisted, and writing outside the guard lets a slower persist land last.
     fn persist(&self) -> Result<()> {
         let _persisting = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        self.persist_serialized()
+    }
+
+    /// [`Self::persist`]'s body, for the callers that already hold
+    /// `persisting` because they need the write to be part of a longer
+    /// critical section.
+    fn persist_serialized(&self) -> Result<()> {
         let (records, workspaces) = {
             let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
             let mut records: Vec<PersistedSession> = sessions
                 .values()
-                .filter(|session| !session.lost)
+                .filter(|session| !session.lost || keeps_a_live_terminal(session))
                 .map(|session| PersistedSession::from_info(&session.info))
                 .collect();
+            // Reserved rows whose terminal is being spawned right now. A leaf
+            // lock, taken under the two above and never the other way round.
+            let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            records.extend(
+                pending
+                    .iter()
+                    .filter(|record| !sessions.contains_key(&record.id))
+                    .cloned(),
+            );
             records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
             let mut infos: Vec<WorkspaceInfo> = workspaces.values().cloned().collect();
             infos.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
@@ -1704,6 +2580,68 @@ impl SessionTable {
         };
         self.state.save(&records, &workspaces)
     }
+
+    /// Write a session's ledger row *before* its terminal is spawned.
+    ///
+    /// **A shell must never exist without a row.** A daemon that dies between
+    /// the spawn and the write leaves a terminal nothing can name, and a
+    /// terminal nothing can name is one the next daemon has to treat as a
+    /// stranger. So the row goes down first and the spawn follows it; the
+    /// reservation is withdrawn again if the spawn never happens.
+    ///
+    /// A create whose reservation cannot be written is refused *before*
+    /// anything is spawned, which is the one create failure that costs nothing.
+    fn reserve(&self, record: PersistedSession) -> TableResult<()> {
+        let id = record.id.clone();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(record);
+        self.persist().map_err(|err| {
+            self.release(&id);
+            TableError::persist_failed(format!("could not reserve a ledger row: {err:#}"))
+        })
+    }
+
+    /// Drop a reservation, without writing. The caller decides whether the
+    /// removal has to reach the disk: on the success path the create's own
+    /// persist writes the real row over it, on the failure path
+    /// [`Self::abandon_reservation`] writes the row away.
+    fn release(&self, id: &SessionId) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|record| &record.id != id);
+    }
+
+    /// Park here until the test that armed `test_gate` lets go; a no-op when
+    /// none did, which is every other test and every real daemon.
+    #[cfg(test)]
+    fn test_gate(&self) {
+        if let Some((arrived, go)) = self
+            .test_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// A spawn that never happened: take the reserved row off the disk again.
+    fn abandon_reservation(&self, id: &SessionId) {
+        self.release(id);
+        if let Err(err) = self.persist() {
+            log::warn!("could not withdraw the ledger row reserved for {id}: {err:#}");
+        }
+    }
+}
+
+/// A lost row on unix is a tombstone: the pty died with the daemon that owned
+/// it, and there is nothing left for a ledger row to name.
+fn keeps_a_live_terminal(_session: &Session) -> bool {
+    false
 }
 
 /// ADE's status-dot rules, in the order they are checked.
@@ -1758,6 +2696,9 @@ fn derive_status(session: &Session, config: StatusConfig, now: Instant) -> Sessi
 /// already gone, or a pty with no foreground group. The caller must skip the
 /// idle rule in that case rather than guess: reporting a working agent as idle
 /// is worse than reporting nothing.
+///
+/// Unix only, because only a unix `Live` has a master to ask. Windows skips the
+/// rule at the call site instead; see [`derive_status`].
 fn foreground_is_shell(master: &(dyn MasterPty + Send)) -> Option<bool> {
     #[cfg(target_os = "linux")]
     {
@@ -2166,20 +3107,27 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
 
-    use ade_session::proto::{LayoutDoc, SessionId, SessionInfo, SessionStatus, WorkspaceInfo};
+    use ade_session::proto::{
+        Frame, LayoutDoc, SessionId, SessionInfo, SessionStatus, WorkspaceInfo, error_code,
+    };
 
     use super::{
-        Activity, SessionTable, StatusConfig, SubscriberId, is_shell_name, login_shell_from, shell,
-        terminal_env,
+        Activity, Outbound, OutputHub, SessionTable, StatusConfig, SubscriberId, is_shell_name,
+        login_shell_from, shell, terminal_env,
     };
     #[cfg(unix)]
     use super::{KILL_GRACE, terminate_groups, wait_for_termination};
+    #[cfg(unix)]
+    use crate::server::OUTBOUND_QUEUE_BYTES;
+    /// The same bound, for the platforms that have no [`crate::server`] to take
+    /// it from — it is [`DEFAULT_SCROLLBACK_BYTES`] there too.
+    #[cfg(not(unix))]
+    const OUTBOUND_QUEUE_BYTES: u64 = super::DEFAULT_SCROLLBACK_BYTES as u64;
     use crate::state::{PersistedSession, StateStore};
 
-    /// Feed `chunks` to one session in order: is a bell pending after the last
-    /// of them? Goes through [`Activity`] rather than [`super::BellScan`]
-    /// alone because the scan state and the sticky-until-the-next-chunk rule
-    /// have to hold together.
+    /// Feed `chunks` to one session in order: is a bell pending after the last?
+    /// Through [`Activity`] rather than [`super::BellScan`] alone, because the
+    /// scan state and the sticky-until-the-next-chunk rule must hold together.
     fn bell_after(chunks: &[&[u8]]) -> bool {
         let activity = Activity::new();
         for chunk in chunks {
@@ -2190,11 +3138,10 @@ mod tests {
 
     /// A table holding one session and the workspace whose layout names it,
     /// built without a pty: the session is adopted as a *lost* row, which
-    /// [`SessionTable::kill`] removes exactly like a live one.
-    ///
-    /// The sweep interval is set past any test's lifetime on purpose — the
-    /// lock-scope tests below assert on who holds the session lock, and a
-    /// sweeper waking up mid-assertion would be a second answer to that.
+    /// [`SessionTable::kill`] removes exactly like a live one. The sweep interval
+    /// is past any test's lifetime on purpose: the lock-scope tests assert on who
+    /// holds the session lock, and a sweeper waking mid-assertion is a second
+    /// answer to that.
     fn seeded_table(dir: &std::path::Path) -> (Arc<SessionTable>, SessionId) {
         let session = SessionInfo {
             id: SessionId::new("session-1"),
@@ -2288,12 +3235,10 @@ mod tests {
     /// Long enough that a thread parked on a lock has certainly reached it.
     const REACHED_THE_LOCK: Duration = Duration::from_millis(250);
 
-    /// Removing the row and pruning its tab are **one** critical section.
-    ///
-    /// Made observable by holding the workspace lock from here: a `kill` that
-    /// took the two in turn would have let go of the session lock before
-    /// blocking, and that gap is exactly when a reader can be handed a layout
-    /// naming a session the table no longer has.
+    /// Removing the row and pruning its tab are **one** critical section. Made
+    /// observable by holding the workspace lock from here: a `kill` that took the
+    /// two in turn would have let go of the session lock before blocking, and
+    /// that gap is when a reader gets a layout naming a session that is gone.
     #[test]
     fn kill_holds_the_session_lock_across_the_layout_scrub() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2302,7 +3247,7 @@ mod tests {
 
         let killer = {
             let table = Arc::clone(&table);
-            std::thread::spawn(move || table.kill(&session))
+            std::thread::spawn(move || smol::block_on(table.kill(&session)))
         };
         std::thread::sleep(REACHED_THE_LOCK);
         assert!(
@@ -2325,8 +3270,8 @@ mod tests {
     }
 
     /// Naming the doomed sessions and dropping the record are one critical
-    /// section too, so a `CreateSession` cannot put the record back between
-    /// them and have it removed out from under a live session.
+    /// section too, so a `CreateSession` cannot put the record back between them
+    /// and have it removed out from under a live session.
     #[test]
     fn kill_workspace_holds_the_session_lock_across_dropping_the_record() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2335,7 +3280,7 @@ mod tests {
 
         let killer = {
             let table = Arc::clone(&table);
-            std::thread::spawn(move || table.kill_workspace("workspace-1"))
+            std::thread::spawn(move || smol::block_on(table.kill_workspace("workspace-1")))
         };
         std::thread::sleep(REACHED_THE_LOCK);
         assert!(
@@ -2382,9 +3327,8 @@ mod tests {
         );
     }
 
-    /// Listing layouts participates in the same snapshot even though it does
-    /// not return session rows. Otherwise it can slip between removing a
-    /// session and scrubbing that session's terminal tab.
+    /// Listing layouts joins the same snapshot even though it returns no session
+    /// rows: otherwise it slips between removing a session and scrubbing its tab.
     #[test]
     fn list_workspaces_holds_the_session_lock_until_layouts_are_cloned() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2405,9 +3349,8 @@ mod tests {
         assert_eq!(lister.join().expect("the lister thread").len(), 1);
     }
 
-    /// Rename publishes the workspace together with its sessions. It must use
-    /// the same transaction as kill, or a delayed rename can announce a stale
-    /// workspace after `WorkspaceRemoved`.
+    /// Rename publishes the workspace with its sessions, so it must use kill's
+    /// transaction or announce a stale workspace after `WorkspaceRemoved`.
     #[test]
     fn rename_workspace_holds_the_session_lock_through_its_snapshot() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2433,10 +3376,718 @@ mod tests {
         assert_eq!(sessions.len(), 1);
     }
 
-    /// The revision and its broadcast are one ordered operation. Releasing the
-    /// workspace lock first lets a later revision publish before this one.
+    /// Make every later [`crate::state::StateStore::save`] fail without
+    /// disturbing what the table already loaded: a directory cannot be renamed
+    /// over, on either platform.
+    pub(super) fn wedge_the_ledger(dir: &std::path::Path) {
+        let path = dir.join(crate::state::STATE_FILE);
+        let _ = std::fs::remove_file(&path);
+        std::fs::create_dir(&path).expect("wedging the ledger");
+    }
+
+    /// One subscriber, and everything it has been sent so far.
+    fn subscribed(table: &Arc<SessionTable>) -> (super::OutboundQueue, Outbound) {
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        table.subscribe(SubscriberId::next(), &outbound);
+        // The subscription snapshot is not what these tests are about.
+        while queue.try_recv().is_some() {}
+        (queue, outbound)
+    }
+
+    fn published(queue: &super::OutboundQueue) -> Vec<Frame> {
+        let mut frames = Vec::new();
+        while let Some(frame) = queue.try_recv() {
+            frames.push(frame);
+        }
+        frames
+    }
+
+    /// §8.3 class B: a record-only mutation nothing outside this process has
+    /// seen yet. A write that cannot be recorded is undone and never announced,
+    /// so no client ever acts on a layout the daemon does not have.
+    ///
+    /// Reverting the order — publish, then persist — leaves the event in the
+    /// queue and the revision in the table, and this fails on both.
     #[test]
-    fn update_layout_holds_the_workspace_lock_until_its_event_is_published() {
+    fn a_layout_that_cannot_be_recorded_is_rolled_back_and_never_announced() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        let before = table.list_workspaces();
+        wedge_the_ledger(dir.path());
+
+        let error = table
+            .update_layout(
+                "workspace-1",
+                LayoutDoc::empty(),
+                2,
+                Some(SubscriberId::next()),
+            )
+            .expect_err("a layout the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert_eq!(
+            table.list_workspaces(),
+            before,
+            "the layout and its revision must be back where they were"
+        );
+        assert!(
+            published(&queue).is_empty(),
+            "a layout nothing recorded was announced anyway"
+        );
+    }
+
+    /// The other class-B mutation, same contract.
+    #[test]
+    fn a_rename_that_cannot_be_recorded_is_rolled_back_and_never_announced() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        wedge_the_ledger(dir.path());
+
+        let error = table
+            .rename_workspace("workspace-1", "renamed")
+            .expect_err("a rename the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert_eq!(
+            table.list_workspaces()[0].name,
+            "one",
+            "the old name must be back"
+        );
+        assert!(
+            published(&queue).is_empty(),
+            "a rename nothing recorded was announced anyway"
+        );
+    }
+
+    /// §8.3 class A: the child is already dead, so `removed` goes out whatever
+    /// the disk says — withholding it would hang an attached terminal — and the
+    /// ack is the only thing that can carry the failure.
+    ///
+    /// Rolling the removal back, or withholding its event, fails here; so does
+    /// answering a kill nothing recorded with success.
+    #[test]
+    fn a_kill_that_cannot_be_recorded_still_removes_the_row_and_still_says_so() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, id) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        wedge_the_ledger(dir.path());
+
+        let error = smol::block_on(table.kill(&id))
+            .expect_err("a kill the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert!(
+            table.list().is_empty(),
+            "the session is dead; the row must not come back because a write failed"
+        );
+        assert!(
+            published(&queue)
+                .iter()
+                .any(|frame| matches!(frame, Frame::Removed { session_id } if *session_id == id)),
+            "the removal was withheld behind a disk write"
+        );
+    }
+
+    /// The workspace-level class-A kill, same contract.
+    #[test]
+    fn a_workspace_kill_that_cannot_be_recorded_still_removes_it_and_still_says_so() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        wedge_the_ledger(dir.path());
+
+        let error = smol::block_on(table.kill_workspace("workspace-1"))
+            .expect_err("a workspace kill the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert!(table.list_workspaces().is_empty());
+        assert!(
+            published(&queue).iter().any(|frame| matches!(
+                frame,
+                Frame::WorkspaceRemoved { workspace_id, .. } if workspace_id == "workspace-1"
+            )),
+            "the removal was withheld behind a disk write"
+        );
+    }
+
+    /// A table on `dir` with nothing in it, sweeping past any test's lifetime.
+    fn empty_table(dir: &std::path::Path) -> Arc<SessionTable> {
+        SessionTable::load(
+            StateStore::new(dir),
+            StatusConfig {
+                needs_input_after: Duration::from_secs(600),
+                sweep_interval: Duration::from_secs(600),
+            },
+        )
+    }
+
+    fn workspace_request(name: &str) -> super::WorkspaceRequest {
+        super::WorkspaceRequest {
+            root: "/tmp/proj".to_owned(),
+            name: Some(name.to_owned()),
+            id: None,
+        }
+    }
+
+    /// The workspace spec's row: the record exists the moment the panel row
+    /// does, before any terminal, and zero sessions is a normal state rather
+    /// than a create whose session half failed. §8.3 class C puts the write
+    /// before the announcement.
+    #[test]
+    fn an_empty_create_records_a_workspace_with_no_sessions_and_announces_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+
+        let workspace = table
+            .create_workspace(workspace_request("proj"))
+            .expect("the empty create");
+
+        assert_eq!(workspace.name, "proj");
+        assert!(workspace.layout.terminal_sessions().is_empty());
+        // Zero, so the client's first layout write is revision 1.
+        assert_eq!(workspace.layout_rev, 0);
+        assert!(table.list().is_empty(), "an empty create spawned something");
+        assert!(table.workspace_sessions(&workspace.id).is_empty());
+        assert_eq!(table.list_workspaces(), vec![workspace.clone()]);
+        assert!(
+            published(&queue).iter().any(|frame| matches!(
+                frame,
+                Frame::Workspace {
+                    workspace: announced,
+                    sessions,
+                    ..
+                } if announced.id == workspace.id && sessions.is_empty()
+            )),
+            "the row was not announced, or was announced with a session in it"
+        );
+        assert_eq!(
+            StateStore::new(dir.path()).load().workspaces,
+            vec![workspace],
+            "the record was announced before it was on disk"
+        );
+    }
+
+    // --------------------------------- the generation-2 auto-create's parts ---
+
+    /// A table holding one workspace and two *lost* rows in it: enough for a
+    /// layout to name a session without a pty to spawn one from.
+    fn table_with_two_rows(dir: &std::path::Path) -> (Arc<SessionTable>, SessionId, SessionId) {
+        let row = |id: &str| SessionInfo {
+            id: SessionId::new(id),
+            workspace_id: "ws-2".to_owned(),
+            agent_kind: "shell".to_owned(),
+            instance_label: id.to_owned(),
+            cwd: "/tmp/proj".to_owned(),
+            created_at: 1,
+            status: SessionStatus::Exited,
+        };
+        let (first, second) = (row("s-first"), row("s-second"));
+        StateStore::new(dir)
+            .save(
+                &[
+                    PersistedSession::from_info(&first),
+                    PersistedSession::from_info(&second),
+                ],
+                &[WorkspaceInfo {
+                    id: "ws-2".to_owned(),
+                    name: "proj".to_owned(),
+                    project_root: "/tmp/proj".to_owned(),
+                    created_at: 1,
+                    layout_rev: 0,
+                    layout: LayoutDoc::empty(),
+                }],
+            )
+            .expect("seeding the state file");
+        let table = empty_table(dir);
+        (table, first.id, second.id)
+    }
+
+    /// A named auto-create must adopt the record that is already there rather
+    /// than write over it — a second insert would reset a live workspace's
+    /// layout and revision — and only the caller that really made it may be
+    /// told it did, since that flag is the warrant to remove it again.
+    #[test]
+    fn ensure_workspace_adopts_a_named_record_without_resetting_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let named = || super::WorkspaceRequest {
+            root: "/tmp/proj".to_owned(),
+            name: Some("proj".to_owned()),
+            id: Some("ws-named".to_owned()),
+        };
+
+        let (first, created_here) = table.ensure_workspace(named()).expect("the first ensure");
+        assert!(created_here, "the first ensure made the record");
+        table
+            .update_layout(&first.id, LayoutDoc::empty(), 4, None)
+            .expect("a later layout write");
+
+        let (again, created_here) = table.ensure_workspace(named()).expect("the second ensure");
+        assert!(
+            !created_here,
+            "a reuse must not claim it created the record"
+        );
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.layout_rev, 4, "the live record's revision was reset");
+        assert_eq!(table.list_workspaces().len(), 1);
+    }
+
+    /// An id-less ensure cannot collide, so it stays a plain create.
+    #[test]
+    fn ensure_workspace_mints_a_fresh_record_when_the_request_names_none() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+
+        let (first, made) = table
+            .ensure_workspace(workspace_request("proj"))
+            .expect("the first ensure");
+        assert!(made);
+        let (second, made) = table
+            .ensure_workspace(workspace_request("proj"))
+            .expect("the second ensure");
+        assert!(made);
+        assert_ne!(first.id, second.id);
+    }
+
+    /// Compensation takes back only what the failed request left behind. A
+    /// workspace a concurrent create has since put a session in is no longer
+    /// this refusal's to remove, and neither is one already gone.
+    #[test]
+    fn compensation_spares_a_workspace_something_else_is_using() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, occupied, _) = table_with_two_rows(dir.path());
+        let empty = table
+            .create_workspace(workspace_request("empty"))
+            .expect("an empty record");
+
+        smol::block_on(table.remove_empty_workspace("ws-2")).expect("the populated workspace");
+        assert_eq!(table.workspace_sessions("ws-2").len(), 2);
+        assert!(table.list().iter().any(|info| info.id == occupied));
+
+        smol::block_on(table.remove_empty_workspace(&empty.id)).expect("the empty workspace");
+        smol::block_on(table.remove_empty_workspace(&empty.id)).expect("nothing left to remove");
+        assert_eq!(table.list_workspaces().len(), 1, "only ws-2 should be left");
+    }
+
+    /// The auto-create's layout converges with whoever else is writing the
+    /// document instead of replacing it: a fresh one-leaf write here would
+    /// delete tabs a client already has on screen.
+    #[test]
+    fn the_auto_created_layout_merges_with_the_document_that_won() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, first, second) = table_with_two_rows(dir.path());
+        table
+            .update_layout("ws-2", LayoutDoc::single_terminal(first.clone()), 1, None)
+            .expect("the concurrent writer's layout");
+
+        table
+            .install_legacy_layout("ws-2", &second)
+            .expect("the auto-created layout");
+
+        let (workspace, _) = table.open_workspace("ws-2").expect("the workspace");
+        assert_eq!(
+            workspace.layout.terminal_sessions(),
+            vec![first, second.clone()],
+            "the concurrent document was replaced instead of appended to"
+        );
+        assert_eq!(workspace.layout_rev, 2);
+
+        // Already there: nothing to write, and nothing to bump.
+        table
+            .install_legacy_layout("ws-2", &second)
+            .expect("the second install");
+        assert_eq!(
+            table.open_workspace("ws-2").expect("the workspace").0,
+            workspace
+        );
+    }
+
+    /// At generation 2 the layout arrived inside the workspace event, and the
+    /// `Created` reply carries none — so this is the one layout write whose own
+    /// requester must be told, and an ordinary write still must not be.
+    #[test]
+    fn the_auto_created_layout_reaches_every_subscriber() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, first, _) = table_with_two_rows(dir.path());
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let writer = SubscriberId::next();
+        table.subscribe(writer, &outbound);
+        while queue.try_recv().is_some() {}
+
+        table
+            .install_legacy_layout("ws-2", &first)
+            .expect("the auto-created layout");
+        assert!(
+            published(&queue)
+                .iter()
+                .any(|frame| matches!(frame, Frame::LayoutChanged { rev: 1, .. })),
+            "the requester was not told its own workspace's layout"
+        );
+
+        table
+            .update_layout("ws-2", LayoutDoc::empty(), 2, Some(writer))
+            .expect("an ordinary layout write");
+        assert!(
+            published(&queue).is_empty(),
+            "an ordinary write echoed back to its writer"
+        );
+    }
+
+    /// §8.1: a ledger that refuses the auto-created layout is an error the
+    /// request carries back, never a silent `Created` over a workspace whose
+    /// session is in no layout.
+    #[test]
+    fn a_wedged_ledger_refuses_the_auto_created_layout() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, first, _) = table_with_two_rows(dir.path());
+        wedge_the_ledger(dir.path());
+
+        let refused = table
+            .install_legacy_layout("ws-2", &first)
+            .expect_err("a wedged ledger must refuse the write");
+
+        assert_eq!(refused.code, error_code::PERSIST_FAILED);
+        assert!(
+            table
+                .open_workspace("ws-2")
+                .expect("the workspace")
+                .0
+                .layout
+                .terminal_sessions()
+                .is_empty(),
+            "the refused layout was left applied in memory"
+        );
+    }
+
+    /// A row with nothing in it is still a row after a restart: `load` keeps
+    /// every persisted workspace, session or no session.
+    #[test]
+    fn an_empty_workspace_comes_back_empty_after_a_restart() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let created = empty_table(dir.path())
+            .create_workspace(workspace_request("proj"))
+            .expect("the empty create");
+
+        let restarted = empty_table(dir.path());
+        assert_eq!(restarted.list_workspaces(), vec![created.clone()]);
+        assert!(restarted.workspace_sessions(&created.id).is_empty());
+        assert!(restarted.list().is_empty());
+    }
+
+    /// Row delete on a row that never had a terminal. `NOT_FOUND` is for a
+    /// workspace nothing knows about, not for an empty one, and the record
+    /// leaves memory and the ledger together.
+    #[test]
+    fn killing_an_empty_workspace_removes_its_record_everywhere() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let workspace = table
+            .create_workspace(workspace_request("proj"))
+            .expect("the empty create");
+        let (queue, _outbound) = subscribed(&table);
+
+        smol::block_on(table.kill_workspace(&workspace.id)).expect("killing an empty workspace");
+
+        assert!(table.list_workspaces().is_empty());
+        assert!(StateStore::new(dir.path()).load().workspaces.is_empty());
+        assert!(
+            published(&queue).iter().any(|frame| matches!(
+                frame,
+                Frame::WorkspaceRemoved { workspace_id, .. } if *workspace_id == workspace.id
+            )),
+            "the removal was not announced"
+        );
+        assert_eq!(
+            smol::block_on(table.kill_workspace(&workspace.id))
+                .expect_err("killing it twice is an error, not a second removal")
+                .code,
+            error_code::NOT_FOUND
+        );
+    }
+
+    /// A `CreateRequest` for the strictness tests: the workspace is the only
+    /// thing they vary, and nothing gets far enough to spawn.
+    fn session_in(workspace_id: &str) -> super::CreateRequest {
+        super::CreateRequest {
+            workspace_id: workspace_id.to_owned(),
+            cwd: "/tmp/proj".to_owned(),
+            command: String::new(),
+            env: Vec::new(),
+            cols: 80,
+            rows: 24,
+            agent_kind: "shell".to_owned(),
+            instance_label: "one".to_owned(),
+            scrollback_bytes: None,
+        }
+    }
+
+    /// The spec's "sessions are created only inside an existing workspace".
+    /// Nothing about a session makes a record any more, so a create naming one
+    /// the daemon does not hold is refused before it spawns — no pty, no
+    /// reservation, no workspace conjured out of the id.
+    #[test]
+    fn a_session_naming_an_unknown_workspace_is_refused_and_creates_nothing() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+
+        let refused = smol::block_on(table.create(session_in("no-such-workspace")))
+            .expect_err("a session in a workspace that does not exist");
+
+        assert_eq!(refused.code, error_code::NOT_FOUND);
+        assert!(table.list().is_empty());
+        assert!(table.list_workspaces().is_empty(), "a workspace was minted");
+        assert!(StateStore::new(dir.path()).load().sessions.is_empty());
+        assert!(published(&queue).is_empty(), "a refused create announced");
+    }
+
+    /// An empty id is the field being unusable rather than an id nothing
+    /// matches, so it is `invalid_argument` and not `not_found` (§2.1). The
+    /// distinction is what stops a client retrying a bug as if it were a race.
+    #[test]
+    fn a_session_with_no_workspace_id_is_an_invalid_argument() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+
+        let refused =
+            smol::block_on(table.create(session_in(""))).expect_err("a session with no workspace");
+
+        assert_eq!(refused.code, error_code::INVALID_ARGUMENT);
+        assert!(table.list().is_empty());
+        assert!(table.list_workspaces().is_empty());
+    }
+
+    /// §8.3 class C for the empty half: a record the ledger refused is undone
+    /// and the create fails, so no client is left holding a row this daemon
+    /// will not have after a restart.
+    #[test]
+    fn an_empty_workspace_that_cannot_be_recorded_is_taken_back() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        wedge_the_ledger(dir.path());
+
+        let error = table
+            .create_workspace(workspace_request("proj"))
+            .expect_err("a create the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert!(table.list_workspaces().is_empty());
+        assert!(
+            !published(&queue)
+                .iter()
+                .any(|frame| matches!(frame, Frame::Workspace { .. })),
+            "a workspace that does not exist was announced as created"
+        );
+    }
+
+    /// The workspace create's own window: the record is in the map before the
+    /// ledger write, so a `kill_workspace` naming it can remove it and publish
+    /// `workspace_removed` while the create is still writing. Publishing
+    /// `workspace` after that would leave every subscriber a row nothing will
+    /// remove again — so the create rechecks and answers `NOT_FOUND` instead.
+    ///
+    /// The ledger needs no repair either way, and that is asserted here rather
+    /// than reasoned about: both writes snapshot the live map under
+    /// `persisting`, so whichever lands last still writes the removal.
+    #[test]
+    fn a_workspace_killed_while_it_is_being_recorded_is_never_announced() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        let held = table.persisting.lock().expect("the persist guard");
+
+        let creator = {
+            let table = Arc::clone(&table);
+            std::thread::spawn(move || table.create_workspace(workspace_request("proj")))
+        };
+        // The record is in the map before the write, which is what makes it
+        // killable — and how the killer learns the id it was just minted.
+        let id = wait_for(|| table.list_workspaces().first().map(|w| w.id.clone()));
+        let killer = {
+            let table = Arc::clone(&table);
+            let id = id.clone();
+            std::thread::spawn(move || smol::block_on(table.kill_workspace(&id)))
+        };
+        wait_for(|| table.list_workspaces().is_empty().then_some(()));
+
+        drop(held);
+        assert_eq!(
+            creator
+                .join()
+                .expect("the creating thread")
+                .expect_err("a create whose record was killed under it")
+                .code,
+            error_code::NOT_FOUND
+        );
+        killer
+            .join()
+            .expect("the killing thread")
+            .expect("the kill");
+
+        assert!(
+            !published(&queue).iter().any(|frame| matches!(
+                frame,
+                Frame::Workspace { workspace, .. } if workspace.id == id
+            )),
+            "a workspace that was already removed was announced as created"
+        );
+        assert!(table.list_workspaces().is_empty());
+        assert!(
+            StateStore::new(dir.path()).load().workspaces.is_empty(),
+            "the removed record was written back by the slower persist"
+        );
+    }
+
+    /// A ledger that exists and did not parse is this daemon's ignorance, not
+    /// an empty host: the rows it still holds may name terminals that are
+    /// running right now. So the store goes read-only, every ack says
+    /// `persisted: false`, and a mutation cannot turn a transient read failure
+    /// into the permanent loss of what the file recorded.
+    #[test]
+    fn a_ledger_that_could_not_be_read_is_never_written_over() {
+        const MALFORMED: &str = "this was never json";
+
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join(crate::state::STATE_FILE);
+        std::fs::write(&path, MALFORMED).expect("seeding the ledger");
+        let table = empty_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+
+        assert!(!table.ledger_authoritative());
+        assert!(
+            !table.persisted(),
+            "a ledger this daemon cannot read is not one it records to"
+        );
+        table
+            .create_workspace(workspace_request("proj"))
+            .expect("a mutation still applies and still publishes");
+        assert_eq!(table.list_workspaces().len(), 1);
+        assert!(
+            published(&queue).iter().any(|frame| matches!(
+                frame,
+                Frame::Workspace { persisted, .. } if !persisted
+            )),
+            "the workspace was announced as recorded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the ledger"),
+            MALFORMED,
+            "a mutation overwrote the ledger it could not read"
+        );
+    }
+
+    /// A `CreateSession` writes its ledger row before its terminal exists, so
+    /// `kill_workspace` cannot see it in the table. Left in `pending`, the
+    /// kill's own persist writes a session whose workspace is gone — and the
+    /// next daemon's load migrates that workspace back into existence, undoing
+    /// the delete that won.
+    #[test]
+    fn a_workspace_kill_takes_the_reservations_naming_it() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let reserved = SessionInfo {
+            id: SessionId::new("reserved"),
+            workspace_id: "workspace-1".to_owned(),
+            agent_kind: "shell".to_owned(),
+            instance_label: "spawning".to_owned(),
+            cwd: "/tmp".to_owned(),
+            created_at: 2,
+            status: SessionStatus::Working,
+        };
+        table
+            .reserve(PersistedSession::from_info(&reserved))
+            .expect("the reservation");
+        assert_eq!(
+            StateStore::new(dir.path()).load().sessions.len(),
+            1,
+            "the reservation is what this test kills around"
+        );
+
+        smol::block_on(table.kill_workspace("workspace-1")).expect("the workspace kill");
+
+        let ledger = StateStore::new(dir.path()).load();
+        assert!(
+            ledger.sessions.is_empty(),
+            "the ledger kept a session whose workspace was deleted: {ledger:?}"
+        );
+        assert!(ledger.workspaces.is_empty());
+    }
+
+    /// The rename's own window, the create's mirrored: the new name is written
+    /// and a kill takes the record before the announcement goes out.
+    /// Publishing then would leave every subscriber a renamed row nothing will
+    /// ever remove again — and the renaming client a name it recorded against a
+    /// workspace the next reconcile drops.
+    #[test]
+    fn a_rename_a_kill_won_answers_not_found() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+
+        let (arrived, at_the_gate) = std::sync::mpsc::sync_channel(1);
+        let (go, released) = std::sync::mpsc::sync_channel(1);
+        *table.test_gate.lock().expect("the gate") = Some((arrived, released));
+
+        let renamer = {
+            let table = Arc::clone(&table);
+            std::thread::spawn(move || table.rename_workspace("workspace-1", "renamed"))
+        };
+        at_the_gate
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the rename to reach its recheck");
+        let killer = {
+            let table = Arc::clone(&table);
+            std::thread::spawn(move || smol::block_on(table.kill_workspace("workspace-1")))
+        };
+        // The removal is applied and published before its own persist, which
+        // waits on the guard the parked rename still holds.
+        wait_for(|| table.list_workspaces().is_empty().then_some(()));
+        go.send(()).expect("releasing the rename");
+
+        assert_eq!(
+            renamer
+                .join()
+                .expect("the renaming thread")
+                .expect_err("a rename whose record was killed under it")
+                .code,
+            error_code::NOT_FOUND
+        );
+        killer
+            .join()
+            .expect("the killing thread")
+            .expect("the workspace kill");
+        assert!(
+            !published(&queue)
+                .iter()
+                .any(|frame| matches!(frame, Frame::Workspace { .. })),
+            "a workspace that was already removed was announced as renamed"
+        );
+    }
+
+    /// Poll until `ready` answers, or fail the test. For the states another
+    /// thread reaches on its own — a sleep would only guess at when.
+    fn wait_for<T>(mut ready: impl FnMut() -> Option<T>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(value) = ready() {
+                return value;
+            }
+            assert!(std::time::Instant::now() < deadline, "timed out waiting");
+            std::thread::yield_now();
+        }
+    }
+
+    /// The revision, its ledger write and its broadcast are one ordered
+    /// operation. §8.3 class B puts the write between the mutation and the
+    /// event, so the workspace lock cannot be what spans them — `persisting`
+    /// is, and it is held right through the publish. Release it any earlier
+    /// and a later revision can apply, or publish, ahead of this one.
+    #[test]
+    fn update_layout_serializes_its_revision_through_its_broadcast() {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let (table, _) = seeded_table(dir.path());
         let events = table.events.lock().expect("the event lock");
@@ -2444,12 +4095,17 @@ mod tests {
         let writer = {
             let table = Arc::clone(&table);
             std::thread::spawn(move || {
-                table.update_layout("workspace-1", LayoutDoc::empty(), 2, SubscriberId::next())
+                table.update_layout(
+                    "workspace-1",
+                    LayoutDoc::empty(),
+                    2,
+                    Some(SubscriberId::next()),
+                )
             })
         };
         std::thread::sleep(REACHED_THE_LOCK);
         assert!(
-            table.workspaces.try_lock().is_err(),
+            table.persisting.try_lock().is_err(),
             "a later revision can land before this revision is broadcast"
         );
 
@@ -2460,9 +4116,8 @@ mod tests {
             .expect("the layout update");
     }
 
-    /// Workspace removal is not announced after the transaction releases the
-    /// workspace lock: a create in that gap would recreate the workspace and
-    /// then be hidden by the stale removal event.
+    /// Workspace removal is not announced after the transaction drops the
+    /// workspace lock: a create in that gap would be hidden by the stale event.
     #[test]
     fn kill_workspace_holds_the_workspace_lock_until_removal_is_published() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2471,7 +4126,7 @@ mod tests {
 
         let killer = {
             let table = Arc::clone(&table);
-            std::thread::spawn(move || table.kill_workspace("workspace-1"))
+            std::thread::spawn(move || smol::block_on(table.kill_workspace("workspace-1")))
         };
         std::thread::sleep(REACHED_THE_LOCK);
         assert!(
@@ -2486,10 +4141,9 @@ mod tests {
             .expect("the workspace kill");
     }
 
-    /// `persist` is serialized *end to end*, not just over its snapshot: the
-    /// write happens under the same guard. Two persists that only serialized
-    /// their snapshots could still reach `save` in the opposite order and
-    /// leave the older pair on disk.
+    /// `persist` is serialized *end to end*, the write under the same guard as
+    /// the snapshot. Two that only serialized their snapshots could still reach
+    /// `save` in the opposite order and leave the older pair on disk.
     #[test]
     fn persist_writes_under_the_guard_it_snapshots_under() {
         let dir = tempfile::TempDir::new().expect("temp dir");
@@ -2695,5 +4349,124 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// The bound is a policy, and this is the policy: the reader that stopped
+    /// reading loses its connection, the one that kept reading loses nothing, and
+    /// the publisher — a pty drain thread in the real daemon — waits on neither.
+    ///
+    /// Time-bound on purpose: unbounded growth is a slow failure this test could
+    /// not otherwise see, and a *blocking* send would stop dead at the bound.
+    #[test]
+    fn a_subscriber_that_stops_reading_is_dropped_and_never_stalls_the_publisher() {
+        use std::sync::mpsc;
+        use std::thread;
+
+        /// The unix drain thread's read size, what the bound is sized against.
+        const CHUNK: usize = 8 * 1024;
+        /// Enough to go over the bound, plus slack for the replay `attach` queues
+        /// ahead: by construction one reader is over its bound and one is not.
+        const CHUNKS: usize = (OUTBOUND_QUEUE_BYTES as usize / CHUNK) + 8;
+
+        let id = SessionId::new("session-1");
+        let (stalled, _never_read) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let (reading, drained) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(64 * 1024, None, None);
+        hub.attach(&id, SubscriberId::next(), &stalled);
+        hub.attach(&id, SubscriberId::next(), &reading);
+
+        // The well-behaved client: a thread that does nothing but read, the way
+        // a connection's writer task does.
+        let reader = thread::spawn(move || {
+            let mut received = 0usize;
+            while smol::block_on(drained.recv()).is_some() {
+                received += 1;
+            }
+            received
+        });
+
+        let (done, published) = mpsc::channel();
+        let publisher = thread::spawn(move || {
+            let chunk = vec![b'x'; CHUNK];
+            for _ in 0..CHUNKS {
+                hub.publish(&id, &chunk);
+            }
+            done.send(hub.subscribers.len()).expect("reporting");
+            hub
+        });
+        let subscribers = published
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the publishing thread blocked on a client that stopped reading");
+
+        assert_eq!(subscribers, 1, "the stalled subscriber was not dropped");
+        assert!(
+            stalled.is_closed(),
+            "the stalled subscriber's queue was left open, so its connection would live on"
+        );
+        assert!(!reading.is_closed(), "the reading subscriber was punished");
+        // The hub still holds the surviving subscriber's sender, so it has to
+        // go before the reader thread can see the channel close.
+        drop(publisher.join().expect("publisher thread"));
+        drop(reading);
+        // One replay frame from `attach`, then every chunk: the client that
+        // kept reading missed nothing.
+        assert_eq!(reader.join().expect("reader thread"), CHUNKS + 1);
+    }
+
+    /// **The bound counts bytes, and this is why it had to** — see [`Outbound`]
+    /// for the argument: conhost writes a line at a time, so Windows frames are
+    /// tens of bytes and a *frame* bound dropped healthy clients after ~24 KiB.
+    ///
+    /// `CHUNKS` is fifteen times the frame bound that used to be here, and half
+    /// the byte bound that replaced it.
+    #[test]
+    fn a_subscriber_fed_many_tiny_chunks_is_not_mistaken_for_a_stalled_one() {
+        const CHUNKS: usize = 4000;
+
+        let id = SessionId::new("session-1");
+        let (never_read, _queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(64 * 1024, None, None);
+        hub.attach(&id, SubscriberId::next(), &never_read);
+        for _ in 0..CHUNKS {
+            hub.publish(&id, b"ZORCALINE\r\n");
+        }
+
+        assert_eq!(
+            hub.subscribers.len(),
+            1,
+            "a client was dropped for being sent {CHUNKS} small frames it had every chance of \
+             reading"
+        );
+        assert!(!never_read.is_closed(), "its queue was closed anyway");
+    }
+
+    /// Output larger than the attach budget replays only the newest of it and
+    /// says so — and a full replay still leaves the queue open behind it.
+    #[test]
+    fn a_replay_larger_than_the_outbound_budget_is_capped_to_the_newest() {
+        const BOUND: u64 = 256 * 1024;
+
+        let id = SessionId::new("session-1");
+        let (outbound, queue) = Outbound::new(BOUND);
+        let mut hub = OutputHub::new(512 * 1024, None, None);
+        // Three 96 KiB chunks: 288 KiB retained whole, over the 128 KiB budget.
+        for marker in [b'A', b'B', b'C'] {
+            hub.publish(&id, &vec![marker; 96 * 1024]);
+        }
+
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        let Some(Frame::Replay {
+            bytes, truncated, ..
+        }) = smol::block_on(queue.recv())
+        else {
+            panic!("attach did not queue a replay");
+        };
+        assert!(truncated, "capping is an omission and must say so");
+        assert!(!bytes.contains(&b'A'), "the oldest chunk survived the cap");
+        assert!(bytes.contains(&b'C'), "the newest chunk was lost");
+        assert!(
+            !outbound.is_closed(),
+            "the replay blew the bound it was capped to fit under"
+        );
     }
 }

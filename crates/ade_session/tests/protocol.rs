@@ -92,6 +92,7 @@ fn hello_ack() -> HelloAck {
         degraded: false,
         binary_hash: Some("a".repeat(64)),
         upgrade_ready: Some(true),
+        instance_id: Some("6f1a9f60-0e5f-4d2e-9a1a-8f2b3c4d5e6f".into()),
         request_id: Some(1),
     }
 }
@@ -182,6 +183,12 @@ fn every_variant() -> Vec<Frame> {
         },
         Frame::Attach {
             session_id: SessionId::new("s-1"),
+            view_id: None,
+            request_id: Some(12),
+        },
+        Frame::Attach {
+            session_id: SessionId::new("s-1"),
+            view_id: Some("view-1".into()),
             request_id: Some(12),
         },
         Frame::Detach {
@@ -196,6 +203,11 @@ fn every_variant() -> Vec<Frame> {
             session_id: SessionId::new("s-1"),
             cols: 200,
             rows: 60,
+        },
+        Frame::FocusSession {
+            session_id: SessionId::new("s-1"),
+            view_id: "view-1".into(),
+            hover: false,
         },
         Frame::Kill {
             session_id: SessionId::new("s-1"),
@@ -226,6 +238,7 @@ fn every_variant() -> Vec<Frame> {
         },
         Frame::Created {
             session: session_info("s-3"),
+            persisted: true,
             request_id: Some(7),
         },
         Frame::Removed {
@@ -276,10 +289,10 @@ fn every_variant() -> Vec<Frame> {
         Frame::CreateWorkspace {
             root: "/home/u/proj".into(),
             name: Some("proj".into()),
-            env: vec![("TERM".into(), "xterm-256color".into())],
-            cols: Some(120),
-            rows: Some(40),
             request_id: Some(15),
+            env: Vec::new(),
+            cols: None,
+            rows: None,
         },
         Frame::OpenWorkspace {
             workspace_id: "w-1".into(),
@@ -306,6 +319,7 @@ fn every_variant() -> Vec<Frame> {
         Frame::Workspace {
             workspace: workspace_info(),
             sessions: vec![session_info("s-1"), session_info("s-2")],
+            persisted: true,
             request_id: Some(16),
         },
         Frame::WorkspaceList {
@@ -316,13 +330,95 @@ fn every_variant() -> Vec<Frame> {
             workspace_id: "w-1".into(),
             layout: nested_layout(),
             rev: 5,
+            persisted: true,
             request_id: None,
         },
         Frame::WorkspaceRemoved {
             workspace_id: "w-1".into(),
+            persisted: true,
             request_id: Some(20),
         },
     ]
+}
+
+/// §8.5's `persisted` flag, against §4's rules for a field added after its op
+/// shipped: absent means `true`, so a daemon that persists normally puts
+/// nothing new on the wire and an older peer's frames keep their old meaning.
+/// Only a degraded daemon's ack says anything at all.
+#[test]
+fn the_persisted_flag_is_absent_unless_it_is_false() {
+    let normal = encode_frame(&Frame::WorkspaceRemoved {
+        workspace_id: "w-1".into(),
+        persisted: true,
+        request_id: Some(3),
+    })
+    .unwrap();
+    let value: Value = serde_json::from_slice(&normal).unwrap();
+    assert!(
+        !value["body"].as_object().unwrap().contains_key("persisted"),
+        "a normal ack must be byte-identical to one from before the field: {}",
+        String::from_utf8_lossy(&normal)
+    );
+
+    let degraded = encode_frame(&Frame::WorkspaceRemoved {
+        workspace_id: "w-1".into(),
+        persisted: false,
+        request_id: Some(3),
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&degraded).unwrap()["body"]["persisted"],
+        json!(false)
+    );
+    assert_eq!(
+        decode_frame(&degraded).unwrap(),
+        Frame::WorkspaceRemoved {
+            workspace_id: "w-1".into(),
+            persisted: false,
+            request_id: Some(3),
+        }
+    );
+
+    // The reader half: an older daemon's ack has no such field, and it never
+    // meant "not recorded".
+    assert_eq!(
+        decode_frame(br#"{"op":"created","rid":4,"body":{"session":{"id":"s-1","workspace_id":"ws-1","agent_kind":"claude","instance_label":"main","cwd":"/home/u/proj","created_at":1754200000,"status":"working"}}}"#)
+            .unwrap(),
+        Frame::Created {
+            session: session_info("s-1"),
+            persisted: true,
+            request_id: Some(4),
+        }
+    );
+}
+
+/// A generation-3 `create_workspace` carries the record's identity and nothing
+/// else: the legacy first-session fields exist only to decode an old peer's
+/// request, so a sender at 3 must put none of them on the wire.
+#[test]
+fn create_workspace_carries_nothing_but_the_record_at_generation_three() {
+    let encoded = encode_frame(&Frame::CreateWorkspace {
+        root: "/home/u/proj".into(),
+        name: None,
+        request_id: Some(5),
+        env: Vec::new(),
+        cols: None,
+        rows: None,
+    })
+    .unwrap();
+    let value: Value = serde_json::from_slice(&encoded).unwrap();
+    let body: Vec<&str> = value["body"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        body,
+        ["root"],
+        "encoded {}",
+        String::from_utf8_lossy(&encoded)
+    );
 }
 
 #[test]
@@ -331,7 +427,7 @@ fn frame_round_trip_covers_every_variant() {
     // Guard against a variant being added to the enum but not to the fixture.
     assert_eq!(
         frames.len(),
-        36,
+        38,
         "add the new Frame variant to every_variant()"
     );
 
@@ -377,15 +473,17 @@ fn every_op_on_the_wire_is_listed_in_known_ops() {
     );
 }
 
-/// The cross-implementation fixture: the exact gen-2 `hello` envelope, decoded
-/// and encoded. pydaemon replicates this byte shape, so a change here is a
-/// change to the protocol and not to a test.
+/// The cross-implementation fixture: the exact `hello` envelope, decoded and
+/// encoded. pydaemon replicates this byte shape, so a change here is a change
+/// to the protocol and not to a test. The decoded fixture is a gen-2 peer's
+/// hello, which the *codec* must still read — §3.1's refusal is the handshake's
+/// job, and it can only refuse what it could parse.
 ///
 /// Key *order* is deliberately not asserted — JSON objects are unordered and
 /// the Python twin's encoder will not match Rust's field order — but the key
 /// *set* is: no `type`, no inline `request_id`, `rid` omitted when absent.
 #[test]
-fn the_gen_2_hello_envelope_is_pinned_on_the_wire() {
+fn the_hello_envelope_is_pinned_on_the_wire() {
     let wire = br#"{"op":"hello","rid":1,"body":{"min_generation":2,"max_generation":2,"capabilities":["ade.persist_before_ack"]}}"#;
     assert_eq!(
         decode_frame(wire).unwrap(),
@@ -515,6 +613,9 @@ fn an_ack_without_the_optional_fields_still_decodes() {
             assert_eq!(ack.daemon_version, "0.1.0");
             assert_eq!(ack.binary_hash, None);
             assert_eq!(ack.upgrade_ready, None);
+            // A daemon too old to name itself: the client identifies its host
+            // by the spelling it was given, as it always did.
+            assert_eq!(ack.instance_id, None);
             assert!(ack.capabilities.is_empty());
             assert!(!ack.degraded);
             assert_eq!(ack.request_id, Some(1));
@@ -1211,4 +1312,227 @@ fn a_split_with_one_surviving_child_becomes_that_child() {
     });
     assert!(layout.retain_sessions(|id| id.as_str() == "s-2"));
     assert_eq!(layout.root, survivor);
+}
+
+// ------------------------------------------- the frozen generation-2 wire ---
+//
+// Hand-derived from the types at `be8f183cf0`, the envelope cut this build
+// still serves as the previous generation. These bytes are the contract with
+// every daemon and client already deployed at 2: a change here is a change to
+// the protocol, not to a test.
+
+/// The gen-2 `create_workspace` carried the first session's environment and
+/// size, because at 2 the op *was* the combined create. All three fields must
+/// still decode, or an old client's request arrives with its shell's
+/// environment silently dropped.
+#[test]
+fn the_generation_two_create_workspace_still_decodes_whole() {
+    let wire = br#"{"op":"create_workspace","rid":5,"body":{"root":"/home/u/proj","name":"proj","env":[["TERM","xterm-256color"],["ADE_TEST","1"]],"cols":120,"rows":40}}"#;
+    assert_eq!(
+        decode_frame(wire).unwrap(),
+        Frame::CreateWorkspace {
+            root: "/home/u/proj".into(),
+            name: Some("proj".into()),
+            env: vec![
+                ("TERM".into(), "xterm-256color".into()),
+                ("ADE_TEST".into(), "1".into()),
+            ],
+            cols: Some(120),
+            rows: Some(40),
+            request_id: Some(5),
+        }
+    );
+}
+
+/// A gen-2 `attach` names a session and nothing else. Both directions matter:
+/// the old peer's frame must decode with no view, and a frame bound for one
+/// must not grow a `view_id` field it has never heard of.
+#[test]
+fn the_generation_two_attach_has_no_view() {
+    let wire = br#"{"op":"attach","rid":7,"body":{"session_id":"s-1"}}"#;
+    let attach = Frame::Attach {
+        session_id: SessionId::new("s-1"),
+        view_id: None,
+        request_id: Some(7),
+    };
+    assert_eq!(decode_frame(wire).unwrap(), attach);
+
+    let encoded = encode_frame(&attach).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&encoded).unwrap(),
+        serde_json::from_slice::<Value>(wire).unwrap(),
+        "encoded {}",
+        String::from_utf8_lossy(&encoded)
+    );
+}
+
+/// The gen-2 handshake pair, pinned at 2..=2 — the range a daemon from the cut
+/// advertises. Its ack predates `binary_hash`, `upgrade_ready` and
+/// `instance_id`, and all three must read as absent rather than fail.
+#[test]
+fn the_generation_two_handshake_pair_decodes() {
+    let hello = br#"{"op":"hello","rid":1,"body":{"min_generation":2,"max_generation":2,"capabilities":[]}}"#;
+    assert_eq!(
+        decode_frame(hello).unwrap(),
+        Frame::Hello(Hello {
+            min_generation: 2,
+            max_generation: 2,
+            capabilities: Vec::new(),
+            request_id: Some(1),
+        })
+    );
+
+    let ack = br#"{"op":"hello_ack","rid":1,"body":{"daemon_version":"0.1.0","protocol_version":2,"host_os":"linux","min_generation":2,"max_generation":2,"generation":2,"capabilities":[],"degraded":false}}"#;
+    assert_eq!(
+        decode_frame(ack).unwrap(),
+        Frame::HelloAck(HelloAck {
+            daemon_version: "0.1.0".into(),
+            protocol_version: 2,
+            host_os: "linux".into(),
+            min_generation: 2,
+            max_generation: 2,
+            generation: 2,
+            capabilities: Vec::new(),
+            degraded: false,
+            binary_hash: None,
+            upgrade_ready: None,
+            instance_id: None,
+            request_id: Some(1),
+        })
+    );
+}
+
+/// Gen-2 mutation acks have no `persisted` field, and its absence means the
+/// mutation *was* recorded (§8.5). The encoder's half of the same contract:
+/// `persisted: true` is omitted, so a frame bound for an old peer keeps the
+/// shape it has always had.
+#[test]
+fn generation_two_acks_omit_persisted_and_read_as_persisted() {
+    let cases: Vec<(&[u8], Frame)> = vec![
+        (
+            br#"{"op":"created","rid":4,"body":{"session":{"id":"s-1","workspace_id":"ws-1","agent_kind":"claude","instance_label":"main","cwd":"/home/u/proj","created_at":1754200000,"status":"working"}}}"#,
+            Frame::Created {
+                session: session_info("s-1"),
+                persisted: true,
+                request_id: Some(4),
+            },
+        ),
+        (
+            br#"{"op":"workspace_removed","rid":8,"body":{"workspace_id":"w-1"}}"#,
+            Frame::WorkspaceRemoved {
+                workspace_id: "w-1".into(),
+                persisted: true,
+                request_id: Some(8),
+            },
+        ),
+    ];
+    for (wire, expected) in cases {
+        assert_eq!(
+            decode_frame(wire).unwrap(),
+            expected,
+            "decoding {}",
+            String::from_utf8_lossy(wire)
+        );
+        let encoded = encode_frame(&expected).unwrap();
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(
+            !value["body"].as_object().unwrap().contains_key("persisted"),
+            "encoded {}",
+            String::from_utf8_lossy(&encoded)
+        );
+        assert_eq!(
+            value,
+            serde_json::from_slice::<Value>(wire).unwrap(),
+            "the re-encoded frame drifted from the frozen shape"
+        );
+    }
+}
+
+/// The sliding window, both directions: whichever peer is the older one, the
+/// pair settles on 2 and nobody is refused.
+#[test]
+fn the_two_generation_window_meets_a_pinned_generation_two_peer() {
+    assert_eq!(
+        select_generation(MIN_GENERATION, MAX_GENERATION, 2, 2),
+        Some(2),
+        "this build against a daemon from the cut"
+    );
+    assert_eq!(
+        select_generation(2, 2, MIN_GENERATION, MAX_GENERATION),
+        Some(2),
+        "a client from the cut against this build"
+    );
+}
+
+/// A hello pinned narrower than this build can serve.
+fn pinned_hello(min: u32, max: u32) -> Hello {
+    Hello {
+        min_generation: min,
+        max_generation: max,
+        capabilities: Vec::new(),
+        request_id: Some(1),
+    }
+}
+
+/// A caller that pinned a range narrower than this build can serve must be held
+/// to the range it *sent*: verifying against the crate constants would accept a
+/// generation this connection never offered, and the frame after it would
+/// decode as nonsense.
+#[test]
+fn handshake_rejects_an_ack_outside_the_range_the_hello_offered() {
+    let (client_stream, mut server) = duplex();
+    let mut connection = Connection::new(client_stream);
+
+    let error = block_on(async {
+        let fake_daemon = async {
+            match read_frame(&mut server).await.unwrap() {
+                Frame::Hello(hello) => {
+                    assert_eq!((hello.min_generation, hello.max_generation), (2, 2));
+                }
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            write_frame(&mut server, &Frame::HelloAck(hello_ack()))
+                .await
+                .unwrap();
+        };
+        futures::future::join(fake_daemon, connection.handshake(pinned_hello(2, 2)))
+            .await
+            .1
+    })
+    .expect_err("an ack above the offered range must not be accepted");
+
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("2..=2"),
+        "the refusal must name the range this connection offered: {error}"
+    );
+}
+
+/// The same handshake, accepted: an ack inside the pinned range is what a
+/// two-generation daemon answers a pinned client with.
+#[test]
+fn handshake_accepts_an_ack_inside_the_pinned_range() {
+    let (client_stream, mut server) = duplex();
+    let mut connection = Connection::new(client_stream);
+
+    let ack = block_on(async {
+        let fake_daemon = async {
+            read_frame(&mut server).await.unwrap();
+            write_frame(
+                &mut server,
+                &Frame::HelloAck(HelloAck {
+                    generation: 2,
+                    protocol_version: 2,
+                    ..hello_ack()
+                }),
+            )
+            .await
+            .unwrap();
+        };
+        futures::future::join(fake_daemon, connection.handshake(pinned_hello(2, 2)))
+            .await
+            .1
+    })
+    .expect("a generation inside the offered range");
+    assert_eq!(ack.generation, 2);
 }
