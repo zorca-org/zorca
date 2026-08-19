@@ -2831,15 +2831,15 @@ fn the_alternate_screen_is_replayed_and_then_given_back() {
 
 /// A session that printed more than fits keeps the newest of it and says so.
 ///
-/// Once the ring wraps, attach reports truncation and falls back to the safe
-/// repaint because the retained byte tail may begin inside an escape sequence.
+/// Once the ring wraps, attach reports truncation and still restores the
+/// retained tail before repainting the visible screen.
 #[test]
 fn scrollback_wraps_to_the_tail_and_reports_truncation() {
     let (dir, server) = server();
     smol::block_on(async {
         let mut connection = client(server.socket_path()).await;
         let session =
-            create_with_scrollback(&mut connection, dir.path(), "seq 1 500", Some(64)).await;
+            create_with_scrollback(&mut connection, dir.path(), "seq 1 500", Some(512)).await;
         wait_for(&mut connection, "the session to exit", |sessions| {
             sessions.iter().any(|s| s.status == SessionStatus::Exited)
         })
@@ -2847,9 +2847,11 @@ fn scrollback_wraps_to_the_tail_and_reports_truncation() {
 
         let mut viewer = client(server.socket_path()).await;
         let (replayed, truncated) = replay_containing(&mut viewer, &session.id, b"500").await;
-        assert!(truncated, "500 lines cannot fit in 64 bytes");
-        // The newest lines are on the screen; the ones that scrolled past the
-        // top of it are gone, and 250 went long before the end.
+        assert!(truncated, "500 lines cannot fit in 512 bytes");
+        assert!(
+            contains(&replayed, b"450\r\n"),
+            "recent history above the visible screen is retained: {replayed:?}"
+        );
         assert!(!contains(&replayed, b"250"), "{replayed:?}");
     });
 }

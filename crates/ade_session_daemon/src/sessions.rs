@@ -421,8 +421,7 @@ fn default_workspace_name(root: &str) -> String {
 struct Ring {
     bytes: VecDeque<u8>,
     capacity: usize,
-    /// Set once the ring has dropped anything, and never cleared — a replay
-    /// that starts mid-escape-sequence has to say so.
+    /// Set once the ring has dropped anything, and never cleared.
     truncated: bool,
 }
 
@@ -446,8 +445,6 @@ impl Ring {
 
     /// The whole window, oldest byte first.
     ///
-    /// The whole history can be replayed safely only while its beginning is
-    /// still present; a wrapped ring may start in the middle of an escape.
     fn snapshot(&self) -> Vec<u8> {
         let (head, tail) = self.bytes.as_slices();
         let mut out = Vec::with_capacity(self.bytes.len());
@@ -516,17 +513,13 @@ impl OutputHub {
     /// Queue the replay and subscribe. Re-attaching replaces the previous
     /// subscription rather than doubling it.
     ///
-    /// A complete ring is replayed first to restore scrollback, followed by a
-    /// screen repaint so the visible rows are correct at the current size. A
-    /// wrapped ring may begin inside an escape sequence, so only the safe
-    /// repaint is sent once history has truncated.
+    /// The retained ring is replayed first to restore scrollback, followed by
+    /// a screen repaint so the visible rows are correct at the current size.
+    /// A wrapped ring can start with a partial escape sequence, but that only
+    /// affects its oldest fragment; the repaint repairs the current screen.
     fn attach(&mut self, session_id: &SessionId, subscriber: SubscriberId, sender: &Sender<Frame>) {
         self.subscribers.retain(|(id, _)| *id != subscriber);
-        let mut bytes = if self.ring.truncated {
-            Vec::new()
-        } else {
-            self.ring.snapshot()
-        };
+        let mut bytes = self.ring.snapshot();
         if let Some(grid) = self.grid.as_ref() {
             bytes.extend(grid.repaint());
         }

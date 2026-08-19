@@ -42,14 +42,14 @@
 //!
 //! Known gaps, deliberate:
 //!
-//! - **A wrapped scrollback ring cannot be replayed.** A complete ring is sent
-//!   before this repaint, but a wrapped one may begin inside an escape sequence;
-//!   in that case attach safely restores only this visible screen.
-//! - **After the ring wraps, the saved primary screen is not painted while an
-//!   app is on the alt screen.** [`Term`] holds it, but only in a private field,
-//!   and the one public door to it ([`Term::swap_alt`]) resets the alternate
-//!   screen on the way back. Until the ring wraps, replaying its complete bytes
-//!   reconstructs both screens before this repaint.
+//! - **A wrapped scrollback ring starts at an arbitrary byte.** Its oldest
+//!   fragment may be incomplete, but the retained history is still replayed
+//!   before this repaint repairs the current screen.
+//! - **The saved primary screen may be incomplete while an app is on the alt
+//!   screen.** [`Term`] holds it, but only in a private field, and the one public
+//!   door to it ([`Term::swap_alt`]) resets the alternate screen on the way
+//!   back. The retained ring reconstructs it only if it still contains the
+//!   app's entry into the alternate screen.
 //! - **No charset-designation state.** `ESC ( 0` line-drawing is not re-emitted;
 //!   cells are stored already translated, so the painted rows are right and only
 //!   an app that leaves G0 non-default mid-stream would be off.
