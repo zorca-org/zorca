@@ -2322,6 +2322,33 @@ fn kill_reaches_a_descendant_that_outlives_its_leader() {
     });
 }
 
+/// An interactive shell gives its foreground job a process group of its own.
+/// `Kill` must not acknowledge the shell while that job can still hold files
+/// or locks needed by the replacement session.
+#[test]
+fn kill_waits_for_a_foreground_job_that_ignores_sighup() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("foreground.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c 'set -m; (trap \"\" HUP; while :; do sleep 1; done) & echo $! > {}; fg'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        kill(&mut connection, &session.id).await;
+
+        if running(pid) {
+            // SAFETY: this process group was created by the command above.
+            let cleanup = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            assert_eq!(cleanup, 0, "failed to clean up foreground job {pid}");
+            panic!("Kill was acknowledged while the foreground job {pid} was still alive");
+        }
+    });
+}
+
 /// Poll until `pid` is gone — or SIGKILL what the test leaked and fail.
 ///
 /// Generous against the daemon's own grace period: the assertion is that the
