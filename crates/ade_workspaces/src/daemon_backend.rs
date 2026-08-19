@@ -2155,7 +2155,9 @@ impl HostLink {
                 "{}: daemon runs build {}… and holds sessions with work in them; \
                  leaving it alone — \"upgrade host daemon\" forces it",
                 self.host.destination,
-                &remote_hash[..remote_hash.len().min(12)],
+                // `get`, not a byte slice: the hash is remote input, and a
+                // multi-byte char straddling offset 12 would panic here.
+                remote_hash.get(..12).unwrap_or(&remote_hash),
             );
             return false;
         }

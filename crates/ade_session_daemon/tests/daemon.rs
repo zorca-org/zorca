@@ -170,7 +170,7 @@ async fn wait_for(
     what: &str,
     predicate: impl Fn(&[SessionInfo]) -> bool,
 ) -> Vec<SessionInfo> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let sessions = list(connection).await;
         if predicate(&sessions) {
@@ -184,9 +184,10 @@ async fn wait_for(
 }
 
 /// How long any single frame may take to arrive before the test gives up.
-/// Generous: a CI runner under full-workspace load can stall a frame for tens
-/// of seconds, and a passing run never waits this long.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(60);
+/// Generous: a runner under full-workspace load can stall a frame for tens of
+/// seconds, and a passing run never waits this long. Must stay under nextest's
+/// 60s slow-timeout hard kill, or the labeled panic loses the race to it.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// `connection.recv()` that fails the test instead of hanging forever.
 ///
@@ -330,7 +331,10 @@ async fn wait_for_ring(socket: &Path, id: &SessionId, needle: &[u8]) {
         if contains(&replayed, needle) {
             return;
         }
-        assert!(Instant::now() < deadline, "replay never contained {needle:?}");
+        assert!(
+            Instant::now() < deadline,
+            "replay never contained {needle:?}"
+        );
         match recv(&mut probe, "Output").await {
             Frame::Output { session_id, .. } => assert_eq!(&session_id, id),
             other => panic!("expected Output, got {other:?}"),
@@ -357,7 +361,7 @@ async fn event_until<T>(
     what: &str,
     want: impl Fn(&Frame) -> Option<T>,
 ) -> T {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let frame = recv(connection, what).await;
         if let Some(found) = want(&frame) {
@@ -403,7 +407,7 @@ async fn replay_containing(
     id: &SessionId,
     needle: &[u8],
 ) -> (Vec<u8>, bool) {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let (bytes, truncated) = attach(connection, id).await;
         if contains(&bytes, needle) {
@@ -2268,6 +2272,73 @@ fn kill_reaches_a_child_that_ignores_sighup() {
             // exist. The whole group, so the failing test leaks nothing.
             unsafe { libc::kill(-pid, libc::SIGKILL) };
             panic!("the killed session's child {pid} ignored SIGHUP and survived");
+        }
+    });
+}
+
+/// A workspace close is a kill, with the same escalation: nothing in the
+/// removed workspace may outlive it just because it arrived via
+/// `KillWorkspace` instead of `Kill`.
+#[test]
+fn kill_workspace_reaches_a_child_that_ignores_sighup() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("survivor.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c 'trap \"\" HUP; echo $$ > {}; while :; do sleep 1; done'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        connection
+            .send(&Frame::KillWorkspace {
+                workspace_id: session.workspace_id.clone(),
+                request_id: Some(66),
+            })
+            .await
+            .expect("sending KillWorkspace");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while running(pid) && Instant::now() < deadline {
+            pause(Duration::from_millis(100)).await;
+        }
+        if running(pid) {
+            // SAFETY: a plain `kill(2)` on a process group this test caused to
+            // exist. The whole group, so the failing test leaks nothing.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            panic!("the closed workspace's child {pid} ignored SIGHUP and survived");
+        }
+    });
+}
+
+/// The escalation must fire even when the *leader* dies of the SIGHUP: a
+/// background descendant that traps it outlives the leader, and only the
+/// group SIGKILL can reach it.
+#[test]
+fn kill_reaches_a_descendant_that_outlives_its_leader() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("descendant.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c '(trap \"\" HUP; while :; do sleep 1; done) & echo $! > {}; wait'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        kill(&mut connection, &session.id).await;
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while running(pid) && Instant::now() < deadline {
+            pause(Duration::from_millis(100)).await;
+        }
+        if running(pid) {
+            // SAFETY: a plain `kill(2)` on a process this test caused to exist.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("the killed session's descendant {pid} outlived the escalation");
         }
     });
 }
