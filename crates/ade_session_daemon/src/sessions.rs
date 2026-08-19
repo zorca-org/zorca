@@ -1818,28 +1818,6 @@ fn spawn_sweeper(table: Weak<SessionTable>, interval: Duration) {
         .expect("spawning status sweeper thread");
 }
 
-/// End a killed session's whole process group, and make sure it ended.
-///
-/// Three things push at a killed session, and only the last is unconditional.
-/// The killer's `SIGHUP` reaches the direct child; closing the pty makes the
-/// kernel `SIGHUP` whatever is in the *foreground* of it. An agent that traps
-/// `SIGHUP`, or a descendant sitting in the background, survives both — and
-/// once the row is gone nothing can name that process again, so it keeps its
-/// files and its locks for good. That is the shape of the reported failure: a
-/// killed Codex kept its per-thread writer lock, and the next `codex resume`
-/// was refused because the thread "already has an active writer".
-///
-/// So the group gets a `SIGHUP` of its own, and after [`KILL_GRACE`] a
-/// `SIGKILL`, which nothing can trap. The wait runs on a detached thread —
-/// `Kill` still answers `Removed` at once. A row whose child was already
-/// reaped gets neither signal: its pid may have been recycled, and the group
-/// signals would land on a stranger.
-///
-/// The child is a session leader (`portable-pty` calls `setsid` before `exec`),
-/// so its pid *is* its process-group id, that group holds every descendant that
-/// did not deliberately leave it, and the daemon — in another session entirely
-/// — can never be caught by this. A descendant that called `setsid` itself is
-/// beyond any signal we could send; only a cgroup would follow it there.
 /// The whole kill sequence for one removed row, shared by `Kill` and
 /// `KillWorkspace`.
 ///
@@ -1865,6 +1843,28 @@ fn kill_session_process(session: &mut Session) {
     }
 }
 
+/// End a killed session's whole process group, and make sure it ended.
+///
+/// Three things push at a killed session, and only the last is unconditional.
+/// The killer's `SIGHUP` reaches the direct child; closing the pty makes the
+/// kernel `SIGHUP` whatever is in the *foreground* of it. An agent that traps
+/// `SIGHUP`, or a descendant sitting in the background, survives both — and
+/// once the row is gone nothing can name that process again, so it keeps its
+/// files and its locks for good. That is the shape of the reported failure: a
+/// killed Codex kept its per-thread writer lock, and the next `codex resume`
+/// was refused because the thread "already has an active writer".
+///
+/// So the group gets a `SIGHUP` of its own, and after [`KILL_GRACE`] a
+/// `SIGKILL`, which nothing can trap. The wait runs on a detached thread —
+/// `Kill` still answers `Removed` at once. A row whose child was already
+/// reaped gets neither signal: its pid may have been recycled, and the group
+/// signals would land on a stranger.
+///
+/// The child is a session leader (`portable-pty` calls `setsid` before `exec`),
+/// so its pid *is* its process-group id, that group holds every descendant that
+/// did not deliberately leave it, and the daemon — in another session entirely
+/// — can never be caught by this. A descendant that called `setsid` itself is
+/// beyond any signal we could send; only a cgroup would follow it there.
 fn terminate_group(label: &dyn std::fmt::Display, pid: Option<u32>, activity: Arc<Activity>) {
     #[cfg(unix)]
     {
