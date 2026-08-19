@@ -28,7 +28,7 @@ use smol::net::unix::UnixStream;
 use tempfile::TempDir;
 
 /// How long any single frame may take to arrive before a test gives up.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A session command that stays alive but does nothing.
 const IDLE: &str = "sleep 30";

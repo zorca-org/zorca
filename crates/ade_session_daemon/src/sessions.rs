@@ -14,6 +14,10 @@
 //!   row. When the child process exits the row *stays* and its status becomes
 //!   [`SessionStatus::Exited`], which is what makes a crashed agent visible in
 //!   the sidebar instead of vanishing from it.
+//! - **A kill is not a request.** The row goes at once, and the child's whole
+//!   process group is hung up and then, if it is still there, killed; see
+//!   [`terminate_group`]. Removing a row the daemon could not reach again is
+//!   what leaves an agent holding its locks forever.
 //! - **The child process is the agent process.** Commands are run as
 //!   `sh -lc 'exec <command>'`, so the pid the daemon waits on is the agent
 //!   itself and not an intermediate shell. An *empty* command means "the
@@ -65,6 +69,15 @@ pub const DEFAULT_SCROLLBACK_BYTES: usize = 2 * 1024 * 1024;
 /// Bytes read from the pty in one go, and therefore the largest raw payload of
 /// a single [`Frame::Output`].
 const DRAIN_CHUNK_BYTES: usize = 8192;
+
+/// How long a killed session's process group has to leave on its own before
+/// [`terminate_group`] stops asking and sends `SIGKILL`.
+///
+/// A second is a shell's or an agent's whole `SIGHUP` cleanup window, and the
+/// user never waits on it: `Kill` answers `Removed` immediately and the
+/// escalation runs on a thread of its own.
+#[cfg(unix)]
+const KILL_GRACE: Duration = Duration::from_secs(1);
 
 /// The byte an agent sends when it wants a human: `BEL`, 0x07.
 const BELL: u8 = 0x07;
@@ -211,6 +224,12 @@ impl Activity {
 
     fn mark_dead(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).dead = true;
+    }
+
+    /// The child has been waited on, so its pid may already belong to someone
+    /// else — the kill paths' reason to stand down.
+    fn is_dead(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).dead
     }
 
     /// `(last output, bell pending, child dead)`.
@@ -557,6 +576,9 @@ struct Live {
     master: Box<dyn MasterPty + Send>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     killer: Box<dyn ChildKiller + Send + Sync>,
+    /// The child's pid, which on unix is also its process-group id — see
+    /// [`signal_group`]. `None` only if the platform would not report one.
+    pid: Option<u32>,
 }
 
 struct Session {
@@ -911,11 +933,28 @@ impl SessionTable {
         drop(pty.slave);
 
         let killer = child.clone_killer();
-        let writer = pty.master.take_writer().context("taking pty writer")?;
-        let reader = pty
+        let pid = child.process_id();
+        let handles = pty
             .master
-            .try_clone_reader()
-            .context("cloning pty reader")?;
+            .take_writer()
+            .context("taking pty writer")
+            .and_then(|writer| {
+                let reader = pty
+                    .master
+                    .try_clone_reader()
+                    .context("cloning pty reader")?;
+                Ok((writer, reader))
+            });
+        let (writer, reader) = match handles {
+            Ok(handles) => handles,
+            Err(err) => {
+                // Nothing holds this child yet — no row, no reaper — so
+                // returning here would leave a process the daemon can never
+                // name again. Signal and reap it before the error goes out.
+                abandon(child);
+                return Err(err.into());
+            }
+        };
 
         let scrollback = request
             .scrollback_bytes
@@ -958,6 +997,7 @@ impl SessionTable {
                         master: pty.master,
                         writer: Arc::new(Mutex::new(writer)),
                         killer,
+                        pid,
                     }),
                     hub: hub.clone(),
                     activity: activity.clone(),
@@ -1275,11 +1315,7 @@ impl SessionTable {
             removed
         };
         for session in &mut removed {
-            if let Some(live) = session.live.as_mut()
-                && let Err(err) = live.killer.kill()
-            {
-                log::debug!("killing {}: {err}", session.info.id);
-            }
+            kill_session_process(session);
         }
         drop(removed);
         if let Err(err) = self.persist() {
@@ -1515,12 +1551,7 @@ impl SessionTable {
             self.scrub_layout(&session.info.workspace_id, id);
             session
         };
-        if let Some(live) = session.live.as_mut()
-            && let Err(err) = live.killer.kill()
-        {
-            // Already dead is the common case here, not a failure.
-            log::debug!("killing {id}: {err}");
-        }
+        kill_session_process(&mut session);
         drop(session);
         if let Err(err) = self.persist() {
             log::warn!("could not persist session state: {err:#}");
@@ -1778,6 +1809,139 @@ fn spawn_sweeper(table: Weak<SessionTable>, interval: Duration) {
         .expect("spawning status sweeper thread");
 }
 
+/// The whole kill sequence for one removed row, shared by `Kill` and
+/// `KillWorkspace`.
+///
+/// The group first: its reaped-gate must read the state from *before* this
+/// kill — the direct kill below can end the leader and have it reaped fast
+/// enough to read as a long-dead row. The direct kill sits behind the same
+/// gate, because the killer signals a raw pid the kernel may have recycled.
+/// The killer reaches the direct child only, and dropping the pty reaches
+/// whatever is in the foreground; neither is enough on its own — see
+/// [`terminate_group`].
+fn kill_session_process(session: &mut Session) {
+    let id = session.info.id.clone();
+    let pid = session.live.as_ref().and_then(|live| live.pid);
+    let activity = session.activity.clone();
+    terminate_group(&id, pid, activity.clone());
+    if activity.is_dead() {
+        // Reaped before this kill began.
+    } else if let Some(live) = session.live.as_mut()
+        && let Err(err) = live.killer.kill()
+    {
+        // Already dead is the common case here, not a failure.
+        log::debug!("killing {id}: {err}");
+    }
+}
+
+/// End a killed session's whole process group, and make sure it ended.
+///
+/// Three things push at a killed session, and only the last is unconditional.
+/// The killer's `SIGHUP` reaches the direct child; closing the pty makes the
+/// kernel `SIGHUP` whatever is in the *foreground* of it. An agent that traps
+/// `SIGHUP`, or a descendant sitting in the background, survives both — and
+/// once the row is gone nothing can name that process again, so it keeps its
+/// files and its locks for good. That is the shape of the reported failure: a
+/// killed Codex kept its per-thread writer lock, and the next `codex resume`
+/// was refused because the thread "already has an active writer".
+///
+/// So the group gets a `SIGHUP` of its own, and after [`KILL_GRACE`] a
+/// `SIGKILL`, which nothing can trap. The wait runs on a detached thread —
+/// `Kill` still answers `Removed` at once. A row whose child was already
+/// reaped gets neither signal: its pid may have been recycled, and the group
+/// signals would land on a stranger.
+///
+/// The child is a session leader (`portable-pty` calls `setsid` before `exec`),
+/// so its pid *is* its process-group id, that group holds every descendant that
+/// did not deliberately leave it, and the daemon — in another session entirely
+/// — can never be caught by this. A descendant that called `setsid` itself is
+/// beyond any signal we could send; only a cgroup would follow it there.
+fn terminate_group(label: &dyn std::fmt::Display, pid: Option<u32>, activity: Arc<Activity>) {
+    #[cfg(unix)]
+    {
+        let Some(pid) = pid
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+            .filter(|pid| *pid > 0)
+        else {
+            return;
+        };
+        // Once the reaper has waited on the child, the kernel may hand its pid
+        // to anyone — signalling `-pid` could kill an unrelated group. So a
+        // row whose child was already reaped (killed long after it exited)
+        // gets no group signal at all; a descendant that survived its leader
+        // this long was deliberate. An unreaped leader keeps the pid reserved,
+        // which makes the signals below safe.
+        if activity.is_dead() {
+            return;
+        }
+        signal_group(pid, libc::SIGHUP);
+        let label = label.to_string();
+        let escalate = std::thread::Builder::new()
+            .name(format!("ade-kill-{pid}"))
+            .spawn(move || {
+                std::thread::sleep(KILL_GRACE);
+                // No re-check of `is_dead` here: reaping the *leader* inside
+                // the grace is the trap-SIGHUP case this SIGKILL exists for,
+                // and surviving members keep the pgid reserved. The pid is
+                // recyclable only once the whole group is gone — and then a
+                // wrap of pid_max inside one second is not a real window.
+                if signal_group(pid, libc::SIGKILL) {
+                    log::warn!("{label} outlived SIGHUP; killed its process group {pid}");
+                }
+            });
+        if let Err(err) = escalate {
+            log::warn!("could not spawn the kill escalation for {pid}: {err}");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows has no process groups to signal and no daemon to signal them
+        // from; the killer's `TerminateProcess` is the whole story there.
+        let _ = (label, pid, activity);
+    }
+}
+
+/// Send `signal` to the process group led by `pid`; `true` if anything was
+/// there to receive it.
+///
+/// `pid` must be positive. `kill(0, ...)` would signal the daemon's own group
+/// and `kill(-1, ...)` every process it can reach.
+#[cfg(unix)]
+fn signal_group(pid: libc::pid_t, signal: libc::c_int) -> bool {
+    debug_assert!(pid > 0, "a process group id is a positive pid");
+    // SAFETY: `kill(2)` against a group this daemon created, never 0 or -1.
+    unsafe { libc::kill(-pid, signal) == 0 }
+}
+
+/// End a child that never reached the table.
+///
+/// Between the spawn and the insert there is no row and no reaper, so returning
+/// an error from in there would drop the [`portable_pty::Child`] — which on
+/// unix neither signals nor waits — and leave a live process nothing in the
+/// daemon knows about. Reaping happens on its own thread because the
+/// `SIGKILL` that guarantees the child goes is on a timer, and `create` must
+/// not block on it.
+fn abandon(mut child: Box<dyn portable_pty::Child + Send + Sync>) {
+    let pid = child.process_id();
+    if let Err(err) = child.kill() {
+        // Already dead is fine here too.
+        log::debug!("killing an abandoned child: {err}");
+    }
+    // A fresh activity: the child is not reaped until the thread below runs,
+    // which is exactly what makes the group signals safe to send.
+    terminate_group(&"an abandoned session", pid, Arc::new(Activity::new()));
+    if let Err(err) = std::thread::Builder::new()
+        .name("ade-reap-abandoned".to_owned())
+        .spawn(move || {
+            if let Err(err) = child.wait() {
+                log::warn!("waiting on an abandoned child: {err}");
+            }
+        })
+    {
+        log::warn!("could not spawn a reaper for an abandoned child: {err}");
+    }
+}
+
 /// Wait for the child and hand its exit status to the PTY drain. One blocking
 /// thread per session, which is the boring way to do this and costs nothing at
 /// ADE's session counts.
@@ -1949,6 +2113,8 @@ fn now_unix() -> u64 {
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
 
     use ade_session::proto::{LayoutDoc, SessionId, SessionInfo, SessionStatus, WorkspaceInfo};
 
@@ -1956,6 +2122,8 @@ mod tests {
         Activity, SessionTable, StatusConfig, SubscriberId, is_shell_name, login_shell_from, shell,
         terminal_env,
     };
+    #[cfg(unix)]
+    use super::{KILL_GRACE, terminate_group};
     use crate::state::{PersistedSession, StateStore};
 
     /// Feed `chunks` to one session in order: is a bell pending after the last
@@ -2414,5 +2582,64 @@ mod tests {
         assert_eq!(super::passwd_shell(passwd, "noshell"), None);
         assert_eq!(super::passwd_shell(passwd, "truncated"), None);
         assert_eq!(super::passwd_shell(passwd, "nobody"), None);
+    }
+
+    /// A decoy process in its own group, standing in for a stranger that
+    /// inherited a recycled pid.
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_methods, reason = "a synchronous test thread")]
+    fn decoy_group() -> std::process::Child {
+        use std::os::unix::process::CommandExt as _;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawning the decoy")
+    }
+
+    /// A row whose child was already reaped gets no group signal at all: its
+    /// pid may belong to someone else by now.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_stands_down_for_a_reaped_child() {
+        let mut decoy = decoy_group();
+        let activity = Arc::new(Activity::new());
+        activity.mark_dead();
+        terminate_group(&"a reaped session", Some(decoy.id()), activity);
+
+        // Past the escalation deadline; a SIGKILL would have landed by now.
+        std::thread::sleep(KILL_GRACE + Duration::from_millis(500));
+        assert!(
+            decoy.try_wait().expect("polling the decoy").is_none(),
+            "a reaped row's signals reached a live group"
+        );
+        decoy.kill().expect("ending the decoy");
+        decoy.wait().expect("reaping the decoy");
+    }
+
+    /// The counterpart that gives the stand-down test its teeth: with the
+    /// child unreaped, the same call does signal the group.
+    #[cfg(unix)]
+    #[test]
+    fn terminate_group_signals_an_unreaped_group() {
+        let mut decoy = decoy_group();
+        terminate_group(
+            &"a live session",
+            Some(decoy.id()),
+            Arc::new(Activity::new()),
+        );
+
+        // `sleep`'s default SIGHUP disposition is to die; no grace needed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if decoy.try_wait().expect("polling the decoy").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the group signal never reached an unreaped group"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

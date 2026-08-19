@@ -1242,6 +1242,38 @@ async fn test_new_entry_noops_without_open_project(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_new_terminal_in_an_ade_window_is_never_a_stock_terminal(cx: &mut TestAppContext) {
+    let project = init_test_project("/my-project", cx).await;
+    // This installs the center-terminal hook whose sidebar integration the test exercises.
+    cx.update(ade_workspaces::init);
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    let workspace = multi_workspace.read_with(cx, |multi_workspace, _cx| {
+        multi_workspace.workspace().clone()
+    });
+
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.set_ade_owns_layout(window, cx)
+    });
+    cx.run_until_parked();
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_new_terminal(&workspace, window, cx);
+    });
+    cx.run_until_parked();
+
+    // Only ADE reports this intentionally unsynchronized layout state.
+    assert_eq!(
+        workspace
+            .read_with(cx, |workspace, _| workspace.notification_ids())
+            .len(),
+        1,
+        "the sidebar's new terminal went to ADE, not to a stock shell"
+    );
+}
+
+#[gpui::test]
 async fn test_selection_clamps_after_entry_removal(cx: &mut TestAppContext) {
     let project = init_test_project("/my-project", cx).await;
     let (multi_workspace, cx) =

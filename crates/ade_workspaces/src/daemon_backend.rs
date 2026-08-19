@@ -2144,6 +2144,21 @@ impl HostLink {
                     self.host.destination
                 ),
             }
+
+            //
+            // Said out loud, and at `info` like the deploy lines below, because
+            // the silent version of this is indistinguishable from a broken
+            // cross-compile: no build is attempted, so the log shows *nothing*
+            // for the host, and the operator concludes the toolchain failed
+            // rather than that the daemon declined. Once per host per connect.
+            log::info!(
+                "{}: daemon runs build {}… and holds sessions with work in them; \
+                 leaving it alone — \"upgrade host daemon\" forces it",
+                self.host.destination,
+                // `get`, not a byte slice: the hash is remote input, and a
+                // multi-byte char straddling offset 12 would panic here.
+                remote_hash.get(..12).unwrap_or(&remote_hash),
+            );
             return false;
         }
         match self.upgrade_to_local_binary(paths, &remote_hash, false) {
@@ -2210,7 +2225,8 @@ impl HostLink {
         log::info!(
             "{}: daemon runs build {}…, this client would deploy {}…; upgrading{}",
             self.host.destination,
-            &remote_hash[..remote_hash.len().min(12)],
+            // Same reason as the decline log: remote input, `get` or panic.
+            remote_hash.get(..12).unwrap_or(remote_hash),
             &local_hash[..12],
             if force { " (forced)" } else { "" },
         );

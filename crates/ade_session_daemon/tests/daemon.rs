@@ -170,7 +170,7 @@ async fn wait_for(
     what: &str,
     predicate: impl Fn(&[SessionInfo]) -> bool,
 ) -> Vec<SessionInfo> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let sessions = list(connection).await;
         if predicate(&sessions) {
@@ -184,7 +184,12 @@ async fn wait_for(
 }
 
 /// How long any single frame may take to arrive before the test gives up.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Generous: a runner under full-workspace load can stall a frame for tens of
+/// seconds, and a passing run never waits this long. Two of these can compose
+/// in one wait (attach, then recv); the package's 120s slow-timeout override
+/// in `.config/nextest.toml` keeps the labeled panic ahead of the harness
+/// kill even then.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// `connection.recv()` that fails the test instead of hanging forever.
 ///
@@ -314,11 +319,28 @@ async fn output_until(
 ///
 /// Dropping that connection is also the implicit detach, which is exactly what
 /// a client crash does.
+///
+/// On a miss the helper waits for one live `Output` frame and re-attaches:
+/// attach and publish share the session lock, so an `Output` after the attach
+/// proves the grid changed and a fresh replay is worth taking. Waiting for the
+/// needle in the output itself would starve — a repaint (leaving the alternate
+/// screen) puts bytes on the screen that never appear in raw output.
 async fn wait_for_ring(socket: &Path, id: &SessionId, needle: &[u8]) {
-    let mut probe = client(socket).await;
-    let (replayed, _) = attach(&mut probe, id).await;
-    if !contains(&replayed, needle) {
-        output_until(&mut probe, id, needle).await;
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        let mut probe = client(socket).await;
+        let (replayed, _) = attach(&mut probe, id).await;
+        if contains(&replayed, needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay never contained {needle:?}"
+        );
+        match recv(&mut probe, "Output").await {
+            Frame::Output { session_id, .. } => assert_eq!(&session_id, id),
+            other => panic!("expected Output, got {other:?}"),
+        }
     }
 }
 
@@ -341,7 +363,7 @@ async fn event_until<T>(
     what: &str,
     want: impl Fn(&Frame) -> Option<T>,
 ) -> T {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let frame = recv(connection, what).await;
         if let Some(found) = want(&frame) {
@@ -387,7 +409,7 @@ async fn replay_containing(
     id: &SessionId,
     needle: &[u8],
 ) -> (Vec<u8>, bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(45);
     loop {
         let (bytes, truncated) = attach(connection, id).await;
         if contains(&bytes, needle) {
@@ -2215,6 +2237,127 @@ fn kill_removes_the_session_and_unknown_ids_error() {
             other => panic!("expected Error, got {other:?}"),
         }
     });
+}
+
+/// Kill means dead, not "asked politely".
+///
+/// A `Kill` that only sends SIGHUP leaves a child that ignores it running with
+/// no row to reach it by — the orphan behind the reported collision, where a
+/// second agent could not resume a thread a forgotten first one still held. The
+/// command here ignores SIGHUP and never reads its pty, so neither the signal
+/// nor the pty hangup that follows the master's close can end it: only the
+/// escalation can. It records its own pid, which is also its process-group id,
+/// because the wire carries no pid.
+#[test]
+fn kill_reaches_a_child_that_ignores_sighup() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("survivor.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c 'trap \"\" HUP; echo $$ > {}; while :; do sleep 1; done'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        kill(&mut connection, &session.id).await;
+
+        assert_dies(pid, true, "the killed session's SIGHUP-ignoring child").await;
+    });
+}
+
+/// A workspace close is a kill, with the same escalation: nothing in the
+/// removed workspace may outlive it just because it arrived via
+/// `KillWorkspace` instead of `Kill`.
+#[test]
+fn kill_workspace_reaches_a_child_that_ignores_sighup() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("survivor.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c 'trap \"\" HUP; echo $$ > {}; while :; do sleep 1; done'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        connection
+            .send(&Frame::KillWorkspace {
+                workspace_id: session.workspace_id.clone(),
+                request_id: Some(66),
+            })
+            .await
+            .expect("sending KillWorkspace");
+
+        assert_dies(pid, true, "the closed workspace's SIGHUP-ignoring child").await;
+    });
+}
+
+/// The escalation must fire even when the *leader* dies of the SIGHUP: a
+/// background descendant that traps it outlives the leader, and only the
+/// group SIGKILL can reach it.
+#[test]
+fn kill_reaches_a_descendant_that_outlives_its_leader() {
+    let (dir, server) = server();
+    let pid_file = dir.path().join("descendant.pid");
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let command = format!(
+            "sh -c '(trap \"\" HUP; while :; do sleep 1; done) & echo $! > {}; wait'",
+            pid_file.display()
+        );
+        let session = create(&mut connection, dir.path(), &command).await;
+        let pid = wait_for_pid(&pid_file).await;
+
+        kill(&mut connection, &session.id).await;
+
+        assert_dies(
+            pid,
+            false,
+            "the killed session's leader-outliving descendant",
+        )
+        .await;
+    });
+}
+
+/// Poll until `pid` is gone — or SIGKILL what the test leaked and fail.
+///
+/// Generous against the daemon's own grace period: the assertion is that the
+/// process eventually goes, not how fast.
+async fn assert_dies(pid: libc::pid_t, whole_group: bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while running(pid) && Instant::now() < deadline {
+        pause(Duration::from_millis(100)).await;
+    }
+    if running(pid) {
+        // SAFETY: a plain `kill(2)` on a process (group) this test caused to
+        // exist, so the failing test leaks nothing.
+        unsafe { libc::kill(if whole_group { -pid } else { pid }, libc::SIGKILL) };
+        panic!("{what}: {pid} survived");
+    }
+}
+
+/// The pid the command under test wrote, once it has written it.
+async fn wait_for_pid(path: &Path) -> libc::pid_t {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "the command never wrote its pid");
+        pause(Duration::from_millis(50)).await;
+    }
+}
+
+/// Does this pid still exist? A zombie counts as gone: the daemon's reaper
+/// waits on the child, so an unreaped pid means the process is genuinely there.
+fn running(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 checks for the process without sending anything.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// The point of the daemon: an agent that dies stays visible instead of

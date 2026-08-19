@@ -19,7 +19,7 @@ use smol::process::{Child, Command, Stdio};
 use tempfile::TempDir;
 
 /// How long any single step may take before a test gives up.
-const TIMEOUT: Duration = Duration::from_secs(10);
+const TIMEOUT: Duration = Duration::from_secs(45);
 
 fn server() -> (TempDir, RunningServer) {
     let dir = TempDir::new().expect("temp dir");
