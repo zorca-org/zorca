@@ -316,11 +316,25 @@ async fn output_until(
 ///
 /// Dropping that connection is also the implicit detach, which is exactly what
 /// a client crash does.
+///
+/// On a miss the helper waits for one live `Output` frame and re-attaches:
+/// attach and publish share the session lock, so an `Output` after the attach
+/// proves the grid changed and a fresh replay is worth taking. Waiting for the
+/// needle in the output itself would starve — a repaint (leaving the alternate
+/// screen) puts bytes on the screen that never appear in raw output.
 async fn wait_for_ring(socket: &Path, id: &SessionId, needle: &[u8]) {
-    let mut probe = client(socket).await;
-    let (replayed, _) = attach(&mut probe, id).await;
-    if !contains(&replayed, needle) {
-        output_until(&mut probe, id, needle).await;
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    loop {
+        let mut probe = client(socket).await;
+        let (replayed, _) = attach(&mut probe, id).await;
+        if contains(&replayed, needle) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "replay never contained {needle:?}");
+        match recv(&mut probe, "Output").await {
+            Frame::Output { session_id, .. } => assert_eq!(&session_id, id),
+            other => panic!("expected Output, got {other:?}"),
+        }
     }
 }
 
