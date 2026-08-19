@@ -2024,9 +2024,13 @@ impl Terminal {
     }
 
     /// Keep a daemon-owned session at its last active size while its view is unfocused.
-    /// Dock and tab changes must not resize the shared PTY merely because its viewport moved.
+    /// The first measured size must still replace the debug-size PTY that a
+    /// restored terminal starts with before its pane can receive focus.
     pub fn set_view_size(&mut self, new_bounds: TerminalBounds, view_is_focused: bool) {
-        if !view_is_focused && self.is_ade_session() {
+        if !view_is_focused
+            && self.is_ade_session()
+            && self.last_content.terminal_bounds != TerminalBounds::default()
+        {
             return;
         }
         self.set_size(new_bounds);
@@ -4317,6 +4321,46 @@ mod tests {
         assert!(matches!(
             terminal.events.back(),
             Some(InternalEvent::Resize(_))
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_ade_session_accepts_its_initial_unfocused_view_size(cx: &mut TestAppContext) {
+        let builder = cx.update(|cx| {
+            TerminalBuilder::new_display_only(
+                SettingsCursorShape::Block,
+                AlternateScroll::On,
+                None,
+                0,
+                cx.background_executor(),
+                PathStyle::local(),
+            )
+        });
+        let mut terminal = builder.terminal;
+        let (_, completion_rx) = async_channel::unbounded();
+        terminal.task = Some(TaskState {
+            status: TaskStatus::Running,
+            completion_rx,
+            spawned_task: SpawnInTerminal {
+                id: TaskId(format!("{ADE_SESSION_TASK_PREFIX}test")),
+                ..Default::default()
+            },
+        });
+
+        let initial_bounds = TerminalBounds {
+            cell_width: Pixels::from(10.),
+            line_height: Pixels::from(10.),
+            bounds: bounds(
+                GpuiPoint::default(),
+                size(Pixels::from(800.), Pixels::from(600.)),
+            ),
+        };
+        terminal.set_view_size(initial_bounds, false);
+
+        assert_eq!(terminal.last_content.terminal_bounds, initial_bounds);
+        assert!(matches!(
+            terminal.events.back(),
+            Some(InternalEvent::Resize(bounds)) if *bounds == initial_bounds
         ));
     }
 
