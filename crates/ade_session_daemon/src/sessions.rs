@@ -1324,19 +1324,7 @@ impl SessionTable {
             removed
         };
         for session in &mut removed {
-            // Same escalation and same order as a single-session kill: group
-            // first while its reaped-gate still reads pre-kill state, then the
-            // direct kill, gated the same way — see `remove_session`.
-            let pid = session.live.as_ref().and_then(|live| live.pid);
-            let activity = session.activity.clone();
-            terminate_group(&session.info.id, pid, activity.clone());
-            if activity.is_dead() {
-                // Reaped long ago: the raw pid may be recycled.
-            } else if let Some(live) = session.live.as_mut()
-                && let Err(err) = live.killer.kill()
-            {
-                log::debug!("killing {}: {err}", session.info.id);
-            }
+            kill_session_process(session);
         }
         drop(removed);
         if let Err(err) = self.persist() {
@@ -1572,24 +1560,7 @@ impl SessionTable {
             self.scrub_layout(&session.info.workspace_id, id);
             session
         };
-        let pid = session.live.as_ref().and_then(|live| live.pid);
-        let activity = session.activity.clone();
-        // The group first: its reaped-gate must read the state from *before*
-        // this kill — the direct kill below can end the leader and have it
-        // reaped fast enough to read as a long-dead row. The killer reaches
-        // the direct child only, and dropping the pty reaches whatever is in
-        // the foreground; neither is enough on its own — see
-        // [`terminate_group`].
-        terminate_group(id, pid, activity.clone());
-        if activity.is_dead() {
-            // Reaped before this kill began: the raw pid the killer would
-            // signal may already belong to someone else.
-        } else if let Some(live) = session.live.as_mut()
-            && let Err(err) = live.killer.kill()
-        {
-            // Already dead is the common case here, not a failure.
-            log::debug!("killing {id}: {err}");
-        }
+        kill_session_process(&mut session);
         drop(session);
         if let Err(err) = self.persist() {
             log::warn!("could not persist session state: {err:#}");
@@ -1869,6 +1840,31 @@ fn spawn_sweeper(table: Weak<SessionTable>, interval: Duration) {
 /// did not deliberately leave it, and the daemon — in another session entirely
 /// — can never be caught by this. A descendant that called `setsid` itself is
 /// beyond any signal we could send; only a cgroup would follow it there.
+/// The whole kill sequence for one removed row, shared by `Kill` and
+/// `KillWorkspace`.
+///
+/// The group first: its reaped-gate must read the state from *before* this
+/// kill — the direct kill below can end the leader and have it reaped fast
+/// enough to read as a long-dead row. The direct kill sits behind the same
+/// gate, because the killer signals a raw pid the kernel may have recycled.
+/// The killer reaches the direct child only, and dropping the pty reaches
+/// whatever is in the foreground; neither is enough on its own — see
+/// [`terminate_group`].
+fn kill_session_process(session: &mut Session) {
+    let id = session.info.id.clone();
+    let pid = session.live.as_ref().and_then(|live| live.pid);
+    let activity = session.activity.clone();
+    terminate_group(&id, pid, activity.clone());
+    if activity.is_dead() {
+        // Reaped before this kill began.
+    } else if let Some(live) = session.live.as_mut()
+        && let Err(err) = live.killer.kill()
+    {
+        // Already dead is the common case here, not a failure.
+        log::debug!("killing {id}: {err}");
+    }
+}
+
 fn terminate_group(label: &dyn std::fmt::Display, pid: Option<u32>, activity: Arc<Activity>) {
     #[cfg(unix)]
     {

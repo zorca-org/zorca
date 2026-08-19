@@ -23,6 +23,13 @@ filter = 'package(extension_host) and test(test_extension_store_with_test_extens
 priority = 99
 threads-required = "num-test-threads"
 
+# The daemon tests drive real child processes through labeled 45s frame
+# deadlines that can compose (attach, then recv) within one test. Room above
+# the sum, so the labeled panic always beats the harness kill.
+[[profile.default.overrides]]
+filter = 'package(ade_session_daemon)'
+slow-timeout = { period = "120s", terminate-after = 1 }
+
 # Extended timeouts for tests that were timing out at 60s
 [[profile.default.overrides]]
 filter = 'test(test_rainbow_bracket_highlights) or test(test_wrapped_invisibles_drawing) or test(test_basic_following) or test(test_random_diagnostics_blocks)'

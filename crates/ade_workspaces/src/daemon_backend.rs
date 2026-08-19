@@ -2225,7 +2225,8 @@ impl HostLink {
         log::info!(
             "{}: daemon runs build {}…, this client would deploy {}…; upgrading{}",
             self.host.destination,
-            &remote_hash[..remote_hash.len().min(12)],
+            // Same reason as the decline log: remote input, `get` or panic.
+            remote_hash.get(..12).unwrap_or(remote_hash),
             &local_hash[..12],
             if force { " (forced)" } else { "" },
         );

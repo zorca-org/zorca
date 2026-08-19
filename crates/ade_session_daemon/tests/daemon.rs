@@ -185,8 +185,10 @@ async fn wait_for(
 
 /// How long any single frame may take to arrive before the test gives up.
 /// Generous: a runner under full-workspace load can stall a frame for tens of
-/// seconds, and a passing run never waits this long. Must stay under nextest's
-/// 60s slow-timeout hard kill, or the labeled panic loses the race to it.
+/// seconds, and a passing run never waits this long. Two of these can compose
+/// in one wait (attach, then recv); the package's 120s slow-timeout override
+/// in `.config/nextest.toml` keeps the labeled panic ahead of the harness
+/// kill even then.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// `connection.recv()` that fails the test instead of hanging forever.
@@ -2261,18 +2263,7 @@ fn kill_reaches_a_child_that_ignores_sighup() {
 
         kill(&mut connection, &session.id).await;
 
-        // Generous against the daemon's own grace period: the assertion is
-        // that the process eventually goes, not how fast.
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while running(pid) && Instant::now() < deadline {
-            pause(Duration::from_millis(100)).await;
-        }
-        if running(pid) {
-            // SAFETY: a plain `kill(2)` on a process group this test caused to
-            // exist. The whole group, so the failing test leaks nothing.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-            panic!("the killed session's child {pid} ignored SIGHUP and survived");
-        }
+        assert_dies(pid, true, "the killed session's SIGHUP-ignoring child").await;
     });
 }
 
@@ -2300,16 +2291,7 @@ fn kill_workspace_reaches_a_child_that_ignores_sighup() {
             .await
             .expect("sending KillWorkspace");
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while running(pid) && Instant::now() < deadline {
-            pause(Duration::from_millis(100)).await;
-        }
-        if running(pid) {
-            // SAFETY: a plain `kill(2)` on a process group this test caused to
-            // exist. The whole group, so the failing test leaks nothing.
-            unsafe { libc::kill(-pid, libc::SIGKILL) };
-            panic!("the closed workspace's child {pid} ignored SIGHUP and survived");
-        }
+        assert_dies(pid, true, "the closed workspace's SIGHUP-ignoring child").await;
     });
 }
 
@@ -2331,16 +2313,30 @@ fn kill_reaches_a_descendant_that_outlives_its_leader() {
 
         kill(&mut connection, &session.id).await;
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while running(pid) && Instant::now() < deadline {
-            pause(Duration::from_millis(100)).await;
-        }
-        if running(pid) {
-            // SAFETY: a plain `kill(2)` on a process this test caused to exist.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            panic!("the killed session's descendant {pid} outlived the escalation");
-        }
+        assert_dies(
+            pid,
+            false,
+            "the killed session's leader-outliving descendant",
+        )
+        .await;
     });
+}
+
+/// Poll until `pid` is gone — or SIGKILL what the test leaked and fail.
+///
+/// Generous against the daemon's own grace period: the assertion is that the
+/// process eventually goes, not how fast.
+async fn assert_dies(pid: libc::pid_t, whole_group: bool, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while running(pid) && Instant::now() < deadline {
+        pause(Duration::from_millis(100)).await;
+    }
+    if running(pid) {
+        // SAFETY: a plain `kill(2)` on a process (group) this test caused to
+        // exist, so the failing test leaks nothing.
+        unsafe { libc::kill(if whole_group { -pid } else { pid }, libc::SIGKILL) };
+        panic!("{what}: {pid} survived");
+    }
 }
 
 /// The pid the command under test wrote, once it has written it.
