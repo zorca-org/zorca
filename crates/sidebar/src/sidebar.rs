@@ -231,6 +231,7 @@ enum NewEntryTarget {
     /// Selecting a worktree has to leave the user somewhere they can work, but
     /// re-selecting one that is already open must not stack up terminals.
     TerminalIfCentreEmpty,
+    WorktreePicker,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -566,6 +567,19 @@ impl Sidebar {
         workspace.update(cx, |workspace, cx| {
             git_ui::worktree_picker::toggle(workspace, window, cx)
         });
+    }
+
+    fn open_worktree_picker_for_group(
+        &mut self,
+        key: &ProjectGroupKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace_for_group(key, cx) {
+            self.open_worktree_picker(&workspace, window, cx);
+        } else {
+            self.open_workspace_and_create_entry(key, NewEntryTarget::WorktreePicker, window, cx);
+        }
     }
 
     #[cfg(test)]
@@ -1241,6 +1255,7 @@ impl Sidebar {
                         this.create_new_terminal(&workspace, window, cx);
                     }
                 }
+                NewEntryTarget::WorktreePicker => this.open_worktree_picker(&workspace, window, cx),
             })?;
             anyhow::Ok(())
         })
@@ -4621,9 +4636,7 @@ impl Sidebar {
                                 .icon_size(IconSize::Small)
                                 .tooltip(Tooltip::text("New Worktree"))
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some(workspace) = this.workspace_for_group(&key, cx) {
-                                        this.open_worktree_picker(&workspace, window, cx);
-                                    }
+                                    this.open_worktree_picker_for_group(&key, window, cx);
                                 })),
                         )
                     },
@@ -4867,9 +4880,7 @@ impl Sidebar {
                     menu.entry("New Worktree", None, move |window, cx| {
                         sidebar
                             .update(cx, |sidebar, cx| {
-                                if let Some(workspace) = sidebar.workspace_for_group(&key, cx) {
-                                    sidebar.open_worktree_picker(&workspace, window, cx);
-                                }
+                                sidebar.open_worktree_picker_for_group(&key, window, cx);
                             })
                             .ok();
                     })

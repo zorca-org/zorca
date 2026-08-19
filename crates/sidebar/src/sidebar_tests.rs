@@ -4320,6 +4320,72 @@ async fn test_worktree_picker_activates_its_project(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_new_worktree_button_opens_picker_for_a_closed_project(cx: &mut TestAppContext) {
+    let (fs, project) = init_sidebar_create_worktree_test(cx).await;
+    let project_key = project.read_with(cx, |project, cx| project.project_group_key(cx));
+    let unrelated_project = project::Project::test(fs, [Path::new("/unrelated")], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(unrelated_project, window, cx));
+    multi_workspace.update(cx, |multi_workspace, _| {
+        multi_workspace.test_add_project_group(workspace::ProjectGroup {
+            key: project_key.clone(),
+            workspaces: Vec::new(),
+            expanded: true,
+        });
+    });
+    let sidebar = setup_sidebar(&multi_workspace, cx);
+    sidebar.update(cx, |sidebar, cx| {
+        sidebar.available_worktrees.insert(
+            (PathBuf::from("/project-a/.git"), None),
+            vec![git::repository::Worktree {
+                path: PathBuf::from("/project-a"),
+                ref_name: Some("refs/heads/main".into()),
+                sha: "deadbeef".into(),
+                is_main: true,
+                is_bare: false,
+            }],
+        );
+        cx.notify();
+    });
+
+    sidebar.update(cx, |sidebar, cx| {
+        let tree = sidebar.workspace_tree(cx);
+        let project = tree
+            .groups
+            .iter()
+            .flat_map(|group| &group.projects)
+            .find(|project| project.name.as_ref() == "project-a")
+            .expect("the closed project should have a row");
+        assert!(project.has_repository, "the row should offer New Worktree");
+        assert!(
+            sidebar.workspace_for_group(&project_key, cx).is_none(),
+            "the regression requires the target project to be closed",
+        );
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.open_worktree_picker_for_group(&project_key, window, cx);
+    });
+    cx.run_until_parked();
+
+    let workspace =
+        multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+    assert!(
+        workspace
+            .read_with(cx, |workspace, cx| workspace
+                .active_modal::<git_ui::worktree_picker::WorktreePicker>(
+                cx
+            ))
+            .is_some(),
+        "New Worktree should open the target project and show its picker",
+    );
+    assert_eq!(
+        workspace.read_with(cx, |workspace, cx| workspace.project_group_key(cx)),
+        project_key,
+        "the picker should belong to the project whose button was clicked",
+    );
+}
+
+#[gpui::test]
 async fn test_created_worktree_clears_source_sidebar_selection(cx: &mut TestAppContext) {
     let (_fs, project) = init_sidebar_create_worktree_test(cx).await;
     let (multi_workspace, cx) =
