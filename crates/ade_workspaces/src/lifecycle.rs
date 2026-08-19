@@ -534,7 +534,10 @@ impl WorkspaceLifecycleService {
         // add an atomic ResetWorkspace protocol frame if concurrent clients
         // creating sessions during recovery becomes a real problem.
         backend
-            .kill(&SessionId::from(daemon_workspace_id.clone()))
+            .reset_workspace_sessions(
+                &SessionId::from(daemon_workspace_id.clone()),
+                &workspace.repository_path,
+            )
             .with_context(|| format!("killing sessions in workspace {daemon_workspace_id}"))?;
         self.start_session(&mut workspace).await?;
         let attached = self.attach_command(&workspace)?;
@@ -2175,6 +2178,14 @@ mod tests {
         assert_eq!(
             calls
                 .iter()
+                .filter(|call| *call == &format!("reset:{target_session}:/repos/target"))
+                .count(),
+            1,
+            "reset must use the backend's old-daemon recovery path: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
                 .filter(|call| *call == &format!("kill:{target_session}"))
                 .count(),
             1,
@@ -2893,6 +2904,11 @@ mod tests {
                 .unwrap()
                 .retain(|session| session != id);
             Ok(())
+        }
+
+        fn reset_workspace_sessions(&self, id: &SessionId, directory: &Path) -> Result<()> {
+            self.record(format!("reset:{id}:{}", directory.display()))?;
+            self.kill(id)
         }
 
         fn kill_workspace(&self, workspace_id: &str) -> Result<()> {

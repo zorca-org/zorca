@@ -401,6 +401,15 @@ pub trait SessionBackend: Send + Sync {
     /// state the caller asked for.
     fn kill(&self, id: &SessionId) -> Result<()>;
 
+    /// Kills a workspace's sessions before immediately recreating them.
+    ///
+    /// The directory lets remote backends clean up terminal process groups
+    /// left behind by an older daemon. Other backends need no recovery beyond
+    /// their ordinary kill.
+    fn reset_workspace_sessions(&self, id: &SessionId, _directory: &Path) -> Result<()> {
+        self.kill(id)
+    }
+
     /// How this backend expects status to be obtained. See [`StatusDelivery`].
     fn status_delivery(&self) -> StatusDelivery;
 

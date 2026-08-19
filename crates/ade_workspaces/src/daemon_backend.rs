@@ -919,6 +919,14 @@ impl SessionBackend for DaemonBackend {
         Ok(())
     }
 
+    fn reset_workspace_sessions(&self, id: &SessionId, directory: &Path) -> Result<()> {
+        self.kill(id)?;
+        if let Transport::Forwarded(link) = &self.endpoint.transport {
+            link.recover_stale_daemon_processes(directory)?;
+        }
+        Ok(())
+    }
+
     fn status_delivery(&self) -> StatusDelivery {
         StatusDelivery::Push
     }
@@ -1688,6 +1696,60 @@ fn pre_cut_kill_script(state_dir: &str, socket: &str) -> String {
     )
 }
 
+/// Reap terminal process groups an older daemon may have acknowledged before
+/// they actually exited. The exact remote worktree is the safety boundary.
+fn stale_daemon_recovery_script(directory: &Path) -> Result<String> {
+    use ade_session::deploy::shell_quote;
+
+    let directory = directory.to_str().with_context(|| {
+        format!(
+            "the remote worktree path is not UTF-8: {}",
+            directory.display()
+        )
+    })?;
+    Ok(format!(
+        concat!(
+            "root={root}\n",
+            "if ! root=$(cd \"$root\" 2>/dev/null && pwd -P); then\n",
+            "  echo \"cannot enter the worktree at $root\" >&2; exit 2\n",
+            "fi\n",
+            "if [ \"$root\" = / ]; then echo \"refusing to recover every terminal on the host\" >&2; exit 2; fi\n",
+            "[ -r /proc/$$/stat ] || exit 0\n",
+            "own_stat=$(cat /proc/$$/stat) || exit 2\n",
+            "set -- ${{own_stat##*) }}\n",
+            "own_group=$3\n",
+            "groups=\n",
+            "for process in /proc/[0-9]*; do\n",
+            "  cwd=$(readlink \"$process/cwd\" 2>/dev/null) || continue\n",
+            "  case \"$cwd\" in \"$root\"|\"$root\"/*) ;; *) continue;; esac\n",
+            "  stat=$(cat \"$process/stat\" 2>/dev/null) || continue\n",
+            "  set -- ${{stat##*) }}\n",
+            "  group=$3\n",
+            "  tty=$5\n",
+            "  case \"$group:$tty\" in *[!0-9:]*) continue;; 0:*|*:0) continue;; esac\n",
+            "  [ \"$group\" = \"$own_group\" ] && continue\n",
+            "  case \" $groups \" in *\" $group \"*) ;; *) groups=\"$groups $group\";; esac\n",
+            "done\n",
+            "[ -n \"$groups\" ] || exit 0\n",
+            "for group in $groups; do kill -HUP -\"$group\" 2>/dev/null || :; done\n",
+            "sleep 1\n",
+            "for group in $groups; do kill -KILL -\"$group\" 2>/dev/null || :; done\n",
+            "attempt=0\n",
+            "while [ \"$attempt\" -lt 200 ]; do\n",
+            "  alive=\n",
+            "  for group in $groups; do kill -0 -\"$group\" 2>/dev/null && alive=\"$alive $group\"; done\n",
+            "  [ -z \"$alive\" ] && exit 0\n",
+            "  groups=$alive\n",
+            "  attempt=$((attempt + 1))\n",
+            "  sleep 0.01\n",
+            "done\n",
+            "echo \"terminal process groups did not exit:$groups\" >&2\n",
+            "exit 1\n",
+        ),
+        root = shell_quote(directory),
+    ))
+}
+
 /// Park a blocking thread. `smol::Timer` is disallowed by the workspace lints.
 async fn sleep(duration: Duration) {
     smol::unblock(move || std::thread::sleep(duration)).await;
@@ -2367,6 +2429,34 @@ impl HostLink {
             "{}: the pre-cut daemon was terminated out of band for the forced upgrade",
             self.host.destination
         );
+        Ok(())
+    }
+
+    fn recover_stale_daemon_processes(&self, directory: &Path) -> Result<()> {
+        use ade_session::deploy::HostExec as _;
+
+        let output = self
+            .host
+            .run(&[
+                "sh".to_owned(),
+                "-c".to_owned(),
+                stale_daemon_recovery_script(directory)?,
+            ])
+            .with_context(|| {
+                format!(
+                    "checking {} for terminal processes left in {}",
+                    self.host.destination,
+                    directory.display()
+                )
+            })?;
+        if !output.success() {
+            bail!(
+                "recovering terminal processes in {} on {}: {}",
+                directory.display(),
+                self.host.destination,
+                output.stderr.trim(),
+            );
+        }
         Ok(())
     }
 
@@ -3801,9 +3891,10 @@ mod daemon_freshness_tests {
 
 #[cfg(test)]
 mod pre_cut_fallback_tests {
-    use super::{is_incompatible_daemon, pre_cut_kill_script};
+    use super::{is_incompatible_daemon, pre_cut_kill_script, stale_daemon_recovery_script};
     use ade_session::PRE_CUT_DIAGNOSIS;
     use anyhow::anyhow;
+    use std::path::Path;
 
     /// The diagnosis is produced as a context string ([`super::handshaken`]),
     /// so the detector has to find it anywhere in the chain — and must not
@@ -3833,6 +3924,28 @@ mod pre_cut_fallback_tests {
         assert!(script.contains("stop the daemon by hand"));
         assert!(script.contains("*ade-daemon*"));
         assert!(script.contains("rm -f \"$socket\""));
+    }
+
+    #[test]
+    fn stale_daemon_recovery_is_scoped_to_terminal_groups_in_the_worktree() {
+        let script = stale_daemon_recovery_script(Path::new("/home/user name/repo"))
+            .expect("the remote worktree path should produce a script");
+
+        assert!(script.contains("root='/home/user name/repo'"));
+        assert!(script.contains("\"$root\"|\"$root\"/*"));
+        assert!(script.contains("tty=$5"));
+        assert!(script.contains("kill -HUP -\"$group\""));
+        assert!(script.contains("kill -KILL -\"$group\""));
+        assert!(script.contains("refusing to recover every terminal on the host"));
+        assert!(
+            smol::block_on(
+                smol::process::Command::new("sh")
+                    .args(["-n", "-c", &script])
+                    .status()
+            )
+            .expect("sh should parse the recovery script")
+            .success()
+        );
     }
 }
 
