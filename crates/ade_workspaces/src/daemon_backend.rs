@@ -3913,10 +3913,9 @@ mod daemon_freshness_tests {
 
 #[cfg(test)]
 mod pre_cut_fallback_tests {
-    use super::{is_incompatible_daemon, pre_cut_kill_script, stale_daemon_recovery_script};
+    use super::{is_incompatible_daemon, pre_cut_kill_script};
     use ade_session::PRE_CUT_DIAGNOSIS;
     use anyhow::anyhow;
-    use std::path::Path;
 
     /// The diagnosis is produced as a context string ([`super::handshaken`]),
     /// so the detector has to find it anywhere in the chain — and must not
@@ -3949,9 +3948,11 @@ mod pre_cut_fallback_tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stale_daemon_recovery_is_scoped_to_terminal_groups_in_the_worktree() {
-        let script = stale_daemon_recovery_script(Path::new("/home/user name/repo"))
-            .expect("the remote worktree path should produce a script");
+        let script =
+            super::stale_daemon_recovery_script(std::path::Path::new("/home/user name/repo"))
+                .expect("the remote worktree path should produce a script");
 
         assert!(script.contains("root='/home/user name/repo'"));
         assert!(script.contains("\"$root\"|\"$root\"/*"));
