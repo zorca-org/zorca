@@ -906,14 +906,23 @@ impl Sidebar {
         if project.read(cx).is_via_collab() {
             return;
         }
+        let retry_workspace = workspace.downgrade();
 
         cx.subscribe_in(
             &project,
             window,
-            |this, project, event, _window, cx| match event {
-                ProjectEvent::WorktreeAdded(_)
-                | ProjectEvent::WorktreeRemoved(_)
-                | ProjectEvent::WorktreeOrderChanged => {
+            move |this, project, event, window, cx| match event {
+                ProjectEvent::WorktreeAdded(_) => {
+                    this.schedule_update_entries(false, cx);
+                    if let Some(retry_workspace) = retry_workspace.upgrade()
+                        && this.is_active_workspace(&retry_workspace, cx)
+                    {
+                        retry_workspace.update(cx, |workspace, cx| {
+                            ade_workspaces::open_connection_workspace(workspace, window, cx);
+                        });
+                    }
+                }
+                ProjectEvent::WorktreeRemoved(_) | ProjectEvent::WorktreeOrderChanged => {
                     this.schedule_update_entries(false, cx);
                 }
                 ProjectEvent::WorktreePathsChanged { old_worktree_paths } => {
