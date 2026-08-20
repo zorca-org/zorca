@@ -186,6 +186,13 @@ pub async fn ensure(config: ProxyConfig) -> Result<String> {
     if let Some(ready) = ack.upgrade_ready {
         line.push_str(&format!(" upgrade_ready={ready}"));
     }
+    // The window this daemon serves, before any handshake has been attempted:
+    // a client whose own window is entirely below it must refuse to deploy
+    // over these bytes rather than downgrade a daemon it cannot talk to.
+    line.push_str(&format!(
+        " generations={}..={}",
+        ack.min_generation, ack.max_generation
+    ));
     Ok(line)
 }
 

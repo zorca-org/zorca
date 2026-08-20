@@ -5,11 +5,11 @@
 //! an owner of it — **when a client goes away the sessions it created keep
 //! running**. That is the whole reason the daemon exists.
 //!
-//! Each connection is two tasks over one socket: a request loop that reads
+//! Each connection is two tasks over one transport: a request loop that reads
 //! frames, and a *writer* task that owns the only writing half. Everything the
 //! daemon sends — replies, replays, live output and status events — is queued
-//! on one unbounded channel per connection and written
-//! by that task alone. Nothing else touches the socket, so frames can never
+//! on one [bounded](OUTBOUND_QUEUE_BYTES) channel per connection and written
+//! by that task alone. Nothing else touches the transport, so frames can never
 //! interleave, and the pty drain threads (which are plain std threads, see
 //! [`crate::sessions`]) push output without ever entering the executor.
 //!
@@ -24,19 +24,22 @@ use std::time::{Duration, Instant};
 use ade_session::client::Connection;
 use ade_session::framing::{ReadFrameError, bounded, bounded_debug, rejection_frame};
 use ade_session::proto::{
-    Frame, HelloAck, MAX_GENERATION, MIN_GENERATION, SessionId, error_code, select_generation,
-    validate_capabilities,
+    Frame, HelloAck, LayoutDoc, MAX_GENERATION, MIN_GENERATION, SessionId, error_code,
+    select_generation, validate_capabilities,
 };
-use anyhow::{Context as _, Result, bail};
-use smol::channel::Sender;
-use smol::net::unix::{UnixListener, UnixStream};
+#[cfg(unix)]
+use anyhow::bail;
+use anyhow::{Context as _, Result};
+use smol::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
+use smol::net::unix::UnixListener;
 
 use crate::DAEMON_VERSION;
 use crate::sessions::{
-    CreateRequest, DEFAULT_COLS, DEFAULT_ROWS, SessionTable, StatusConfig, SubscriberId,
-    TableError, WorkspaceRequest,
+    CreateRequest, Outbound, SessionTable, StatusConfig, SubscriberId, TableError, WorkspaceRequest,
 };
-use crate::state::{StateStore, create_private_dir};
+use crate::state::StateStore;
+use crate::state::create_private_dir;
 
 /// How long a daemon that serves nobody and holds only tombstones waits
 /// before exiting on its own.
@@ -46,6 +49,27 @@ use crate::state::{StateStore, create_private_dir};
 /// does not carry an idle daemon for weeks — and, with binary identity in the
 /// handshake, that an idle daemon stops pinning a stale binary.
 const IDLE_EXIT_AFTER: Duration = Duration::from_secs(15 * 60);
+
+/// How many *bytes* one connection may have queued but unwritten before the
+/// daemon calls it a stalled consumer and drops it.
+///
+/// Bounded because the pty drain thread filling it must never block
+/// ([`crate::sessions`]); unbounded, a stalled client would turn its
+/// session's output into unlimited daemon memory. 2 MiB, matching
+/// [`DEFAULT_SCROLLBACK_BYTES`](crate::sessions::DEFAULT_SCROLLBACK_BYTES) —
+/// past that a reader is caught up only by a re-attach's repaint, not the
+/// stream. **Bytes, not frames**: see [`Outbound`] / [`Outbound::push`] for
+/// why, and for the drop-on-full rule.
+pub const OUTBOUND_QUEUE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The previous generation in the two-generation window
+/// ([`MIN_GENERATION`]), whose dialect this daemon still serves on connections
+/// that negotiated it.
+pub(crate) const LEGACY_GENERATION: u32 = 2;
+
+/// The pty size generation 2 gave a `create_workspace` that named none.
+const LEGACY_DEFAULT_COLS: u16 = 80;
+const LEGACY_DEFAULT_ROWS: u16 = 24;
 
 /// Where the daemon listens, where it keeps its session list, and how it times
 /// status derivation.
@@ -87,6 +111,7 @@ impl ServerConfig {
     /// `$XDG_RUNTIME_DIR/ade/daemon.sock`, falling back to
     /// `~/.ade/daemon.sock` on hosts without a runtime dir (macOS, most ssh
     /// sessions).
+    #[cfg(unix)]
     pub fn default_socket_path() -> PathBuf {
         if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR")
             && !runtime_dir.is_empty()
@@ -102,17 +127,19 @@ impl ServerConfig {
     }
 }
 
+#[cfg(unix)]
 impl Default for ServerConfig {
     fn default() -> Self {
         Self::new(Self::default_socket_path(), Self::default_state_dir())
     }
 }
 
-fn ade_home() -> PathBuf {
-    match std::env::var_os("HOME") {
-        Some(home) if !home.is_empty() => PathBuf::from(home).join(".ade"),
-        _ => std::env::temp_dir().join("ade"),
+/// `~/.ade`, where `~` is `$HOME`.
+pub(crate) fn ade_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        return PathBuf::from(home).join(".ade");
     }
+    std::env::temp_dir().join("ade")
 }
 
 /// What a connection can say and do on behalf of the daemon as a whole: the
@@ -128,15 +155,19 @@ fn ade_home() -> PathBuf {
 /// ([`SessionTable::only_tombstones`]) — an idle shell is not a pointless
 /// daemon. An accepted [`Frame::Shutdown`] uses the looser
 /// [`SessionTable::expendable`], so a manual upgrade may take idle shells with
-/// it: their rows come back under the next daemon as lost, and the client
-/// recreates the workspace. A [`Frame::Shutdown`] with `force` set checks
-/// nothing at all — a human clicked, and the same recreate pass answers
-/// whatever went with the process.
+/// it: the workspace records are persisted and come back whole, their shells as
+/// lost rows. A [`Frame::Shutdown`] with `force` set checks nothing at all — a
+/// human clicked, and whatever went with the process comes back the same way.
 struct DaemonControl {
     /// Hex sha256 of the executable this daemon started from, reported in
     /// [`HelloAck::binary_hash`]. `None` if the executable could not be read
     /// back, which a client must treat as "unknown, leave it alone".
     binary_hash: Option<String>,
+    /// Which daemon this is, across restarts — see
+    /// [`StateStore::instance_id`] and [`HelloAck::instance_id`]. Read once at
+    /// startup: the file behind it may be deleted while the daemon runs, and a
+    /// client that has already been told an identity must not be told another.
+    instance_id: String,
     socket_path: PathBuf,
     state_dir: PathBuf,
     fired: AtomicBool,
@@ -178,7 +209,7 @@ impl DaemonControl {
         if self.fired.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Err(err) = std::fs::remove_file(&self.socket_path) {
+        if let Err(err) = unlink_endpoint(&self.socket_path) {
             log::warn!(
                 "could not unlink {} on exit: {err}",
                 self.socket_path.display()
@@ -187,6 +218,12 @@ impl DaemonControl {
         StateStore::new(&self.state_dir).remove_pid();
         (self.on_exit)();
     }
+}
+
+/// Take the endpoint out of the namespace so nothing new can connect to or
+/// forward to it.
+fn unlink_endpoint(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 struct StateRequestGuard<'a> {
@@ -227,42 +264,50 @@ fn hash_current_exe() -> Option<String> {
     }
 }
 
+/// The bound listener.
+type Listener = UnixListener;
+
+/// Bind the endpoint, refusing to start beside a daemon already serving it.
+///
+/// A leftover unix socket is removed only after a connect proves nobody
+/// answers — a successful connect means a second daemon would strand the first.
+fn bind_listener(socket_path: &Path) -> Result<Listener> {
+    if let Some(parent) = socket_path.parent() {
+        create_private_dir(parent)?;
+    }
+    if socket_path.exists() {
+        match std::os::unix::net::UnixStream::connect(socket_path) {
+            Ok(_) => bail!(
+                "daemon already running on {} — refusing to start a second one",
+                socket_path.display()
+            ),
+            Err(err) => {
+                log::info!("removing stale socket {} ({err})", socket_path.display());
+                std::fs::remove_file(socket_path)
+                    .with_context(|| format!("removing {}", socket_path.display()))?;
+            }
+        }
+    }
+    UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))
+}
+
 /// A bound listener plus the session table it serves.
 pub struct Server {
-    listener: UnixListener,
+    listener: Listener,
     socket_path: PathBuf,
     state_dir: PathBuf,
     sessions: Arc<SessionTable>,
     binary_hash: Option<String>,
+    instance_id: String,
     idle_exit_after: Option<Duration>,
 }
 
 impl Server {
-    /// Bind the socket and load previous session metadata.
-    ///
-    /// A leftover socket file is removed only after proving nobody answers on
-    /// it: if a connect succeeds there *is* a daemon, and starting a second one
-    /// would strand the first one's sessions.
+    /// Bind the endpoint (see [`bind_listener`]) and load previous session
+    /// metadata.
     pub fn bind(config: ServerConfig) -> Result<Self> {
         let socket_path = config.socket_path.clone();
-        if let Some(parent) = socket_path.parent() {
-            create_private_dir(parent)?;
-        }
-        if socket_path.exists() {
-            match std::os::unix::net::UnixStream::connect(&socket_path) {
-                Ok(_) => bail!(
-                    "daemon already running on {} — refusing to start a second one",
-                    socket_path.display()
-                ),
-                Err(err) => {
-                    log::info!("removing stale socket {} ({err})", socket_path.display());
-                    std::fs::remove_file(&socket_path)
-                        .with_context(|| format!("removing {}", socket_path.display()))?;
-                }
-            }
-        }
-        let listener = UnixListener::bind(&socket_path)
-            .with_context(|| format!("binding {}", socket_path.display()))?;
+        let listener = bind_listener(&socket_path)?;
         // A daemon started by the proxy's start-if-absent has no terminal and
         // no parent that outlives it, so the pid file is the only way anything
         // finds it afterwards. Failing to write it is not a reason to refuse to
@@ -279,6 +324,7 @@ impl Server {
             state_dir,
             sessions,
             binary_hash: hash_current_exe(),
+            instance_id: state.instance_id(),
             idle_exit_after: config.idle_exit_after,
         })
     }
@@ -297,6 +343,7 @@ impl Server {
         log::info!("listening on {}", self.socket_path.display());
         let control = Arc::new(DaemonControl {
             binary_hash: self.binary_hash.clone(),
+            instance_id: self.instance_id.clone(),
             socket_path: self.socket_path.clone(),
             state_dir: self.state_dir.clone(),
             fired: AtomicBool::new(false),
@@ -325,6 +372,7 @@ impl Server {
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let control = Arc::new(DaemonControl {
             binary_hash: server.binary_hash.clone(),
+            instance_id: server.instance_id.clone(),
             socket_path: socket_path.clone(),
             state_dir: state_dir.clone(),
             fired: AtomicBool::new(false),
@@ -338,7 +386,7 @@ impl Server {
         spawn_idle_watcher(sessions.clone(), control.clone(), server.idle_exit_after);
         let task = smol::spawn(async move {
             if let Err(err) = accept_loop(server.listener, server.sessions, control).await {
-                log::error!("server stopped: {err:#}");
+                log::debug!("server stopped: {err:#}");
             }
         });
         Ok(RunningServer {
@@ -352,8 +400,11 @@ impl Server {
 }
 
 /// Accept forever. A failed accept is logged, not fatal.
+///
+/// The two halves handed to [`serve_connection`] are two clones of the one
+/// socket — the reader half and the single writer, same as always.
 async fn accept_loop(
-    listener: UnixListener,
+    listener: Listener,
     sessions: Arc<SessionTable>,
     control: Arc<DaemonControl>,
 ) -> Result<()> {
@@ -363,7 +414,9 @@ async fn accept_loop(
                 let sessions = sessions.clone();
                 let control = control.clone();
                 smol::spawn(async move {
-                    if let Err(err) = serve_connection(stream, sessions, control).await {
+                    if let Err(err) =
+                        serve_connection(stream.clone(), stream, sessions, control).await
+                    {
                         log::debug!("connection ended: {err:#}");
                     }
                 })
@@ -389,6 +442,10 @@ fn spawn_idle_watcher(
 ) {
     let Some(after) = after else { return };
     smol::spawn(async move {
+        // A table that has not rehydrated yet is all tombstones — the rows of
+        // the sessions it is about to take back. Exiting over that would kill
+        // the daemon for holding nothing, seconds before it holds everything.
+        sessions.ready().await;
         let tick = (after / 4).clamp(Duration::from_millis(10), Duration::from_secs(30));
         let mut idle_since: Option<Instant> = None;
         loop {
@@ -423,7 +480,7 @@ fn spawn_idle_watcher(
 }
 
 /// Park a blocking thread. `smol::Timer` is disallowed by the workspace lints.
-async fn sleep(duration: Duration) {
+pub(crate) async fn sleep(duration: Duration) {
     smol::unblock(move || std::thread::sleep(duration)).await;
 }
 
@@ -461,7 +518,7 @@ impl RunningServer {
 
 impl Drop for RunningServer {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
+        let _ = unlink_endpoint(&self.socket_path);
         StateStore::new(&self.state_dir).remove_pid();
     }
 }
@@ -521,6 +578,7 @@ fn touches_state(frame: &Frame) -> bool {
             | Frame::Detach { .. }
             | Frame::Write { .. }
             | Frame::Resize { .. }
+            | Frame::FocusSession { .. }
             | Frame::Kill { .. }
             | Frame::CreateWorkspace { .. }
             | Frame::UpdateLayout { .. }
@@ -532,29 +590,46 @@ fn touches_state(frame: &Frame) -> bool {
 /// Handshake, then serve requests until the peer goes away — or asks the
 /// daemon to.
 ///
-/// The handshake is written directly because it is strictly sequential and
-/// happens before the writer task exists; from then on every outbound frame
-/// goes through `outbound`.
-async fn serve_connection(
-    stream: UnixStream,
+/// `reader` and `writer` are the two halves of one connection, owned
+/// separately because the writer is handed to a task of its own — see the
+/// module doc for why that, not a cloneable duplex stream, is the seam. Only
+/// one `Connection` is ever written to at a time: it writes the handshake,
+/// then moves into the writer task, so no two writers can interleave a length
+/// prefix with somebody else's payload.
+async fn serve_connection<R, W>(
+    reader: R,
+    writer: W,
     sessions: Arc<SessionTable>,
     control: Arc<DaemonControl>,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     sessions.connection_opened();
     let mut guard = ConnectionGuard::new(sessions.clone());
     if control.shutting_down.load(Ordering::SeqCst) {
         return Ok(());
     }
 
-    let mut reader = Connection::new(stream.clone());
-    if !handshake(&mut reader, &sessions, &control).await? {
+    let mut reader = Connection::new(reader);
+    let mut writer = Connection::new(writer);
+    // Held here for the connection's life and passed to every handler: control,
+    // subscription and attach connections negotiate independently and may sit
+    // at different generations at the same moment, so this can never be daemon
+    // state (`docs/ade/protocol-compatibility.md` §3.3).
+    let Some(generation) = handshake(&mut reader, &mut writer, &sessions, &control).await? else {
         return Ok(());
-    }
+    };
 
-    let (outbound, queued) = smol::channel::unbounded::<Frame>();
+    // Bounded: see [`OUTBOUND_QUEUE_BYTES`]. A producer that finds it full
+    // closes it and drops its subscription rather than waiting — the drain
+    // threads must never block on a client — and a closed queue ends this
+    // writer task and then this connection, because the peer has stopped
+    // reading the stream it asked for.
+    let (outbound, queued) = Outbound::new(OUTBOUND_QUEUE_BYTES);
     let writer_task = smol::spawn(async move {
-        let mut writer = Connection::new(stream);
-        while let Ok(frame) = queued.recv().await {
+        while let Some(frame) = queued.recv().await {
             if let Err(err) = writer.send(&frame).await {
                 log::debug!("connection writer stopped: {err:#}");
                 break;
@@ -589,7 +664,7 @@ async fn serve_connection(
                 // session named, so it is logged and dropped (§2).
                 match rejection_frame(&err) {
                     Some(reply) => {
-                        if outbound.send(reply).await.is_err() {
+                        if !outbound.push(reply) {
                             break;
                         }
                         owes_a_frame = true;
@@ -604,10 +679,18 @@ async fn serve_connection(
                 // A peer that cannot frame an envelope is pre-cut or broken —
                 // the spec permits closing here, and closing is what makes the
                 // client-side diagnosis in §6.1 possible.
-                log::debug!("closing the connection after a malformed frame: {err}");
+                log::warn!("closing the connection after a malformed frame: {err}");
                 break;
             }
         };
+        // Past the handshake, every frame is about the table — a request, a
+        // subscription, or the shutdown decision, which is itself a question
+        // about what the table holds. So this is the one place the rehydration
+        // gate is waited on, and the handshake above deliberately is not: a
+        // client connects and is answered at once, and only then waits for
+        // whatever the table is still rehydrating. Free here; see
+        // [`SessionTable::ready`].
+        sessions.ready().await;
         if let Frame::Shutdown { force, request_id } = frame {
             // One condition, and it is about the *table*, not about who is
             // connected: nothing held that an upgrade may not sacrifice
@@ -616,15 +699,15 @@ async fn serve_connection(
             // an accepted shutdown may take idle shells with it. The process
             // exit closes their pty masters, the children die, and the rows
             // this daemon persisted come back under the next one as lost,
-            // which the client's reconcile pass already answers by recreating
-            // the workspace. A shell at a prompt is worth that; anything with
-            // work in it, or an exited row's last screen, is not.
+            // inside the workspaces the ledger restores whole. A shell at a
+            // prompt is worth that; anything with work in it, or an exited
+            // row's last screen, is not.
             //
             // `force` skips even that: it is set only when a human clicked
             // "upgrade host daemon", and the click is the consent. The
-            // sessions die with the process the same way, and the same
-            // recreate pass answers them — the operator traded them for the
-            // upgrade knowingly, which is more than the table can know.
+            // sessions die with the process the same way — the operator traded
+            // them for the upgrade knowingly, which is more than the table can
+            // know.
             //
             // Connections are deliberately *not* consulted either way.
             // Shutdown is reached by a human asking for it from an app that
@@ -648,7 +731,7 @@ async fn serve_connection(
                         .to_owned(),
                     request_id,
                 };
-                if outbound.send(reply).await.is_err() {
+                if !outbound.push(reply) {
                     break;
                 }
             } else {
@@ -661,7 +744,7 @@ async fn serve_connection(
                 } else {
                     log::info!("shutdown accepted: nothing worth keeping is held; exiting");
                 }
-                let _ = outbound.send(Frame::ShutdownAck { request_id }).await;
+                outbound.push(Frame::ShutdownAck { request_id });
                 exiting = true;
                 break;
             }
@@ -672,7 +755,9 @@ async fn serve_connection(
         }
         let reply = if touches_state(&frame) {
             match control.admit_state_request() {
-                Some(_request) => handle_frame(frame, &sessions, subscriber, &outbound),
+                Some(_request) => {
+                    handle_frame(frame, &sessions, subscriber, &outbound, generation).await
+                }
                 None => Some(Frame::Error {
                     session_id: frame.session_id().cloned(),
                     workspace_id: frame.workspace_id().map(str::to_owned),
@@ -682,10 +767,10 @@ async fn serve_connection(
                 }),
             }
         } else {
-            handle_frame(frame, &sessions, subscriber, &outbound)
+            handle_frame(frame, &sessions, subscriber, &outbound, generation).await
         };
         if let Some(reply) = reply
-            && outbound.send(reply).await.is_err()
+            && !outbound.push(reply)
         {
             break;
         }
@@ -693,7 +778,7 @@ async fn serve_connection(
 
     // Losing the connection detaches everything it was watching. It kills
     // nothing: the ptys, the children and the scrollback all outlive it.
-    sessions.detach_all(subscriber);
+    sessions.detach_all(subscriber).await;
     // Closing the queue ends the writer task; anything still queued is for a
     // client that is no longer there — unless the daemon is exiting, in which
     // case the queue holds the ShutdownAck, or the daemon closed the connection
@@ -714,22 +799,28 @@ async fn serve_connection(
 /// The negotiation (`docs/ade/protocol-compatibility.md` §3): the daemon
 /// **selects** the generation, the client verifies it.
 ///
-/// `Ok(false)` means the handshake was rejected and the connection is done.
-/// Everything that ends in `Ok(false)` has already said why on the wire, except
-/// the undecodable cases that have nobody to answer.
+/// `Ok(None)` means the handshake was rejected and the connection is done.
+/// Everything that ends in `Ok(None)` has already said why on the wire, except
+/// the undecodable cases that have nobody to answer. `Ok(Some(g))` is the
+/// generation this connection — and only this connection — will be served at.
 ///
-/// Writing directly on the connection is deliberate and stays: the writer task
-/// does not exist yet, and the handshake is strictly one frame in, one frame
-/// out.
-async fn handshake(
-    connection: &mut Connection<UnixStream>,
+/// Writing directly on the writing half is deliberate and stays: the writer
+/// task does not exist yet, and the handshake is strictly one frame in, one
+/// frame out.
+async fn handshake<R, W>(
+    connection: &mut Connection<R>,
+    writer: &mut Connection<W>,
     sessions: &SessionTable,
     control: &DaemonControl,
-) -> Result<bool> {
+) -> Result<Option<u32>>
+where
+    R: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin,
+{
     let hello = match connection.recv().await {
         Ok(Frame::Hello(hello)) => hello,
         Ok(other) => {
-            connection
+            writer
                 .send(&Frame::Error {
                     session_id: None,
                     workspace_id: None,
@@ -744,7 +835,7 @@ async fn handshake(
                     request_id: other.request_id(),
                 })
                 .await?;
-            return Ok(false);
+            return Ok(None);
         }
         // Nothing can be read after a transport failure; the connection is
         // over and there is nothing to write an answer to.
@@ -756,9 +847,9 @@ async fn handshake(
         Err(err) => {
             log::debug!("rejecting a connection whose hello did not decode: {err}");
             if let Some(reply) = rejection_frame(&err) {
-                connection.send(&reply).await?;
+                writer.send(&reply).await?;
             }
-            return Ok(false);
+            return Ok(None);
         }
     };
 
@@ -771,7 +862,7 @@ async fn handshake(
         MIN_GENERATION,
         MAX_GENERATION,
     ) else {
-        connection
+        writer
             .send(&Frame::Error {
                 session_id: None,
                 workspace_id: None,
@@ -786,13 +877,13 @@ async fn handshake(
                 request_id: hello.request_id,
             })
             .await?;
-        return Ok(false);
+        return Ok(None);
     };
 
     // §3.2: the *bounds* are fatal to the handshake; unknown identifiers and
     // duplicates are not errors at all and are handled by the intersection.
     if let Err(reason) = validate_capabilities(&hello.capabilities) {
-        connection
+        writer
             .send(&Frame::Error {
                 session_id: None,
                 workspace_id: None,
@@ -801,15 +892,13 @@ async fn handshake(
                 request_id: hello.request_id,
             })
             .await?;
-        return Ok(false);
+        return Ok(None);
     }
 
-    // Where the negotiated generation and the effective capability set would be
-    // stored per connection (§3.3). Neither is kept today because neither can
-    // vary: `generation` is always `MAX_GENERATION` while the range is a single
-    // value, and the intersection with an empty daemon list is always empty. A
-    // second generation, or the first capability, is what makes this state real.
-    connection
+    // The selected generation goes back to `serve_connection`, which holds it
+    // for this connection alone (§3.3). The effective capability set is still
+    // not kept: the intersection with an empty daemon list is always empty.
+    writer
         .send(&Frame::HelloAck(HelloAck {
             daemon_version: DAEMON_VERSION.to_owned(),
             // Legacy informational, equal to the selected generation, and never
@@ -819,24 +908,124 @@ async fn handshake(
             min_generation: MIN_GENERATION,
             max_generation: MAX_GENERATION,
             generation,
-            // The daemon advertises nothing at generation 2. Capability
+            // The daemon advertises nothing at either generation. Capability
             // identifiers land with the feature that needs them, in the same
             // release that defines them (§5) — an empty list here is not a
             // placeholder, it is the honest answer.
             capabilities: Vec::new(),
             // The ledger is read-only for this daemon: it found one written by
-            // a newer schema. Mutations still apply and still publish; they are
-            // simply not recorded (§8.5). Only the flag is carried here — the
-            // per-ack `persisted` field is a separate change.
-            degraded: sessions.state().is_degraded(),
+            // a newer schema, or one it could not read at all. Mutations still
+            // apply and still publish; they are simply not recorded (§8.5).
+            // Only the flag is carried here — the per-ack `persisted` field is
+            // a separate change.
+            degraded: sessions.state().read_only(),
             binary_hash: control.binary_hash.clone(),
             // A snapshot, not a promise — the client re-proves it by sending
             // Shutdown, which re-checks under the same table.
             upgrade_ready: Some(sessions.expendable()),
+            instance_id: Some(control.instance_id.clone()),
             request_id: hello.request_id,
         }))
         .await?;
-    Ok(true)
+    Ok(Some(generation))
+}
+
+/// The first session a generation-2 `create_workspace` spawns: the host's
+/// login shell (the empty command), in the workspace root, at the size the
+/// request named or 80x24.
+fn combined_create_request(
+    workspace_id: String,
+    root: String,
+    label: String,
+    env: Vec<(String, String)>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) -> CreateRequest {
+    CreateRequest {
+        workspace_id,
+        cwd: root,
+        command: String::new(),
+        env,
+        cols: cols.unwrap_or(LEGACY_DEFAULT_COLS),
+        rows: rows.unwrap_or(LEGACY_DEFAULT_ROWS),
+        agent_kind: "shell".to_owned(),
+        instance_label: label,
+        scrollback_bytes: None,
+    }
+}
+
+/// Generation 2's `create_workspace`: the record, its first login shell and the
+/// one-leaf layout holding that shell's tab, in one round trip.
+///
+/// Composed from the entry points generation 3 uses rather than reinstated
+/// beside them, so every hardening since the cut — persist-before-ack, layout
+/// validation, refusals — still applies to an old client. A create that
+/// cannot be completed takes the record with it: a workspace whose first
+/// session never started is not a workspace, which is what the old daemon
+/// meant too.
+#[allow(clippy::too_many_arguments, reason = "the gen-2 request's own fields")]
+async fn combined_create(
+    sessions: &Arc<SessionTable>,
+    subscriber: SubscriberId,
+    root: String,
+    name: Option<String>,
+    env: Vec<(String, String)>,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    persisted: bool,
+    request_id: Option<u64>,
+) -> Frame {
+    let refusal = |error: TableError, workspace_id: Option<String>| Frame::Error {
+        session_id: None,
+        workspace_id,
+        code: error.code.to_owned(),
+        message: error.message,
+        request_id,
+    };
+    let workspace = match sessions.create_workspace(WorkspaceRequest {
+        root: root.clone(),
+        name,
+        id: None,
+    }) {
+        Ok(workspace) => workspace,
+        // No `workspace_id`: a creation that failed has no id to name.
+        Err(err) => return refusal(err, None),
+    };
+    let session = match sessions
+        .create(combined_create_request(
+            workspace.id.clone(),
+            root,
+            workspace.name.clone(),
+            env,
+            cols,
+            rows,
+        ))
+        .await
+    {
+        Ok(session) => session,
+        Err(err) => {
+            let _ = sessions.kill_workspace(&workspace.id).await;
+            return refusal(err, Some(workspace.id));
+        }
+    };
+    if let Err(err) = sessions.update_layout(
+        &workspace.id,
+        LayoutDoc::single_terminal(session.id.clone()),
+        workspace.layout_rev + 1,
+        Some(subscriber),
+    ) {
+        let _ = sessions.kill_workspace(&workspace.id).await;
+        return refusal(err, Some(workspace.id));
+    }
+    match sessions.open_workspace(&workspace.id) {
+        Ok((workspace, sessions)) => Frame::Workspace {
+            workspace,
+            sessions,
+            persisted,
+            request_id,
+        },
+        Err(err) => refusal(err, Some(workspace.id)),
+    }
 }
 
 /// One request in, at most one reply out.
@@ -856,11 +1045,17 @@ async fn handshake(
 ///   daemon with no sessions therefore answers with nothing at all, which is
 ///   the honest snapshot of an empty table; there is no `SubscribeAck` to
 ///   wait for.
-fn handle_frame(
+/// `generation` is this connection's alone (see [`serve_connection`]) and picks
+/// the dialect: at 2 `create_workspace` is the combined create, `create_session`
+/// auto-creates its workspace, `resize` is last-request-wins, `attach` has no
+/// view, and `focus_session` does not exist. Everything else — and every
+/// hardening since the cut — is the same at both.
+async fn handle_frame(
     frame: Frame,
     sessions: &Arc<SessionTable>,
     subscriber: SubscriberId,
-    outbound: &Sender<Frame>,
+    outbound: &Outbound,
+    generation: u32,
 ) -> Option<Frame> {
     /// A refusal from the table, as the frame that carries it back.
     ///
@@ -884,6 +1079,10 @@ fn handle_frame(
     }
 
     let request_id = frame.request_id();
+    // §8.5: a degraded daemon serves normally and says so on every ack it
+    // sends, because the durability §8.1 promises is the one thing it cannot
+    // provide. Read once, and it cannot change: nothing clears degraded mode.
+    let persisted = sessions.persisted();
     match frame {
         Frame::CreateSession {
             workspace_id,
@@ -897,8 +1096,58 @@ fn handle_frame(
             scrollback_bytes,
             request_id,
         } => {
+            let named = workspace_id.clone();
+            // Generation 2 never refused a session for want of a workspace: it
+            // made one, under the id the client named or a fresh one when it
+            // named none. Both forms, because both were reachable.
+            //
+            // Record, session and one-leaf layout are **one semantic outcome**:
+            // what cannot be completed is compensated and refused, never acked
+            // as a bare `Created` over a workspace that has no layout — see
+            // `compensate` below.
+            let auto_created = if generation == LEGACY_GENERATION
+                && sessions.open_workspace(&workspace_id).is_err()
+            {
+                match sessions.ensure_workspace(WorkspaceRequest {
+                    root: cwd.clone(),
+                    name: (!instance_label.is_empty()).then(|| instance_label.clone()),
+                    id: (!workspace_id.is_empty()).then(|| workspace_id.clone()),
+                }) {
+                    Ok((workspace, created_here)) => Some((workspace.id, created_here)),
+                    Err(err) => return Some(refusal(err, None, Some(named), request_id)),
+                }
+            } else {
+                None
+            };
+            let workspace_id = auto_created
+                .as_ref()
+                .map_or(workspace_id, |(id, _)| id.clone());
+            /// Undo what this request made and nothing else: the workspace only
+            /// if this request created it *and* it is still empty — a
+            /// concurrent create may have adopted it, and its sessions are not
+            /// this refusal's to take. A cleanup that fails is logged; the
+            /// answer stays the original refusal, which is what went wrong.
+            async fn compensate(
+                sessions: &Arc<SessionTable>,
+                created: Option<&(String, bool)>,
+                session: Option<&SessionId>,
+            ) {
+                if let Some(session) = session
+                    && let Err(err) = sessions.kill(session).await
+                {
+                    log::warn!("could not take back session {session}: {}", err.message);
+                }
+                if let Some((workspace_id, true)) = created
+                    && let Err(err) = sessions.remove_empty_workspace(workspace_id).await
+                {
+                    log::warn!(
+                        "could not take back auto-created workspace {workspace_id}: {}",
+                        err.message
+                    );
+                }
+            }
             let request = CreateRequest {
-                workspace_id,
+                workspace_id: workspace_id.clone(),
                 cwd,
                 command,
                 env,
@@ -908,12 +1157,25 @@ fn handle_frame(
                 instance_label,
                 scrollback_bytes,
             };
-            Some(match sessions.create(request) {
-                Ok(session) => Frame::Created {
-                    session,
-                    request_id,
-                },
-                Err(err) => refusal(err, None, None, request_id),
+            let session = match sessions.create(request).await {
+                Ok(session) => session,
+                // A create is refused over its workspace as often as not, so
+                // the error names it.
+                Err(err) => {
+                    compensate(sessions, auto_created.as_ref(), None).await;
+                    return Some(refusal(err, None, Some(named), request_id));
+                }
+            };
+            if auto_created.is_some()
+                && let Err(err) = sessions.install_legacy_layout(&workspace_id, &session.id)
+            {
+                compensate(sessions, auto_created.as_ref(), Some(&session.id)).await;
+                return Some(refusal(err, None, Some(named), request_id));
+            }
+            Some(Frame::Created {
+                session,
+                persisted,
+                request_id,
             })
         }
         Frame::ListSessions { request_id } => Some(Frame::SessionList {
@@ -928,17 +1190,26 @@ fn handle_frame(
             rows,
             request_id,
         } => {
+            if generation == LEGACY_GENERATION {
+                return Some(
+                    combined_create(
+                        sessions, subscriber, root, name, env, cols, rows, persisted, request_id,
+                    )
+                    .await,
+                );
+            }
+            // Generation 3 creates the record alone and the legacy request
+            // fields mean nothing here — a gen-3 client never sends them.
             let request = WorkspaceRequest {
                 root,
                 name,
-                env,
-                cols: cols.unwrap_or(DEFAULT_COLS),
-                rows: rows.unwrap_or(DEFAULT_ROWS),
+                id: None,
             };
             Some(match sessions.create_workspace(request) {
-                Ok((workspace, session)) => Frame::Workspace {
+                Ok(workspace) => Frame::Workspace {
                     workspace,
-                    sessions: vec![session],
+                    sessions: Vec::new(),
+                    persisted,
                     request_id,
                 },
                 // No `workspace_id`: a creation that failed has no id to name.
@@ -952,6 +1223,7 @@ fn handle_frame(
             Ok((workspace, sessions)) => Frame::Workspace {
                 workspace,
                 sessions,
+                persisted,
                 request_id,
             },
             Err(err) => refusal(err, None, Some(workspace_id), request_id),
@@ -966,11 +1238,12 @@ fn handle_frame(
             rev,
             request_id,
         } => Some(
-            match sessions.update_layout(&workspace_id, layout.clone(), rev, subscriber) {
+            match sessions.update_layout(&workspace_id, layout.clone(), rev, Some(subscriber)) {
                 Ok(()) => Frame::LayoutChanged {
                     workspace_id,
                     layout,
                     rev,
+                    persisted,
                     request_id,
                 },
                 Err(err) => refusal(err, None, Some(workspace_id), request_id),
@@ -984,6 +1257,7 @@ fn handle_frame(
             Ok((workspace, sessions)) => Frame::Workspace {
                 workspace,
                 sessions,
+                persisted,
                 request_id,
             },
             Err(err) => refusal(err, None, Some(workspace_id), request_id),
@@ -991,9 +1265,10 @@ fn handle_frame(
         Frame::KillWorkspace {
             workspace_id,
             request_id,
-        } => Some(match sessions.kill_workspace(&workspace_id) {
+        } => Some(match sessions.kill_workspace(&workspace_id).await {
             Ok(()) => Frame::WorkspaceRemoved {
                 workspace_id,
+                persisted,
                 request_id,
             },
             Err(err) => refusal(err, None, Some(workspace_id), request_id),
@@ -1001,26 +1276,41 @@ fn handle_frame(
         Frame::Kill {
             session_id,
             request_id,
-        } => Some(match sessions.kill(&session_id) {
+        } => Some(match sessions.kill(&session_id).await {
             Ok(()) => Frame::Removed { session_id },
             Err(err) => refusal(err, Some(session_id), None, request_id),
         }),
         Frame::Attach {
             session_id,
+            view_id,
             request_id,
-        } => match sessions.attach(&session_id, subscriber, outbound) {
+        } => match sessions
+            .attach(
+                &session_id,
+                subscriber,
+                outbound,
+                // Generation 2 has no views: a `view_id` from a peer at that
+                // generation is read as absent however it got here, or a buggy
+                // sender would become a focus owner the dialect has no focus
+                // for.
+                view_id
+                    .as_deref()
+                    .filter(|_| generation > LEGACY_GENERATION),
+            )
+            .await
+        {
             Ok(()) => None,
             Err(err) => Some(refusal(err, Some(session_id), None, request_id)),
         },
         Frame::Detach { session_id, .. } => {
-            sessions.detach(&session_id, subscriber);
+            sessions.detach(&session_id, subscriber).await;
             None
         }
-        // Both are fire-and-forget and carry no `request_id` by construction,
+        // All three are fire-and-forget and carry no `request_id` by construction,
         // so their failures go out as the legal *unsolicited* error frame: no
         // rid to echo, but a session named, which is what makes it routable to
         // diagnostics rather than to a pending request (§2).
-        Frame::Write { session_id, bytes } => match sessions.write(&session_id, &bytes) {
+        Frame::Write { session_id, bytes } => match sessions.write(&session_id, &bytes).await {
             Ok(()) => None,
             Err(err) => Some(refusal(err, Some(session_id), None, None)),
         },
@@ -1028,7 +1318,39 @@ fn handle_frame(
             session_id,
             cols,
             rows,
-        } => match sessions.resize(&session_id, cols, rows) {
+        } => {
+            // Generation 2 is last-request-wins straight to the pty; its asks
+            // never enter the gen-3 tables (`crate::sessions::Session::sizes`).
+            let resized = if generation == LEGACY_GENERATION {
+                sessions.resize_legacy(&session_id, cols, rows).await
+            } else {
+                sessions.resize(&session_id, subscriber, cols, rows).await
+            };
+            match resized {
+                Ok(()) => None,
+                Err(err) => Some(refusal(err, Some(session_id), None, None)),
+            }
+        }
+        // A generation-3 operation: generation 2 has no focus notion, so it is
+        // refused request-scoped and the connection keeps serving. Sender
+        // gating is not a trust boundary — this build can decode the op from
+        // any peer.
+        Frame::FocusSession { session_id, .. } if generation == LEGACY_GENERATION => {
+            Some(Frame::Error {
+                session_id: Some(session_id),
+                workspace_id: None,
+                code: error_code::UNCAPABLE_PEER.to_owned(),
+                message: "focus_session is a generation-3 operation and this connection \
+                          negotiated generation 2"
+                    .to_owned(),
+                request_id: None,
+            })
+        }
+        Frame::FocusSession {
+            session_id,
+            view_id,
+            hover,
+        } => match sessions.focus(&session_id, &view_id, hover).await {
             Ok(()) => None,
             Err(err) => Some(refusal(err, Some(session_id), None, None)),
         },
@@ -1088,6 +1410,7 @@ mod tests {
     fn control() -> DaemonControl {
         DaemonControl {
             binary_hash: None,
+            instance_id: "test-daemon".to_owned(),
             socket_path: PathBuf::new(),
             state_dir: PathBuf::new(),
             fired: AtomicBool::new(false),
@@ -1120,6 +1443,42 @@ mod tests {
         drop((first, second));
         assert!(control.admit_shutdown(false, || true));
         assert!(control.admit_state_request().is_none());
+    }
+
+    /// The generation-2 request's own fields reach the shell it spawns: the
+    /// environment verbatim, the size it named, 80x24 when it named none. The
+    /// wire test proves the size reaches the pty; this pins the rest of the
+    /// request, which travels to the pty in the same struct.
+    #[test]
+    fn the_combined_create_carries_the_legacy_requests_fields() {
+        let env = vec![("ADE_COMBINED".to_owned(), "1".to_owned())];
+        let request = combined_create_request(
+            "w-1".to_owned(),
+            "/home/u/proj".to_owned(),
+            "proj".to_owned(),
+            env.clone(),
+            None,
+            None,
+        );
+        assert_eq!(request.command, "", "an empty command is the login shell");
+        assert_eq!(request.env, env);
+        assert_eq!(request.cwd, "/home/u/proj");
+        assert_eq!(request.instance_label, "proj");
+        assert_eq!(request.agent_kind, "shell");
+        assert_eq!(
+            (request.cols, request.rows),
+            (LEGACY_DEFAULT_COLS, LEGACY_DEFAULT_ROWS)
+        );
+
+        let sized = combined_create_request(
+            "w-1".to_owned(),
+            "/home/u/proj".to_owned(),
+            "proj".to_owned(),
+            env,
+            Some(120),
+            Some(40),
+        );
+        assert_eq!((sized.cols, sized.rows), (120, 40));
     }
 
     #[test]

@@ -26,10 +26,11 @@
 //! - **The terminal is restored however it ends.** `RawMode` restores what it
 //!   saved from `Drop`, which covers the error paths and a panic alike.
 //!
-//! One socket, one writer: [`Frame::Write`] and [`Frame::Resize`] are queued on
-//! a channel and written by the connection pump, because two tasks writing
+//! One connection, one writer: [`Frame::Write`] and [`Frame::Resize`] are
+//! queued on a channel and written by a single task, because two tasks writing
 //! frames to one stream could interleave a length prefix with somebody else's
-//! payload.
+//! payload. The connect hands back the two halves already separated — on a
+//! socket, two clones of one fd.
 //!
 //! Everything above is platform-neutral, and so is the code for it. Only the
 //! local terminal is not: a Unix tty is termios plus SIGWINCH ([`tty`]), a
@@ -41,6 +42,8 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ade_session::client::{Connection, PRE_CUT_DIAGNOSIS, is_handshake_eof};
@@ -58,6 +61,12 @@ use smol::net::unix::UnixStream;
 use self::console::{RawMode, terminal_size};
 #[cfg(unix)]
 use self::tty::{RawMode, terminal_size};
+#[cfg(unix)]
+use crate::server::LEGACY_GENERATION;
+/// The window's lower end, as the client sees it. On Windows there is no
+/// `server` module to take it from — this build has no daemon there.
+#[cfg(windows)]
+const LEGACY_GENERATION: u32 = ade_session::proto::MIN_GENERATION;
 
 /// Bytes read from the local tty in one go.
 const INPUT_CHUNK_BYTES: usize = 8192;
@@ -78,6 +87,62 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// A replay describes a fresh terminal, so re-establish that baseline first.
 const RESET_TERMINAL: &[u8] = b"\x1bc";
+
+/// The two halves of a connection, back together as the one duplex stream
+/// [`Connection::handshake`] needs. A join, not an adapter: reads go to the
+/// reader, writes to the writer, nothing buffered or interpreted between.
+/// Both halves are `Unpin`, so the projection is a plain `Pin::new` — no
+/// `unsafe` here.
+pub struct Duplex<R, W> {
+    reader: R,
+    writer: W,
+}
+
+impl<R, W> Duplex<R, W> {
+    pub fn new(reader: R, writer: W) -> Self {
+        Self { reader, writer }
+    }
+
+    /// Take the halves back, so the caller can go on using them separately —
+    /// which is the whole reason this type is temporary.
+    pub fn into_halves(self) -> (R, W) {
+        (self.reader, self.writer)
+    }
+}
+
+impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for Duplex<R, W> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.reader).poll_read(context, buffer)
+    }
+}
+
+impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for Duplex<R, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.writer).poll_write(context, buffer)
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_flush(context)
+    }
+
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.writer).poll_close(context)
+    }
+}
 
 /// Whether a failed handshake carries §6.1's pre-cut signature: EOF with
 /// nothing read.
@@ -149,6 +214,10 @@ impl std::fmt::Display for DaemonAddress {
 pub struct AttachConfig {
     pub address: DaemonAddress,
     pub session_id: SessionId,
+    /// Which terminal view this client is the pty for, from `--view-id`. The
+    /// daemon needs it to honour a focus naming this view; without one the
+    /// client is simply never the focus owner.
+    pub view_id: Option<String>,
 }
 
 impl AttachConfig {
@@ -156,6 +225,7 @@ impl AttachConfig {
         Self {
             address: DaemonAddress::Socket(socket_path.into()),
             session_id: session_id.into(),
+            view_id: None,
         }
     }
 
@@ -164,7 +234,13 @@ impl AttachConfig {
         Self {
             address: DaemonAddress::Tcp(address.into()),
             session_id: session_id.into(),
+            view_id: None,
         }
+    }
+
+    pub fn with_view_id(mut self, view_id: Option<String>) -> Self {
+        self.view_id = view_id;
+        self
     }
 }
 
@@ -177,12 +253,17 @@ pub async fn run(config: AttachConfig) -> Result<()> {
     match config.address.clone() {
         // The connect is handed over as a closure rather than a stream because
         // §6.1's retry needs a *second* one: a daemon that dropped the
-        // connection mid-handshake left nothing to try again on.
+        // connection mid-handshake left nothing to try again on. It answers
+        // with the two halves rather than one stream; on a socket they are two
+        // clones of the one connection, which is what they always were.
         #[cfg(unix)]
         DaemonAddress::Socket(path) => {
             attached(config, move || {
                 let path = path.clone();
-                async move { Ok(UnixStream::connect(&path).await?) }
+                async move {
+                    let stream = UnixStream::connect(&path).await?;
+                    Ok((stream.clone(), stream))
+                }
             })
             .await
         }
@@ -191,15 +272,18 @@ pub async fn run(config: AttachConfig) -> Result<()> {
         // this is reachable, so this is the backstop for a caller that built
         // the config directly.
         #[cfg(windows)]
-        DaemonAddress::Socket(path) => anyhow::bail!(
+        DaemonAddress::Socket(path) => Err(anyhow::anyhow!(
             "cannot attach through the Unix socket {}: Windows has no Unix \
              sockets, so attach through --tcp <address> instead",
             path.display()
-        ),
+        )),
         DaemonAddress::Tcp(address) => {
             attached(config, move || {
                 let address = address.clone();
-                async move { Ok(TcpStream::connect(address.as_str()).await?) }
+                async move {
+                    let stream = TcpStream::connect(address.as_str()).await?;
+                    Ok((stream.clone(), stream))
+                }
             })
             .await
         }
@@ -248,27 +332,37 @@ impl AttachFailure {
     }
 }
 
-async fn handshaken<S, C, F>(
+/// The halves, plus **the generation this connection negotiated** — not the
+/// one some earlier connection did. Attach is its own connection and
+/// renegotiates on every reconnect, so what gates a frame here is what came
+/// back from this handshake.
+async fn handshaken<R, W, C, F>(
     config: &AttachConfig,
     connect: &C,
     diagnose_pre_cut: bool,
-) -> std::result::Result<S, AttachFailure>
+) -> std::result::Result<(R, W, u32), AttachFailure>
 where
-    S: AsyncRead + AsyncWrite + Clone + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin,
     C: Fn() -> F,
-    F: Future<Output = Result<S>>,
+    F: Future<Output = Result<(R, W)>>,
 {
     let mut retried = false;
     loop {
-        let stream = connect()
+        let (reader, writer) = connect()
             .await
             .with_context(|| format!("no ADE session daemon is listening on {}", config.address))
             .map_err(AttachFailure::Transport)?;
-        let error = match Connection::new(stream.clone())
-            .handshake(Hello::current())
-            .await
-        {
-            Ok(_ack) => return Ok(stream),
+        // The handshake is one frame out, one frame in, so it is the one place
+        // that wants the halves as a single duplex — [`Connection::handshake`]
+        // owns the §3.1 verification and this client does not get a second
+        // opinion about it. The halves come back out unchanged.
+        let mut connection = Connection::new(Duplex::new(reader, writer));
+        let error = match connection.handshake(Hello::current()).await {
+            Ok(ack) => {
+                let (reader, writer) = connection.into_inner().into_halves();
+                return Ok((reader, writer, ack.generation));
+            }
             Err(error) => error,
         };
         if !handshake_ended_in_eof(&error) || !diagnose_pre_cut {
@@ -292,13 +386,14 @@ where
 /// Everything after the connect, which is the same work whatever carries it.
 ///
 /// Generic rather than duplicated: [`Connection`] is already generic over the
-/// stream, and the two clones are what the one-writer rule needs — a reader
-/// half and a writer half shared across the bidirectional pump.
-async fn attached<S, C, F>(config: AttachConfig, connect: C) -> Result<()>
+/// stream, and the two halves are what the one-writer rule needs — a reader
+/// half for the output pump and a writer half for the single writer task.
+async fn attached<R, W, C, F>(config: AttachConfig, connect: C) -> Result<()>
 where
-    S: AsyncRead + AsyncWrite + Clone + Unpin + Send + 'static,
+    R: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin,
     C: Fn() -> F,
-    F: Future<Output = Result<S>>,
+    F: Future<Output = Result<(R, W)>>,
 {
     let mut stdout = Unblock::new(std::io::stdout());
     let (mut daemon, mut writer) = connect_and_attach(&config, &connect, &mut stdout, false)
@@ -372,20 +467,21 @@ where
 }
 
 /// Open one transport, attach, and paint the daemon's current screen.
-async fn connect_and_attach<S, C, F>(
+async fn connect_and_attach<R, W, C, F>(
     config: &AttachConfig,
     connect: &C,
     stdout: &mut Unblock<std::io::Stdout>,
     reconnecting: bool,
-) -> std::result::Result<(Connection<S>, Connection<S>), AttachFailure>
+) -> std::result::Result<(Connection<R>, Connection<W>), AttachFailure>
 where
-    S: AsyncRead + AsyncWrite + Clone + Unpin,
+    R: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncRead + AsyncWrite + Unpin,
     C: Fn() -> F,
-    F: Future<Output = Result<S>>,
+    F: Future<Output = Result<(R, W)>>,
 {
-    let stream = handshaken(config, connect, !reconnecting).await?;
-    let mut daemon = Connection::new(stream.clone());
-    let mut writer = Connection::new(stream);
+    let (reader, writer, generation) = handshaken(config, connect, !reconnecting).await?;
+    let mut daemon = Connection::new(reader);
+    let mut writer = Connection::new(writer);
     if let Some((cols, rows)) = terminal_size() {
         writer
             .send(&Frame::Resize {
@@ -400,6 +496,13 @@ where
     writer
         .send(&Frame::Attach {
             session_id: config.session_id.clone(),
+            // Generation 2 has no views. `--view-id` is still accepted on the
+            // command line — the caller cannot know what this connection will
+            // negotiate — it simply does not reach the wire there.
+            view_id: config
+                .view_id
+                .clone()
+                .filter(|_| generation > LEGACY_GENERATION),
             request_id: Some(1),
         })
         .await
@@ -417,9 +520,9 @@ where
 }
 
 /// Wait for the attach to be answered, writing the replayed scrollback out.
-async fn await_replay<S: AsyncRead + AsyncWrite + Unpin>(
-    daemon: &mut Connection<S>,
-    writer: &mut Connection<S>,
+async fn await_replay<R: AsyncRead + AsyncWrite + Unpin, W: AsyncRead + AsyncWrite + Unpin>(
+    daemon: &mut Connection<R>,
+    writer: &mut Connection<W>,
     session_id: &SessionId,
     stdout: &mut Unblock<std::io::Stdout>,
     reconnecting: bool,
@@ -1092,5 +1195,118 @@ mod tests {
             ending.len()
         );
         assert!(ending.contains('…'), "expected an elision: {ending}");
+    }
+}
+
+/// What the attach client puts on the wire is gated on the generation **this**
+/// connection negotiated, including after a reconnect. Over a loopback TCP pair
+/// rather than a socket pair, so the same test runs on both platforms.
+#[cfg(test)]
+mod generation_tests {
+    use ade_session::proto::HelloAck;
+    use smol::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    /// A daemon that selects `generation`, then answers the attach with an
+    /// empty replay. Returns the `view_id` the client actually sent.
+    async fn scripted_daemon(stream: TcpStream, generation: u32) -> Option<String> {
+        let mut daemon = Connection::new(stream);
+        let request_id = match daemon.recv().await.expect("hello") {
+            Frame::Hello(hello) => hello.request_id,
+            other => panic!("expected hello, got {other:?}"),
+        };
+        daemon
+            .send(&Frame::HelloAck(HelloAck {
+                daemon_version: "test".to_owned(),
+                protocol_version: generation,
+                host_os: "test".to_owned(),
+                min_generation: generation,
+                max_generation: generation,
+                generation,
+                capabilities: Vec::new(),
+                degraded: false,
+                binary_hash: None,
+                upgrade_ready: None,
+                instance_id: None,
+                request_id,
+            }))
+            .await
+            .expect("hello_ack");
+        loop {
+            // A `resize` may precede the attach when the test's stdout is a
+            // real console; anything else here is not this test's subject.
+            match daemon.recv().await.expect("a frame from the client") {
+                Frame::Attach {
+                    session_id,
+                    view_id,
+                    ..
+                } => {
+                    daemon
+                        .send(&Frame::Replay {
+                            session_id,
+                            bytes: Vec::new(),
+                            truncated: false,
+                        })
+                        .await
+                        .expect("replay");
+                    return view_id;
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// One connect-and-attach against a daemon serving `generation`.
+    fn view_id_sent_at(generation: u32, reconnecting: bool) -> Option<String> {
+        smol::block_on(async move {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("the bound port").to_string();
+            let serving = smol::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("accept");
+                scripted_daemon(stream, generation).await
+            });
+
+            let config =
+                AttachConfig::tcp(address.clone(), "s-1").with_view_id(Some("view-1".to_owned()));
+            let connect = || {
+                let address = address.clone();
+                async move {
+                    let stream = TcpStream::connect(&address).await?;
+                    Ok((stream.clone(), stream))
+                }
+            };
+            let mut stdout = Unblock::new(std::io::stdout());
+            connect_and_attach(&config, &connect, &mut stdout, reconnecting)
+                .await
+                .expect("the attach was answered");
+            serving.await
+        })
+    }
+
+    /// `--view-id` is accepted whatever the daemon turns out to be — the caller
+    /// cannot know before the handshake — but the field only reaches a peer
+    /// that has the op it feeds.
+    #[test]
+    fn a_generation_two_daemon_is_never_sent_a_view_id() {
+        assert_eq!(view_id_sent_at(LEGACY_GENERATION, false), None);
+    }
+
+    #[test]
+    fn a_generation_three_daemon_is_sent_the_view_id() {
+        assert_eq!(
+            view_id_sent_at(3, false),
+            Some("view-1".to_owned()),
+            "the view the client was told to draw"
+        );
+    }
+
+    /// Attach is its own connection and handshakes again on every reconnect, so
+    /// the gate is re-derived there rather than remembered from the first
+    /// connect — a daemon replaced under a running attach can be either one.
+    #[test]
+    fn a_reconnect_re_derives_the_gate_from_its_own_handshake() {
+        assert_eq!(view_id_sent_at(LEGACY_GENERATION, true), None);
+        assert_eq!(view_id_sent_at(3, true), Some("view-1".to_owned()));
     }
 }

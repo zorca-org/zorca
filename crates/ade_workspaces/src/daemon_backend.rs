@@ -608,6 +608,7 @@ impl DaemonBackend {
                 Frame::Created {
                     session,
                     request_id: Some(reply_id),
+                    ..
                 } if *reply_id == request_id => Some(session.clone()),
                 _ => None,
             },
@@ -690,6 +691,7 @@ impl SessionBackend for DaemonBackend {
                     Frame::Created {
                         session,
                         request_id: Some(reply_id),
+                        ..
                     } if *reply_id == request_id => Some(session.clone()),
                     _ => None,
                 },
@@ -1951,7 +1953,9 @@ impl HostLink {
 
     /// A link whose remote paths are already known, so the `$HOME` query is
     /// skipped. See [`DaemonBackend::remote_at`].
-    #[cfg(test)]
+    // Its only caller is unix-gated, so the plain `test` gate warned on
+    // Windows.
+    #[cfg(all(test, unix))]
     fn with_paths(host: ade_session::SshHost, local: LocalEndpoint, paths: RemotePaths) -> Self {
         Self {
             host,
@@ -2549,11 +2553,20 @@ enum DaemonConnection {
 
 impl DaemonConnection {
     async fn handshake(&mut self) -> Result<()> {
+        // Pinned at generation 2: this client still implements gen-2 semantics
+        // (auto-created workspaces, the combined create), while the crate can
+        // already speak 3. Announcing 3 would have the daemon hold it to the
+        // gen-3 meanings. The registry client that speaks 3 is the next commit,
+        // and it removes this pin.
+        let hello = Hello {
+            max_generation: proto::MIN_GENERATION,
+            ..Hello::current()
+        };
         let ack = match self {
-            Self::Proxied(connection) => connection.handshake(Hello::current()).await,
+            Self::Proxied(connection) => connection.handshake(hello.clone()).await,
             #[cfg(unix)]
-            Self::Socket(connection) => connection.handshake(Hello::current()).await,
-            Self::Tcp(connection) => connection.handshake(Hello::current()).await,
+            Self::Socket(connection) => connection.handshake(hello.clone()).await,
+            Self::Tcp(connection) => connection.handshake(hello).await,
         }
         .context("handshaking with the session daemon")?;
         // The *generation* is policed, and not here: since the cut,
@@ -2945,6 +2958,7 @@ mod aggregation {
             change(
                 Frame::Created {
                     session: info("s1", WORKSPACE, SessionStatus::Working),
+                    persisted: true,
                     request_id: None,
                 },
                 &mut join,
@@ -2955,6 +2969,7 @@ mod aggregation {
             change(
                 Frame::Created {
                     session: info("s2", WORKSPACE, SessionStatus::Working),
+                    persisted: true,
                     request_id: None,
                 },
                 &mut join,
@@ -2980,6 +2995,7 @@ mod aggregation {
             change(
                 Frame::Created {
                     session: info("s3", WORKSPACE, SessionStatus::Working),
+                    persisted: true,
                     request_id: None,
                 },
                 &mut join,
@@ -3065,11 +3081,14 @@ mod control_connection {
             host_os: "test".to_owned(),
             min_generation: proto::MIN_GENERATION,
             max_generation: proto::MAX_GENERATION,
-            generation: proto::MAX_GENERATION,
+            // What a real daemon selects for this client, whose handshake pins
+            // its offer at generation 2.
+            generation: proto::MIN_GENERATION,
             capabilities: Vec::new(),
             degraded: false,
             binary_hash: None,
             upgrade_ready: None,
+            instance_id: None,
             request_id: None,
         }
     }
@@ -3603,6 +3622,7 @@ mod control_connection {
                 workspaces: Vec::new(),
                 pending: vec![Frame::WorkspaceRemoved {
                     workspace_id: "removed-before-first-list".to_owned(),
+                    persisted: true,
                     request_id: None,
                 }],
             },
@@ -3628,10 +3648,12 @@ mod control_connection {
                         workspace_id: "changed".to_owned(),
                         layout: LayoutDoc::empty(),
                         rev: 1,
+                        persisted: true,
                         request_id: None,
                     },
                     Frame::WorkspaceRemoved {
                         workspace_id: "removed".to_owned(),
+                        persisted: true,
                         request_id: None,
                     },
                 ],
@@ -4393,7 +4415,7 @@ mod tests {
 
         // The shell exits: the daemon keeps the row, and this seam stops
         // reporting it, so the workspace reads as disconnected upstairs.
-        server.sessions().write(&session.id, b"exit\n").unwrap();
+        smol::block_on(server.sessions().write(&session.id, b"exit\n")).unwrap();
         eventually("the session to be reported dead", || {
             !backend.exists(&spec.id).unwrap()
         });

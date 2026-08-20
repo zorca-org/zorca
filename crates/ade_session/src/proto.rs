@@ -1,4 +1,4 @@
-//! Wire types for the ADE session-daemon protocol (generation 2).
+//! Wire types for the ADE session-daemon protocol (generation 3).
 //!
 //! Every frame that concerns a session carries a [`SessionId`]; that is what
 //! multiplexes many sessions over a single connection. Frames are encoded by
@@ -19,11 +19,13 @@
 //!
 //! A new *operation* is a new [`Frame`] variant, and it does **not** move the
 //! generation: the generation gates the envelope and framing shape,
-//! capabilities gate operations (§5). An op a peer has never heard of is now a
-//! *request-scoped* failure — the receiver answers
+//! capabilities gate operations (§5) — and an op may additionally be declared
+//! *generation-gated*, which [`Frame::FocusSession`] is. An op a peer has never
+//! heard of is now a *request-scoped* failure — the receiver answers
 //! [`error_code::UNKNOWN_OP`] and keeps serving — where before it killed the
 //! connection. That safety net is not the plan: a sender must not emit an op
-//! the peer's effective capability set lacks in the first place.
+//! the peer's effective capability set, or its negotiated generation, lacks in
+//! the first place.
 
 use std::collections::BTreeSet;
 
@@ -33,14 +35,23 @@ use crate::framing::bounded;
 
 /// Lowest protocol generation this build can serve.
 ///
-/// The envelope ships as **generation 2**. Generation 1 is retroactively the
-/// pre-cut protocol — `type`/`request_id` inline, no `op`/`rid`/`body` — and
-/// is never advertised, so the range starts and ends at 2 until something
-/// actually moves the envelope shape (`docs/ade/protocol-compatibility.md` §6).
+/// The envelope shipped as **generation 2**. Generation 1 is retroactively the
+/// pre-cut protocol — `type`/`request_id` inline, no `op`/`rid`/`body` — and is
+/// never advertised.
+///
+/// **Both peers serve a sliding window of two generations, current and
+/// previous.** A change of meaning on an existing frame still bumps the
+/// generation — `create_workspace` lost its combined workspace+first-shell arm
+/// at 3 (§4.1) — but the previous meaning keeps being served, on connections
+/// that negotiated the previous generation, for one window. Refusing a peer
+/// over skew is retired: a daemon is pinned by the sessions it holds, and an
+/// upgrade that orphans them is not an upgrade. Everything a generation
+/// changed is therefore a per-connection decision on the receiver's side, not
+/// a reason to hang up.
 pub const MIN_GENERATION: u32 = 2;
 
 /// Highest protocol generation this build can serve. See [`MIN_GENERATION`].
-pub const MAX_GENERATION: u32 = 2;
+pub const MAX_GENERATION: u32 = 3;
 
 /// Every `op` string this build can decode, in [`Frame`] declaration order.
 ///
@@ -66,6 +77,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "detach",
     "write",
     "resize",
+    "focus_session",
     "kill",
     "subscribe",
     "shutdown",
@@ -104,7 +116,9 @@ pub mod error_code {
     pub const UNKNOWN_OP: &str = "unknown_op";
     /// No generation is common to both peers' ranges. Fatal to the handshake.
     pub const UNSUPPORTED_GENERATION: &str = "unsupported_generation";
-    /// A capability-gated op arrived from a peer whose effective set lacks it.
+    /// A capability-gated op arrived from a peer whose effective set lacks it,
+    /// or a generation-gated one — [`super::Frame::FocusSession`] — arrived on
+    /// a connection below the generation that defines it.
     pub const UNCAPABLE_PEER: &str = "uncapable_peer";
     /// No such session / workspace.
     pub const NOT_FOUND: &str = "not_found";
@@ -136,9 +150,9 @@ pub mod error_code {
     ///
     /// [`UNCAPABLE_PEER`] is here for the same reason as [`UNKNOWN_OP`]: §3.3
     /// has its receiver answer and "keep serving", so the op is refused and the
-    /// stream is not. Nothing emits it yet — generation 2 advertises no
-    /// capabilities — but the day one ships, a client that lacked this would
-    /// end a terminal over a single gated op.
+    /// stream is not. A daemon serving a generation-2 connection emits it for
+    /// [`super::Frame::FocusSession`]; without this, a client would end a
+    /// terminal over a single gated op.
     ///
     /// [`MALFORMED_FRAME`] is deliberately not here, and the reason is not that
     /// the stream desynced — it does not. [`crate::framing::read_frame`] takes
@@ -449,8 +463,7 @@ impl LayoutDoc {
         }
     }
 
-    /// One leaf holding one terminal tab: what [`Frame::CreateWorkspace`]
-    /// returns, and what a migrated flat session becomes.
+    /// One leaf holding one terminal tab: what a migrated flat session becomes.
     pub fn single_terminal(session_id: SessionId) -> Self {
         Self::new(LayoutNode::leaf(vec![Tab::Terminal { session_id }]))
     }
@@ -583,8 +596,29 @@ pub struct HelloAck {
     /// client must read as "never".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upgrade_ready: Option<bool>,
+    /// **Which daemon this is**, minted once and kept in its state dir across
+    /// restarts, degraded ledger or not. A host may be spelled several ways —
+    /// an IP, a hostname, an ssh alias — and each spelling gets its own client
+    /// backend; this is what tells the client those backends are one daemon,
+    /// so one workspace is not locked, cached, listed and persisted twice.
+    ///
+    /// Additive, so the generation does not move: `None` from a daemon that
+    /// predates the field, and a client reading `None` falls back to the host
+    /// spelling as the identity, which is what it always used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<u64>,
+}
+
+/// The absent meaning of the `persisted` flag every mutation ack carries: a
+/// peer that does not have the field recorded everything it acked (§8.5).
+fn persisted_by_default() -> bool {
+    true
+}
+
+fn was_persisted(persisted: &bool) -> bool {
+    *persisted
 }
 
 /// One protocol message, in either direction.
@@ -617,18 +651,28 @@ pub enum Frame {
     // ---- client → daemon ----
     /// Must be the first frame the client sends.
     Hello(Hello),
-    /// Create a workspace, its first login-shell session and a one-leaf layout
-    /// holding that session's terminal tab — one round trip, answered with
-    /// [`Frame::Workspace`].
+    /// Create a workspace record alone — no session, no layout — answered with
+    /// [`Frame::Workspace`] and an empty `sessions`. What a panel row is the
+    /// moment it appears; its first terminal is a separate
+    /// [`Frame::CreateSession`] naming the id this returns.
+    ///
+    /// **At generation 2 this is the combined create**: record, first login
+    /// shell and a one-leaf layout holding it, answered with that session in
+    /// `sessions`. Losing that arm is why the generation moved (§4.1), and
+    /// serving it on gen-2 connections is why the window exists.
     CreateWorkspace {
         /// Project root, resolved on the daemon's host.
         root: String,
         /// Defaults to the last component of `root`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        #[serde(default)]
+        /// Generation-2 request field: the first session's environment. A
+        /// gen-3 receiver ignores it and a gen-3 sender must not emit it —
+        /// kept only so the gen-2 request can still be decoded whole.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<(String, String)>,
-        /// Size of the first session's pty; both default to 80x24.
+        /// Generation-2 request field: the first session's pty size, 80x24 by
+        /// default. See `env`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cols: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -679,9 +723,14 @@ pub enum Frame {
         request_id: Option<u64>,
     },
     CreateSession {
-        /// The workspace this session belongs to. There are no free-floating
-        /// sessions: an id the daemon has never seen creates the workspace
-        /// record, and an empty one is given a fresh id.
+        /// The workspace this session belongs to, and it must already exist:
+        /// creating a session never creates a record. An id the daemon does not
+        /// hold is [`error_code::NOT_FOUND`], an empty one
+        /// [`error_code::INVALID_ARGUMENT`].
+        ///
+        /// **At generation 2 both auto-create instead**: an unknown id makes
+        /// the record under that id, an empty one mints a fresh id, rooted at
+        /// `cwd` and named from `instance_label`.
         workspace_id: String,
         cwd: String,
         /// What to run on the new pty, resolved **on the daemon's host**.
@@ -710,6 +759,13 @@ pub enum Frame {
     /// Ask for scrollback [`Frame::Replay`] followed by live [`Frame::Output`].
     Attach {
         session_id: SessionId,
+        /// Which terminal view this client is the pty for, so
+        /// [`Frame::FocusSession`] can name it. Opaque and never reused — a
+        /// fresh id per view lifetime — so a focus left over from a view that
+        /// is gone can never bind to a later one. Absent from an older client,
+        /// and read as absent on a generation-2 connection however it arrives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        view_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
@@ -727,6 +783,31 @@ pub enum Frame {
         session_id: SessionId,
         cols: u16,
         rows: u16,
+    },
+    /// Make one attached view's ask the pty's size, instead of the smallest
+    /// ask among every attached client.
+    ///
+    /// **Carries no size on purpose.** The owner's ask is live: its attach
+    /// client keeps sending [`Frame::Resize`] as its own terminal moves, and
+    /// the daemon re-derives the pty size from whatever that last ask is. A
+    /// size here would go stale the moment the focused view was dragged.
+    ///
+    /// Sent by the GUI over its control connection, not by the attach client
+    /// that owns `view_id` — which is why the view is named rather than
+    /// implied by the sender. A `view_id` nothing has attached with yet is
+    /// remembered and takes effect when it does.
+    ///
+    /// **A generation-3 operation.** Generation 2 has no focus notion at all —
+    /// its pty follows the last resize — so a receiver serving a gen-2
+    /// connection refuses this with [`error_code::UNCAPABLE_PEER`] and keeps
+    /// serving, and a sender must not emit it there.
+    FocusSession {
+        session_id: SessionId,
+        view_id: String,
+        /// A hover-born claim; the daemon may decline it while the session is
+        /// being typed into (see the daemon's `SessionTable::focus`).
+        #[serde(default)]
+        hover: bool,
     },
     /// The only frame that ends a session.
     Kill {
@@ -783,6 +864,15 @@ pub enum Frame {
     },
     Created {
         session: SessionInfo,
+        /// `false` when a degraded daemon applied the mutation in memory and
+        /// could not record it (§8.5). It is not a failure and must never be
+        /// retried — it happened, only its ledger row did not. Absent reads as
+        /// `true`, which is what every peer without the field always meant.
+        #[serde(
+            default = "persisted_by_default",
+            skip_serializing_if = "was_persisted"
+        )]
+        persisted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
@@ -792,6 +882,12 @@ pub enum Frame {
     Workspace {
         workspace: WorkspaceInfo,
         sessions: Vec<SessionInfo>,
+        /// See [`Frame::Created::persisted`].
+        #[serde(
+            default = "persisted_by_default",
+            skip_serializing_if = "was_persisted"
+        )]
+        persisted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
@@ -807,19 +903,32 @@ pub enum Frame {
         workspace_id: String,
         layout: LayoutDoc,
         rev: u64,
+        /// See [`Frame::Created::persisted`].
+        #[serde(
+            default = "persisted_by_default",
+            skip_serializing_if = "was_persisted"
+        )]
+        persisted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
     WorkspaceRemoved {
         workspace_id: String,
+        /// See [`Frame::Created::persisted`].
+        #[serde(
+            default = "persisted_by_default",
+            skip_serializing_if = "was_persisted"
+        )]
+        persisted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
     Removed {
         session_id: SessionId,
     },
-    /// Scrollback replayed on attach; `truncated` when the buffer had already
-    /// dropped older bytes.
+    /// Scrollback replayed on attach; `truncated` when some of what the
+    /// session printed is not in it — the buffer dropped older bytes, or the
+    /// replay was cut to fit the connection's outbound bound.
     Replay {
         session_id: SessionId,
         bytes: Vec<u8>,
@@ -876,6 +985,7 @@ impl Frame {
             | Frame::Detach { session_id, .. }
             | Frame::Write { session_id, .. }
             | Frame::Resize { session_id, .. }
+            | Frame::FocusSession { session_id, .. }
             | Frame::Kill { session_id, .. }
             | Frame::Removed { session_id }
             | Frame::Replay { session_id, .. }
@@ -949,6 +1059,7 @@ impl Frame {
             | Frame::Error { request_id, .. } => *request_id,
             Frame::Write { .. }
             | Frame::Resize { .. }
+            | Frame::FocusSession { .. }
             | Frame::Removed { .. }
             | Frame::Replay { .. }
             | Frame::Output { .. }
