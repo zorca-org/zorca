@@ -202,6 +202,8 @@ pub async fn open_remote_project(
         );
     }
 
+    app_state.node_runtime.wait_for_shell_environment().await;
+
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()

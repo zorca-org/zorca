@@ -84,6 +84,11 @@ impl NodeRuntime {
         })))
     }
 
+    pub async fn wait_for_shell_environment(&self) {
+        let shell_env_loaded = self.0.lock().await.shell_env_loaded.clone();
+        shell_env_loaded.await.ok();
+    }
+
     async fn instance(&self) -> Box<dyn NodeRuntimeTrait> {
         let mut state = self.0.lock().await;
 
@@ -1142,15 +1147,39 @@ fn npm_command_env(node_binary: Option<&Path>) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use anyhow::{Result, bail};
+    use futures::channel::oneshot;
+    use http_client::BlockedHttpClient;
     use http_client::Url;
     use semver::{Version, VersionReq};
 
     use super::{
-        NpmInfo, VersionStrategy, build_npm_command_args, deserialize_npm_info_from_response,
-        proxy_argument, select_npm_package_version, should_install_npm_package_version,
+        NodeBinaryOptions, NodeRuntime, NpmInfo, VersionStrategy, build_npm_command_args,
+        deserialize_npm_info_from_response, proxy_argument, select_npm_package_version,
+        should_install_npm_package_version,
     };
+
+    #[test]
+    fn test_wait_for_shell_environment_waits_for_startup_capture() {
+        smol::block_on(async {
+            let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+            let node_runtime = NodeRuntime::new(
+                Arc::new(BlockedHttpClient),
+                Some(shell_env_loaded_rx),
+                watch::channel(Some(NodeBinaryOptions::default())).1,
+            );
+            let wait = node_runtime.wait_for_shell_environment();
+            futures::pin_mut!(wait);
+
+            assert!(smol::future::poll_once(wait.as_mut()).await.is_none());
+            shell_env_loaded_tx
+                .send(())
+                .expect("shell environment receiver should still be waiting");
+            wait.await;
+        });
+    }
 
     // Map localhost to 127.0.0.1
     // NodeRuntime without environment information can not parse `localhost` correctly.
