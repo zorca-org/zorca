@@ -1,12 +1,14 @@
-//! A fresh ssh connection reattaches to the host's daemon workspace.
+//! A fresh window — local or a fresh ssh connection — reattaches to a daemon
+//! workspace.
 //!
-//! The first window on a fresh remote connection used to open a plain
-//! centre-pane shell that died with the window, so connecting twice left two
-//! throwaway shells and nothing to come back to. This module is the other
-//! branch of that fresh-window decision: an ssh window ensures the host's
-//! daemon, adopts whatever it already holds, and then either reattaches to the
-//! project's most recently opened workspace or creates the first — exactly as
-//! the workspace panel's "Add workspace" would.
+//! The first window on a fresh connection used to open a plain centre-pane
+//! shell that died with the window, so connecting twice (or just closing and
+//! reopening Zorca) left throwaway shells and nothing to come back to. This
+//! module is the other branch of that fresh-window decision: it ensures the
+//! right daemon — this machine's or the ssh host's — adopts whatever it
+//! already holds, and then either reattaches to the project's most recently
+//! opened workspace or creates the first, exactly as the workspace panel's
+//! "Add workspace" would.
 //!
 //! Opening attaches: it builds the daemon's layout and attaches to the
 //! sessions it names, so a second connect reattaches rather than spawning, and
@@ -17,7 +19,9 @@
 //! WSL box reached *over ssh* is an ssh host, and takes the workspace path.)
 //! A host that cannot be reached has answered nothing and keeps the plain
 //! terminal too, with a log line: a connection must never cost the user their
-//! shell.
+//! shell. **Local on a platform without a local daemon** (see
+//! [`WorkspaceLifecycleService::new`]) keeps the plain terminal for the same
+//! reason.
 
 use crate::{
     AdeWorkspace, SessionState, WorkspaceLifecycleService,
@@ -47,39 +51,91 @@ struct ClaimedWindows(HashSet<EntityId>);
 
 impl Global for ClaimedWindows {}
 
+/// `true` when this window is now the caller's to run the flow in.
+fn claim_window(window: EntityId, cx: &mut App) -> bool {
+    cx.default_global::<ClaimedWindows>().0.insert(window)
+}
+
 pub(crate) fn release_window_claim(window: EntityId, cx: &mut App) {
     if cx.has_global::<ClaimedWindows>() {
         cx.global_mut::<ClaimedWindows>().0.remove(&window);
     }
 }
 
+/// What a window the flow gave up waiting on gets: its shell, and its claim
+/// back.
+///
+/// The empty window's deadline is short because a fresh window owes the user a
+/// prompt, which makes it a guess rather than an answer — a project the user
+/// just added can take longer than that to grow its first worktree. Keeping the
+/// claim would settle the guess for good: the flow runs once per window, so no
+/// later add or activation could try again with the root that has since landed,
+/// and the window would keep its stock non-ADE terminal permanently. Handing the
+/// claim back is what makes the next attempt possible.
+///
+/// The terminal still lands, and only into a window that is still empty: a
+/// rootless connection is owed a prompt either way, and the next attempt finds
+/// a workspace with no stored layout, so it attaches a tab beside that shell
+/// rather than rebuilding the window around it.
+fn give_up_on_window(window: EntityId, this: &WeakEntity<Workspace>, cx: &mut AsyncWindowContext) {
+    cx.update(|_, cx| release_window_claim(window, cx)).ok();
+    open_plain_terminal_if_empty(this, cx);
+}
+
 /// OpenSSH's own default, and what `~/.ssh/config` resolution assumes when the
 /// settings leave the port unset.
 const DEFAULT_SSH_PORT: u16 = 22;
 
-/// Takes over a fresh window that is an ssh connection: `true` means this
-/// window now belongs to the connect flow (which opens a workspace, or falls
-/// back to a plain terminal itself), `false` means the window is not ADE's to
-/// take — local, WSL, Docker, or a connection rooted at the remote home — and
-/// the caller should open whatever a fresh window normally gets.
+/// Which connection a fresh window is, for the part of the decision that does
+/// not need a live project: `Some(Some(ssh))` is an ssh connection,
+/// `Some(None)` is local, and `None` is WSL, Docker, or any other connection
+/// kind — none of ADE's session layer, which speaks ssh or nothing at all.
+///
+/// Local is `Some(None)` only on unix: `backend_for_host` knows a local daemon
+/// there and nowhere else (see `WorkspaceLifecycleService::new`), so a local
+/// window elsewhere stays the plain terminal it always was.
+fn ade_connection(
+    options: Option<RemoteConnectionOptions>,
+) -> Option<Option<SshConnectionOptions>> {
+    match options {
+        Some(RemoteConnectionOptions::Ssh(ssh)) => Some(Some(ssh)),
+        None if cfg!(unix) => Some(None),
+        _ => None,
+    }
+}
+
+/// Takes over a fresh window that is local or an ssh connection: `true` means
+/// this window now belongs to the connect flow (which opens a workspace, or
+/// falls back to a plain terminal itself), `false` means the window is not
+/// ADE's to take — WSL, Docker, a platform with no local daemon, or a
+/// connection rooted at the connected account's home — and the caller should
+/// open whatever a fresh window normally gets.
 pub fn open_connection_workspace(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
     let project = workspace.project().clone();
-    let Some(RemoteConnectionOptions::Ssh(ssh)) = project.read(cx).remote_connection_options(cx)
-    else {
+    let Some(ssh) = ade_connection(project.read(cx).remote_connection_options(cx)) else {
         return false;
     };
-    let destination = ssh_destination(&ssh);
+    // A fake fs has no local machine or daemon behind it. SSH is unaffected:
+    // its daemon lives on the host.
+    if ssh.is_none() && project.read(cx).fs().is_fake() {
+        return false;
+    }
+    // The destination a workspace's `remote_host` column records — `None` is
+    // this machine, exactly as `WorkspaceLifecycleService::create_workspace`
+    // already defines it.
+    let host = ssh.as_ref().map(ssh_destination);
+    let label = host.clone().unwrap_or_else(|| "this machine".to_owned());
     let window_id = cx.entity().entity_id();
-    if !cx.default_global::<ClaimedWindows>().0.insert(window_id) {
+    if !claim_window(window_id, cx) {
         return true;
     }
     // The one line that proves the flow started; everything after it either
     // attaches or explains itself in this same log.
-    log::info!("ADE claims the {destination} window; reattaching once the project root settles");
+    log::info!("ADE claims the {label} window; reattaching once the project root settles");
 
     // A window restored at startup fires its workspace-added hook before the
     // project's worktrees have loaded, so the project root cannot be read here
@@ -102,49 +158,59 @@ pub fn open_connection_workspace(
     cx.spawn_in(window, async move |this, cx| {
         let Some(repository_path) = wait_for_project_root(&this, root_deadline, cx).await else {
             log::info!(
-                "ADE waited {root_deadline:?} for {destination}'s project root; \
-                 leaving the window as it is"
+                "ADE waited {root_deadline:?} for {label}'s project root; \
+                 releasing the claim so a later caller can try again"
             );
-            open_plain_terminal_if_empty(&this, cx);
+            give_up_on_window(window_id, &this, cx);
             return;
         };
         // Connecting with nothing but `~` filled in is how the remote picker
         // behaves before a folder is chosen; a workspace rooted at the whole
-        // account is not a project (operator ruling, 2026-08-05).
-        if is_remote_home_directory(&repository_path, &ssh) {
+        // account is not a project (operator ruling, 2026-08-05). The same
+        // ruling applies to a local window rooted at the user's own home.
+        let is_home = match &ssh {
+            Some(ssh) => is_remote_home_directory(&repository_path, ssh),
+            None => repository_path == *util::paths::home_dir(),
+        };
+        if is_home {
             open_plain_terminal_if_empty(&this, cx);
             return;
         }
 
         // Blocking, deliberately: the ensure drives the host's ssh connection
-        // and adoption reads the daemon, then sqlite.
+        // (or the local daemon proxy) and adoption reads the daemon, then
+        // sqlite.
         let listed = cx
             .background_spawn({
                 let lifecycle = lifecycle.clone();
-                let destination = destination.clone();
-                async move { lifecycle.ensure_host_workspaces(Some(&destination)).await }
+                let host = host.clone();
+                async move { lifecycle.ensure_host_workspaces(host.as_deref()).await }
             })
             .await;
 
         let listed = match listed {
-            Err(error) if crate::daemon_backend::is_incompatible_daemon(&error) => {
+            // Upgrading is remote-only (`upgrade_host_daemon` always targets a
+            // named host): the local daemon is this same client's own binary,
+            // so it cannot fall out of protocol sync with itself, and nothing
+            // here may offer to stop or upgrade it.
+            Err(error) if host.is_some() && crate::daemon_backend::is_incompatible_daemon(&error) => {
                 log::warn!(
-                    "ADE found an incompatible session daemon on {destination}: {error:#}"
+                    "ADE found an incompatible session daemon on {label}: {error:#}"
                 );
-                match offer_incompatible_daemon_upgrade(&destination, lifecycle.clone(), cx).await {
+                match offer_incompatible_daemon_upgrade(&label, lifecycle.clone(), cx).await {
                     Ok(true) => {
                         cx.background_spawn({
                             let lifecycle = lifecycle.clone();
-                            let destination = destination.clone();
+                            let host = host.clone();
                             async move {
-                                lifecycle.ensure_host_workspaces(Some(&destination)).await
+                                lifecycle.ensure_host_workspaces(host.as_deref()).await
                             }
                         })
                         .await
                     }
                     Ok(false) => return,
                     Err(error) => {
-                        log::warn!("upgrading the session daemon on {destination} failed: {error:#}");
+                        log::warn!("upgrading the session daemon on {label} failed: {error:#}");
                         let detail = format!("{error:#}");
                         match cx.update(|window, cx| {
                             window.prompt(
@@ -179,7 +245,7 @@ pub fn open_connection_workspace(
             Ok(workspaces) => workspaces,
             Err(error) => {
                 log::warn!(
-                    "ADE could not reach {destination}, so this connection gets a plain terminal: {error:#}"
+                    "ADE could not reach {label}, so this connection gets a plain terminal: {error:#}"
                 );
                 open_plain_terminal_if_empty(&this, cx);
                 return;
@@ -195,7 +261,7 @@ pub fn open_connection_workspace(
         })
         .ok();
 
-        let existing = most_recent_workspace(&ssh, &repository_path, &workspaces).cloned();
+        let existing = most_recent_workspace(ssh.as_ref(), &repository_path, &workspaces).cloned();
         let opened = match existing {
             Some(existing) => open_or_recreate(&this, &lifecycle, existing, cx).await,
             None => {
@@ -205,16 +271,10 @@ pub fn open_connection_workspace(
                         let name = crate::project_id_from_path(&repository_path);
                         let project_id = name.clone();
                         let repository_path = repository_path.clone();
-                        let destination = destination.clone();
+                        let host = host.clone();
                         async move {
                             lifecycle
-                                .create_workspace(
-                                    name,
-                                    project_id,
-                                    repository_path,
-                                    None,
-                                    Some(destination),
-                                )
+                                .create_workspace(name, project_id, repository_path, None, host)
                                 .await
                         }
                     })
@@ -229,7 +289,7 @@ pub fn open_connection_workspace(
         if let Err(error) = opened {
             // The window must not come up empty: whatever the workspace path
             // could not deliver, the connection still owes the user a shell.
-            log::warn!("opening the ADE workspace for {destination} failed: {error:#}");
+            log::warn!("opening the ADE workspace for {label} failed: {error:#}");
             open_plain_terminal_if_empty(&this, cx);
         }
     })
@@ -376,6 +436,11 @@ fn open_plain_terminal_if_empty(this: &WeakEntity<Workspace>, cx: &mut AsyncWind
         if occupied {
             return;
         }
+        // A fake fs has no real PTY behind it; its reader thread would also
+        // violate the deterministic test scheduler.
+        if workspace.project().read(cx).fs().is_fake() {
+            return;
+        }
         terminal_view::TerminalView::deploy(
             workspace,
             &workspace::NewCenterTerminal::default(),
@@ -389,15 +454,19 @@ fn open_plain_terminal_if_empty(this: &WeakEntity<Workspace>, cx: &mut AsyncWind
 /// The daemon workspace this connection reattaches to: the most recently
 /// opened one for the connected root on this host. `None` means the project has
 /// no workspace yet, which is what makes a fresh connection create one.
+///
+/// `ssh` is `None` for the local connection, and matches only workspaces
+/// with no `remote_host` of their own — a local project must never reattach
+/// to a row a remote host created.
 fn most_recent_workspace<'a>(
-    ssh: &SshConnectionOptions,
+    ssh: Option<&SshConnectionOptions>,
     root: &Path,
     workspaces: &'a [AdeWorkspace],
 ) -> Option<&'a AdeWorkspace> {
     workspaces
         .iter()
         .filter(|workspace| {
-            host_matches_destination(ssh, workspace.remote_host.as_deref())
+            workspace_matches_connection(ssh, workspace.remote_host.as_deref())
                 && workspace.repository_path == root
         })
         // A tie keeps the earlier candidate, so a caller whose list is already
@@ -407,6 +476,20 @@ fn most_recent_workspace<'a>(
             Some(best) if best.last_opened_at >= workspace.last_opened_at => Some(best),
             _ => Some(workspace),
         })
+}
+
+/// Whether a workspace's stored `remote_host` names the connection this window
+/// is on. Local (`ssh` is `None`) matches only a workspace with no
+/// `remote_host` of its own; an ssh connection defers to
+/// [`host_matches_destination`]'s lenient parts comparison.
+fn workspace_matches_connection(
+    ssh: Option<&SshConnectionOptions>,
+    destination: Option<&str>,
+) -> bool {
+    match ssh {
+        Some(ssh) => host_matches_destination(ssh, destination),
+        None => destination.is_none(),
+    }
 }
 
 /// Whether a workspace's stored destination names the host this window is
@@ -548,6 +631,7 @@ mod tests {
     };
     use anyhow::bail;
     use gpui::{Entity, TestAppContext, VisualTestContext};
+    use remote::{DockerConnectionOptions, WslConnectionOptions};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -655,6 +739,39 @@ mod tests {
     }
 
     #[test]
+    fn test_ade_connection_claims_ssh_and_local_but_not_wsl_or_docker() {
+        let ssh_options = RemoteConnectionOptions::Ssh(ssh("wsl-box", Some("kingii"), None));
+        assert_eq!(
+            ade_connection(Some(ssh_options)),
+            Some(Some(ssh("wsl-box", Some("kingii"), None)))
+        );
+
+        // No remote options is an ordinary local project. Local ADE workspaces
+        // need a unix daemon (see `WorkspaceLifecycleService::new`), so the
+        // expected verdict is spelled the same way here.
+        assert_eq!(
+            ade_connection(None),
+            if cfg!(unix) { Some(None) } else { None }
+        );
+
+        // WSL and Docker keep the plain terminal: ADE's session layer only
+        // speaks ssh or local, never these transports.
+        assert_eq!(
+            ade_connection(Some(RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                distro_name: "Ubuntu".to_owned(),
+                user: None,
+            }))),
+            None
+        );
+        assert_eq!(
+            ade_connection(Some(RemoteConnectionOptions::Docker(
+                DockerConnectionOptions::default()
+            ))),
+            None
+        );
+    }
+
+    #[test]
     fn test_the_home_directory_is_not_a_workspace() {
         let with_user = ssh("wsl-box", Some("kingii"), None);
         assert!(is_remote_home_directory(
@@ -691,11 +808,38 @@ mod tests {
         other_host.last_opened_at = opened_at(400);
 
         let workspaces = vec![exact, inside_new, elsewhere, other_host];
-        let best = most_recent_workspace(&ssh, Path::new("/home/kingii/testproj"), &workspaces);
+        let best =
+            most_recent_workspace(Some(&ssh), Path::new("/home/kingii/testproj"), &workspaces);
         assert_eq!(best.map(|workspace| workspace.name.as_str()), Some("main"));
 
-        let best = most_recent_workspace(&ssh, Path::new("/home/kingii/testproj/wt"), &workspaces);
+        let best = most_recent_workspace(
+            Some(&ssh),
+            Path::new("/home/kingii/testproj/wt"),
+            &workspaces,
+        );
         assert_eq!(best.map(|workspace| workspace.name.as_str()), Some("new"));
+    }
+
+    /// Local matching (no ssh connection) selects only a workspace with no
+    /// `remote_host` of its own, never a row a remote host created — even one
+    /// pointed at the identical path, which a stale or migrated remote row
+    /// could be.
+    #[test]
+    fn test_local_matching_ignores_remote_workspaces() {
+        let mut remote = AdeWorkspace::new("remote", "testproj", "/home/kingii/testproj");
+        remote.remote_host = Some("wsl-box".to_owned());
+        let mut local = AdeWorkspace::new("local", "testproj", "/home/kingii/testproj");
+        local.remote_host = None;
+
+        let workspaces = vec![remote.clone()];
+        assert_eq!(
+            most_recent_workspace(None, Path::new("/home/kingii/testproj"), &workspaces),
+            None
+        );
+
+        let workspaces = vec![remote, local];
+        let best = most_recent_workspace(None, Path::new("/home/kingii/testproj"), &workspaces);
+        assert_eq!(best.map(|workspace| workspace.name.as_str()), Some("local"));
     }
 
     #[gpui::test]
@@ -706,6 +850,44 @@ mod tests {
             assert!(cx.default_global::<ClaimedWindows>().0.insert(id));
             release_window_claim(id, cx);
             assert!(cx.default_global::<ClaimedWindows>().0.insert(id));
+        });
+    }
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn test_a_fake_local_project_is_not_claimed(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        let claimed = window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                open_connection_workspace(workspace, window, cx)
+            })
+        });
+
+        assert!(!claimed);
+    }
+
+    /// The short deadline is a guess about a root that has not arrived yet, and
+    /// a project whose worktree lands a second late must not be answered with a
+    /// stock terminal for the life of the window.
+    #[gpui::test]
+    async fn test_a_window_the_flow_gave_up_on_can_be_claimed_again(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        let id = workspace.entity_id();
+        let this = workspace.downgrade();
+        window.update(|_, cx| {
+            assert!(claim_window(id, cx), "the first caller takes the window");
+            assert!(!claim_window(id, cx), "and the flow runs once per window");
+        });
+
+        window
+            .update(|window, cx| window.spawn(cx, async move |cx| give_up_on_window(id, &this, cx)))
+            .await;
+
+        window.update(|_, cx| {
+            assert!(
+                claim_window(id, cx),
+                "a root that lands late must still find the window claimable"
+            );
         });
     }
 
