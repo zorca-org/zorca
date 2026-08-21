@@ -17,21 +17,26 @@ pub struct AdeWorkspaceRegistry(ThreadSafeConnection);
 impl Domain for AdeWorkspaceRegistry {
     const NAME: &str = stringify!(AdeWorkspaceRegistry);
 
-    const MIGRATIONS: &[&str] = &[sql!(
-        CREATE TABLE IF NOT EXISTS ade_workspaces(
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            project_id TEXT NOT NULL,
-            repository_path BLOB NOT NULL,
-            branch TEXT,
-            remote_host TEXT, // NULL means the workspace is local
-            remote_workspace_path BLOB,
-            terminal_session_id TEXT,
-            status TEXT NOT NULL,
-            created_at INTEGER NOT NULL, // unix seconds
-            last_opened_at INTEGER NOT NULL // unix seconds
-        ) STRICT;
-    )];
+    const MIGRATIONS: &[&str] = &[
+        sql!(
+            CREATE TABLE IF NOT EXISTS ade_workspaces(
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                repository_path BLOB NOT NULL,
+                branch TEXT,
+                remote_host TEXT, // NULL means the workspace is local
+                remote_workspace_path BLOB,
+                terminal_session_id TEXT,
+                status TEXT NOT NULL,
+                created_at INTEGER NOT NULL, // unix seconds
+                last_opened_at INTEGER NOT NULL // unix seconds
+            ) STRICT;
+        ),
+        // Migration SQL is persisted verbatim; append changes instead of
+        // editing this step.
+        sql!(ALTER TABLE ade_workspaces ADD COLUMN used_by_client_at INTEGER;),
+    ];
 }
 
 db::static_connection!(AdeWorkspaceRegistry, []);
@@ -53,12 +58,13 @@ impl AdeWorkspaceRegistry {
     /// Inserts a workspace, replacing any row with the same id.
     pub async fn create_workspace(&self, workspace: AdeWorkspace) -> Result<()> {
         let query = format!(
-            "INSERT OR REPLACE INTO ade_workspaces ({COLUMNS})
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+            "INSERT OR REPLACE INTO ade_workspaces ({COLUMNS}, used_by_client_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
         );
         self.write(move |connection| {
             let mut statement = Statement::prepare(connection, &query)?;
-            statement.bind(&workspace, 1)?;
+            let next_index = statement.bind(&workspace, 1)?;
+            statement.bind(&crate::now_whole_seconds().unix_timestamp(), next_index)?;
             statement.exec()
         })
         .await
@@ -177,12 +183,75 @@ impl AdeWorkspaceRegistry {
 }
 
 #[cfg(test)]
+impl AdeWorkspaceRegistry {
+    query! {
+        fn used_by_client_at(id: WorkspaceId) -> Result<Option<i64>> {
+            SELECT used_by_client_at FROM ade_workspaces WHERE id = ?
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    struct BeforeUsageProvenance;
+
+    impl Domain for BeforeUsageProvenance {
+        const NAME: &str = <AdeWorkspaceRegistry as Domain>::NAME;
+        const MIGRATIONS: &[&str] = &[<AdeWorkspaceRegistry as Domain>::MIGRATIONS[0]];
+    }
+
     fn workspace(name: &str, project_id: &str) -> AdeWorkspace {
         AdeWorkspace::new(name, project_id, "/repos/zed")
+    }
+
+    async fn insert_without_usage_column(
+        connection: &ThreadSafeConnection,
+        workspace: AdeWorkspace,
+    ) {
+        let query = format!(
+            "INSERT OR REPLACE INTO ade_workspaces ({COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+        );
+        connection
+            .write(move |connection| {
+                let mut statement = Statement::prepare(connection, &query)?;
+                statement.bind(&workspace, 1)?;
+                statement.exec()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_migration_and_rolled_back_writes_stay_visible() {
+        let name = "test_usage_provenance_rollback";
+        let legacy = db::open_test_db::<BeforeUsageProvenance>(name).await;
+        let before_upgrade = workspace("before-upgrade", "project-a");
+        insert_without_usage_column(&legacy, before_upgrade.clone()).await;
+
+        let db = AdeWorkspaceRegistry::open_test_db(name).await;
+        assert_eq!(
+            db.get_workspace(before_upgrade.id.clone()).unwrap(),
+            Some(before_upgrade)
+        );
+
+        let after_rollback = workspace("after-rollback", "project-a");
+        insert_without_usage_column(&legacy, after_rollback.clone()).await;
+        assert_eq!(
+            db.get_workspace(after_rollback.id.clone()).unwrap(),
+            Some(after_rollback)
+        );
+
+        let created_here = workspace("created-here", "project-a");
+        db.create_workspace(created_here.clone()).await.unwrap();
+        assert!(
+            db.used_by_client_at(created_here.id)
+                .unwrap()
+                .is_some_and(|timestamp| timestamp > 0)
+        );
     }
 
     #[gpui::test]
