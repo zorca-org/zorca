@@ -340,6 +340,9 @@ async fn wait_for_project_root(
 ) -> Option<std::path::PathBuf> {
     let poll = std::time::Duration::from_millis(250);
     let mut waited = std::time::Duration::ZERO;
+    // Require the same root on two consecutive polls: Zed's center restore
+    // can surface a transient first root before it settles.
+    let mut previous: Option<std::path::PathBuf> = None;
     loop {
         let root = this
             .update(cx, |workspace, cx| {
@@ -350,9 +353,10 @@ async fn wait_for_project_root(
                     .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
             })
             .ok()?;
-        if let Some(root) = root {
-            return Some(root);
+        if root.is_some() && root == previous {
+            return root;
         }
+        previous = root;
         if waited >= deadline {
             return None;
         }
