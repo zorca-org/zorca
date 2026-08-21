@@ -28,100 +28,105 @@
   <img src="website/zorca-workspace.webp" alt="ZOrca showing project worktrees, an agent terminal, and repository files" width="960" />
 </p>
 
-ZOrca is a native **Agent Development Environment** built on
-[Zed](https://github.com/zed-industries/zed). Give every coding agent its own
-Git worktree, terminal, and diff across local and SSH-connected projects, then
-restore its project and session context when you return.
+ZOrca is a native **Agent Development Environment** that uses
+[Zed](https://github.com/zed-industries/zed) as its foundation. Each coding
+agent gets a Git worktree, terminal, and diff. ZOrca supports local and
+SSH-connected projects. When you return, ZOrca restores the project and session
+context.
 
-Use the agent CLI you already have. Keep its work visible. Review and commit
-without rebuilding your development workflow around a terminal wrapper.
+ZOrca works with the agent CLI that you already use. It keeps agent work
+visible. Your existing development workflow remains in place. ZOrca does not
+use a terminal wrapper.
 
 <p align="center">
   <strong>Zed + Orca = ZOrca</strong><br />
-  <sub>Zed's native editor foundation with an Orca-inspired workspace-first approach.</sub>
+  <sub>The native editor foundation from Zed with an Orca-inspired, workspace-first approach.</sub>
 </p>
 
-## ZOrca is right for you if
+## When to use ZOrca
 
-- You run **Claude Code, Codex, or another terminal agent** across real repositories.
-- You want several agents working in parallel **without sharing one checkout**.
-- You work across **multiple local or SSH-connected projects**.
-- You want projects and agent sessions to **resume after an app or connection restart**.
-- You want the terminal, files, diff, staging, and history **in one native workspace**.
-- You want Zed's editor depth without making hosted AI the centre of the product.
+ZOrca is a good fit in these situations:
+
+- You use **Claude Code, Codex, or another terminal agent** across repositories.
+- You run several agents at the same time and do not want them to share one checkout.
+- You use **local and SSH-connected projects**.
+- You want ZOrca to restore projects and agent sessions after an app or connection restart.
+- You want the terminal, files, diff, staging area, and history in **one native workspace**.
+- You want the full editor from Zed without hosted AI at the center of the product.
 
 ## How it works
 
-| | Step | What stays together |
-| --- | --- | --- |
-| **01** | Open a project | Repository, local or remote connection, and worktrees |
-| **02** | Start an agent | One worktree with as many terminal tabs as you need |
-| **03** | Review the result | Active terminal, files, diff, staging, commit, and history |
-| **04** | Return later | Project tree, active workspace, and persistent terminal sessions |
+Use this workflow:
+
+1. Open a project. ZOrca keeps the repository, local or remote connection, and worktrees together.
+2. Start an agent. ZOrca gives the agent one worktree and as many terminal tabs as you need.
+3. Review the result. The terminal stays visible while you inspect files and diffs, stage changes, commit, and browse history.
+4. Return later. ZOrca restores the project tree, active workspace, and persistent terminal sessions.
 
 ## Features
 
-### Resume projects and sessions
+### Project and session restoration
 
-Keep local and SSH-connected repositories in one sidebar. ZOrca saves the
-project tree, active workspace, and agent terminal sessions, then restores that
-context when the app or connection returns. Persistent sessions reconnect when
-available or can be recreated in place.
+ZOrca keeps local and SSH-connected repositories in one sidebar. It saves the
+project tree, active workspace, and agent terminal sessions. When the app or
+connection returns, ZOrca restores that context. Persistent sessions reconnect
+after they become available. You can also recreate them in place.
 
 <p align="center">
   <a href="website/zorca-projects.mp4"><img src="docs/images/zorca-projects-demo.gif" alt="ZOrca switching between coding agents in different projects" width="720" /></a>
 </p>
 
-### Give every agent its own worktree
+### Separate worktree for each agent
 
-Agents work in separate Git worktrees instead of colliding in one checkout.
-Each workspace keeps its terminal context and working files attributable to the
-agent using it.
+ZOrca gives each agent a separate Git worktree. Thus, agents do not change the
+same checkout. Each workspace keeps the terminal context and working files of
+its agent.
 
 <p align="center">
   <a href="website/zorca-worktree.mp4"><img src="docs/images/zorca-worktree-demo.gif" alt="ZOrca opening an isolated project worktree and its terminal context" width="720" /></a>
 </p>
 
-### Review terminals and changes together
+### Terminal and change review
 
-The Git cockpit follows the active workspace. Inspect diffs, stage changes,
-commit, and browse history without losing the agent terminal that produced the
-work.
+The Git cockpit follows the active workspace. You can inspect diffs, stage
+changes, commit, and browse history. The agent terminal stays visible during
+the review.
 
 <p align="center">
   <a href="website/zorca-git-review.mp4"><img src="docs/images/zorca-git-review-demo.gif" alt="ZOrca reviewing tracked and untracked changes beside an agent terminal" width="720" /></a>
 </p>
 
-## Zed's editor foundation, already built in
+## Editor features from Zed
 
-ZOrca reorganizes Zed around agent workspaces instead of rebuilding the editor
-underneath them.
+ZOrca reorganizes Zed for agent workspaces. It does not rebuild the editor.
 
 | Editing | Navigation and tooling |
 | --- | --- |
 | LSP and tree-sitter | Debugger and multibuffers |
-| Native Vim keybindings | Beautiful themes |
+| Native Vim keybindings | Themes |
 | Zed Extensions | `zed://` URLs |
 
-Also included today:
+ZOrca also includes these features:
 
-- Multiple repositories and worktrees in one sidebar
-- Local and remote workspaces over SSH
-- Persistent projects, workspace state, and agent terminal sessions
-- As many agent terminal tabs as needed per project worktree
-- Git diff, staging, commit, and history workflows
-- No hosted AI or required ZOrca account; GitHub Copilot remains optional
+- The sidebar supports multiple repositories and worktrees.
+- ZOrca supports local workspaces and SSH-connected remote workspaces.
+- ZOrca stores projects, workspace state, and agent terminal sessions.
+- Each project worktree supports as many agent terminal tabs as you need.
+- The Git tools support diffs, staging, commits, and history.
+- ZOrca does not provide hosted AI and does not require a ZOrca account. GitHub Copilot remains optional.
 
 ## Install
 
 > [!NOTE]
-> ZOrca is pre-alpha. There are no packaged or signed releases yet, so the
-> current installation path builds from source on macOS or Linux. Homebrew is
-> planned.
+> ZOrca is pre-alpha. It does not provide packaged or signed releases. The
+> source supports builds on macOS and Linux. The roadmap includes Homebrew
+> support.
 
 ### macOS
 
-Install the prerequisites from [Zed's macOS development guide](https://zed.dev/docs/development/macos), then:
+Install the prerequisites from the [macOS development guide from Zed](https://zed.dev/docs/development/macos).
+
+Then run these commands:
 
 ```sh
 git clone https://github.com/zorca-org/zorca.git
@@ -129,7 +134,7 @@ cd zorca
 cargo zorca
 ```
 
-To build a `ZOrca.app` bundle:
+Build a `ZOrca.app` bundle with this command:
 
 ```sh
 script/bundle-mac
@@ -137,7 +142,9 @@ script/bundle-mac
 
 ### Linux
 
-Follow [Zed's Linux development guide](https://zed.dev/docs/development/linux), then:
+Install the prerequisites from the [Linux development guide from Zed](https://zed.dev/docs/development/linux).
+
+Then run these commands:
 
 ```sh
 git clone https://github.com/zorca-org/zorca.git
@@ -149,66 +156,75 @@ cargo zorca
 
 ## Where ZOrca fits
 
-ZOrca combines Zed's mature editor with agent-first workspaces. Zed is the
-polished upstream editor; [Orca](https://github.com/stablyai/orca) is the broader
-ADE today.
+ZOrca combines the Zed editor with agent workspaces. Zed is the upstream editor.
+[Orca](https://github.com/stablyai/orca) provides the broader ADE today.
 
 | Capability | ZOrca | Zed | Orca |
 | --- | --- | --- | --- |
 | **Workspace model** | Agent workspaces with Git worktrees | Project folders | Agent workspaces |
 | **Remote projects** | SSH workspaces | SSH projects | Remote workspaces |
-| **Agent terminals** | As many as needed per project worktree | Terminal dock | First-class |
-| **Automation and orchestration** | No; hands-on control only | No | Yes |
-| **Built-in AI** | None hosted; Copilot optional | Zed AI, hosted | Bring your own |
-| **Availability** | Desktop from source; mobile planned | Desktop app | Desktop and mobile apps |
+| **Agent terminals** | Multiple tabs per project worktree | Terminal dock | First-class |
+| **Automation and orchestration** | No. Hands-on control only. | No | Yes |
+| **Built-in AI** | No hosted AI. Copilot is optional. | Hosted Zed AI | Bring your own |
+| **Availability** | Desktop source builds. Mobile is on the roadmap. | Desktop app | Desktop and mobile apps |
 
-Choose **Zed** for the polished upstream editor and Zed's hosted AI. Choose
-**Orca** for fleet orchestration, automation, and mobile control. Choose
-**ZOrca** for Zed's native editor with a worktree-first layout and close,
-hands-on control of agents across projects.
+Choose **Zed** for the upstream editor and hosted AI from Zed.
 
-## Coming soon
+Choose **Orca** for fleet orchestration, automation, and mobile control.
 
-These are directions, not first-version capabilities. There are no promised dates.
+Choose **ZOrca** for the Zed editor, a worktree-first layout, and direct control
+of agents across projects.
 
-- **Agent communication bus** — workspace-scoped messaging so agents can exchange context and coordinate work
-- **Deeper agent integration** — better monitoring and direct interaction with running coding agents
-- **Mobile companion** — monitor and interact with workspaces away from the desktop
+## Planned directions
+
+These roadmap items are directions, not first-version capabilities. The project
+does not promise dates for them.
+
+The roadmap includes these directions:
+
+- An agent communication bus for workspace messages, context exchange, and agent coordination.
+- Deeper agent integration for better monitoring and direct interaction with active coding agents.
+- A mobile companion for workspace monitoring and interaction away from the desktop.
 
 ## Relationship to Zed
 
-ZOrca is an independent hard fork of Zed. It inherits Zed's Rust and GPUI
-foundation, editing engine, terminal rendering, Git tooling, extensions,
-accessibility, persistence, and platform support, but follows a separate product
-direction and release lifecycle.
+ZOrca is an independent hard fork of Zed. It uses the Rust and GPUI foundation
+from Zed. It also uses the editing engine, terminal renderer, Git tools,
+extensions, accessibility features, persistence, and platform support from Zed.
+ZOrca follows a separate product direction and release lifecycle.
 
-The fork reorganizes the workspace around projects, worktrees, and centre-pane
-agent terminals. Zed's hosted AI is removed; GitHub Copilot, the extension API,
-and `zed://` URLs remain available.
+The fork organizes the workspace around projects, worktrees, and agent
+terminals in the center pane. ZOrca removes hosted AI from Zed. GitHub Copilot,
+the extension API, and `zed://` URLs remain available.
 
-ZOrca does not promise compatibility with or routine synchronization from
-upstream Zed. Upstream fixes and improvements may be ported selectively when
-they fit ZOrca's direction. ZOrca-specific issues and contributions belong in
-this repository; changes that also apply cleanly to Zed may be proposed to
-[zed-industries/zed](https://github.com/zed-industries/zed) separately.
+ZOrca does not promise compatibility with Zed or routine synchronization with
+upstream changes. The project can port upstream fixes and improvements that fit
+the ZOrca direction.
+
+This repository accepts ZOrca-specific issues and contributions. The
+[Zed repository](https://github.com/zed-industries/zed) separately accepts
+changes that also apply to Zed.
 
 ## Project status
 
-ZOrca is pre-alpha. Expect breaking changes and expect to build it yourself.
+ZOrca is pre-alpha. You must build ZOrca from source. Breaking changes can occur.
 
-- No signed releases or automatic updates
-- Windows is not supported
-- Fleet orchestration and scheduled automation are not current capabilities
+The current release has these limits:
 
-ZOrca is an independent hard fork. It is not affiliated with or endorsed by Zed
-Industries or Stably AI.
+- ZOrca does not provide signed releases or automatic updates.
+- ZOrca does not support Windows.
+- ZOrca does not provide fleet orchestration or scheduled automation.
+
+ZOrca is an independent hard fork. Zed Industries and Stably AI do not endorse
+ZOrca. ZOrca has no affiliation with either company.
 
 ## Contributing
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) to build, test, and contribute.
+Read [CONTRIBUTING.md](./CONTRIBUTING.md) for instructions to build, test, and
+contribute.
 
 ## License
 
-ZOrca is licensed under GPL-3.0-or-later. Upstream copyright and license notices
-are preserved; see [LICENSE-GPL](./LICENSE-GPL) and
-[LICENSE-APACHE](./LICENSE-APACHE).
+ZOrca uses GPL-3.0-or-later. The repository preserves upstream copyright and
+license notices. Read [LICENSE-GPL](./LICENSE-GPL) and
+[LICENSE-APACHE](./LICENSE-APACHE) for details.
