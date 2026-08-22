@@ -472,7 +472,7 @@ mod tests {
     struct MissingLayoutBackend;
 
     impl SessionBackend for MissingLayoutBackend {
-        fn create(&self, _spec: &SessionSpec) -> Result<SessionId> {
+        fn create(&self, _spec: &SessionSpec, _expected: Option<&str>) -> Result<SessionId> {
             bail!("not used")
         }
 
@@ -480,11 +480,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SessionId) -> Result<bool> {
+        fn exists(&self, _id: &SessionId, _expected: Option<&str>) -> Result<bool> {
             Ok(false)
         }
 
-        fn attach(&self, _spec: &SessionSpec) -> Result<Attached> {
+        fn attach(&self, _spec: &SessionSpec, _expected: Option<&str>) -> Result<Attached> {
             bail!("not used")
         }
 
@@ -492,7 +492,7 @@ mod tests {
             Ok(())
         }
 
-        fn kill(&self, _id: &SessionId) -> Result<()> {
+        fn kill(&self, _id: &SessionId, _expected: Option<&str>) -> Result<()> {
             Ok(())
         }
 
@@ -505,7 +505,11 @@ mod tests {
             Ok(receiver)
         }
 
-        fn open_workspace(&self, _workspace_id: &str) -> Result<WorkspaceLayout> {
+        fn open_workspace(
+            &self,
+            _workspace_id: &str,
+            _expected: Option<&str>,
+        ) -> Result<WorkspaceLayout> {
             bail!("layout unavailable")
         }
     }

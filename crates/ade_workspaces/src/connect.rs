@@ -643,7 +643,11 @@ mod tests {
     }
 
     impl SessionBackend for UpgradeBackend {
-        fn create(&self, _spec: &SessionSpec) -> anyhow::Result<SessionId> {
+        fn create(
+            &self,
+            _spec: &SessionSpec,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<SessionId> {
             bail!("not used")
         }
 
@@ -651,11 +655,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SessionId) -> anyhow::Result<bool> {
+        fn exists(&self, _id: &SessionId, _expected: Option<&str>) -> anyhow::Result<bool> {
             Ok(false)
         }
 
-        fn attach(&self, _spec: &SessionSpec) -> anyhow::Result<Attached> {
+        fn attach(&self, _spec: &SessionSpec, _expected: Option<&str>) -> anyhow::Result<Attached> {
             bail!("not used")
         }
 
@@ -663,7 +667,7 @@ mod tests {
             Ok(())
         }
 
-        fn kill(&self, _id: &SessionId) -> anyhow::Result<()> {
+        fn kill(&self, _id: &SessionId, _expected: Option<&str>) -> anyhow::Result<()> {
             Ok(())
         }
 

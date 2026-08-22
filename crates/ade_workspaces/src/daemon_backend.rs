@@ -55,9 +55,9 @@
 //! still in the daemon's own listing, and [`Self::kill`] takes it with the rest.
 
 use crate::{
-    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, LayoutEvent, SessionBackend,
-    SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery, StatusEvent,
-    WorkspaceLayout, WorkspaceStatus,
+    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, Identified, LayoutEvent,
+    SessionBackend, SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery,
+    StatusEvent, WorkspaceLayout, WorkspaceStatus,
 };
 use ade_session::{
     EnsureOutcome, LOOPBACK_ADDRESS, LayoutDoc, LocalEndpoint, PRE_CUT_DIAGNOSIS, ReadFrameError,
@@ -201,6 +201,17 @@ pub enum DaemonUpgradeOutcome {
     UpToDate,
 }
 
+/// A control connection paired with its own handshake identity.
+struct Control {
+    connection: DaemonConnection,
+    instance_id: Option<String>,
+}
+
+/// `None` is permissive for rows created before daemon identities existed.
+fn identity_admits(expected: Option<&str>, actual: Option<&str>) -> bool {
+    expected.is_none_or(|expected| actual == Some(expected))
+}
+
 /// Sessions kept alive by the ADE session daemon on this machine.
 pub struct DaemonBackend {
     endpoint: Endpoint,
@@ -209,7 +220,7 @@ pub struct DaemonBackend {
     /// next call reconnects, and the proxy restarts the daemon if it really is
     /// gone. Sessions lost that way come back as exited `(lost)` rows rather
     /// than being quietly recreated.
-    connection: Mutex<Option<DaemonConnection>>,
+    connection: Mutex<Option<Control>>,
     next_request_id: AtomicU64,
     /// [`ANSWER_TIMEOUT`], except in tests that would otherwise have to sit
     /// through it to reach the failure they are about.
@@ -369,16 +380,52 @@ impl DaemonBackend {
     /// on the frame being waited past.
     fn request<T>(
         &self,
+        expected_daemon_id: Option<&str>,
         request_id: u64,
         request: Frame,
         want: impl Fn(&Frame) -> Option<T>,
     ) -> Result<T> {
+        self.request_seen(expected_daemon_id, request_id, request, want)
+            .map(|(value, _)| value)
+    }
+
+    /// [`Self::request`] with the identity of the connection that answered.
+    fn request_seen<T>(
+        &self,
+        expected_daemon_id: Option<&str>,
+        request_id: u64,
+        request: Frame,
+        want: impl Fn(&Frame) -> Option<T>,
+    ) -> Result<(T, Option<String>)> {
         let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
         let outcome = smol::block_on(async {
-            let connection = match slot.as_mut() {
-                Some(connection) => connection,
+            // Reconnect once before sending; a cached route may have moved.
+            if slot.as_ref().is_some_and(|control| {
+                !identity_admits(expected_daemon_id, control.instance_id.as_deref())
+            }) {
+                *slot = None;
+                self.endpoint.on_connection_lost();
+            }
+            let control = match slot.as_mut() {
+                Some(control) => control,
                 None => slot.insert(self.endpoint.connect().await?),
             };
+            // Authorization and send share the connection lock.
+            if !identity_admits(expected_daemon_id, control.instance_id.as_deref()) {
+                return anyhow::Ok(Err(format!(
+                    "this operation belongs to daemon {}, and {} answers as {}",
+                    bounded(expected_daemon_id.unwrap_or_default()),
+                    self.endpoint,
+                    bounded(
+                        control
+                            .instance_id
+                            .as_deref()
+                            .unwrap_or("an unnamed daemon")
+                    ),
+                )));
+            }
+            let seen = control.instance_id.clone();
+            let connection = &mut control.connection;
             connection.send(&request).await?;
             // Unarmed until the daemon spends a frame on something that is not
             // this request's answer — see [`ANSWER_TIMEOUT`].
@@ -403,7 +450,7 @@ impl DaemonBackend {
                 if let Some(reply) = &reply
                     && let Some(value) = want(reply)
                 {
-                    return anyhow::Ok(Ok(value));
+                    return anyhow::Ok(Ok((value, seen.clone())));
                 }
                 // Whatever it was, the daemon has now written something that
                 // was not the answer, so the wait stops being open-ended.
@@ -499,7 +546,7 @@ impl DaemonBackend {
 
     fn finish_upgrade(
         &self,
-        connection: &mut Option<DaemonConnection>,
+        connection: &mut Option<Control>,
         outcome: Result<DaemonUpgradeOutcome>,
     ) -> Result<DaemonUpgradeOutcome> {
         if !matches!(&outcome, Ok(DaemonUpgradeOutcome::UpToDate)) {
@@ -540,6 +587,8 @@ impl DaemonBackend {
     }
 
     /// The identity from the last successful handshake on either connection.
+    ///
+    /// Observational only; operations use [`Control::instance_id`].
     pub fn instance_id(&self) -> Option<String> {
         self.endpoint
             .identity
@@ -549,9 +598,18 @@ impl DaemonBackend {
     }
 
     /// Every session the daemon holds, exited ones included.
-    fn daemon_sessions(&self) -> Result<Vec<proto::SessionInfo>> {
+    fn daemon_sessions(&self, expected_daemon_id: Option<&str>) -> Result<Vec<proto::SessionInfo>> {
+        Ok(self.daemon_sessions_seen(expected_daemon_id)?.0)
+    }
+
+    /// [`Self::daemon_sessions`] with the identity that answered it.
+    fn daemon_sessions_seen(
+        &self,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(Vec<proto::SessionInfo>, Option<String>)> {
         let id = self.request_id();
-        self.request(
+        self.request_seen(
+            expected_daemon_id,
             id,
             Frame::ListSessions {
                 request_id: Some(id),
@@ -567,18 +625,60 @@ impl DaemonBackend {
         .context("listing the daemon's sessions")
     }
 
+    /// Every workspace record the daemon holds, with the identity that answered.
+    fn daemon_workspaces_seen(&self) -> Result<(Vec<BackendWorkspace>, Option<String>)> {
+        let request_id = self.request_id();
+        let (workspaces, seen) = self
+            .request_seen(
+                // Discovery has no persisted owner yet.
+                None,
+                request_id,
+                Frame::ListWorkspaces {
+                    request_id: Some(request_id),
+                },
+                |frame| match frame {
+                    Frame::WorkspaceList {
+                        workspaces,
+                        request_id: Some(reply_id),
+                    } if *reply_id == request_id => Some(workspaces.clone()),
+                    _ => None,
+                },
+            )
+            .context("listing the daemon's workspaces")?;
+        Ok((
+            workspaces
+                .into_iter()
+                .map(|workspace| BackendWorkspace {
+                    id: workspace.id,
+                    name: workspace.name,
+                    project_root: workspace.project_root,
+                    created_at: workspace.created_at,
+                })
+                .collect(),
+            seen,
+        ))
+    }
+
     /// The live session carrying `id` as its workspace id, newest first.
     ///
     /// Newest because a workspace can legitimately have a tombstone and a
     /// replacement (recreate after a crash); the one still running is the one
     /// the caller means.
-    fn live_session(&self, id: &SessionId) -> Result<Option<proto::SessionInfo>> {
-        Ok(newest_live(&self.daemon_sessions()?, id))
+    fn live_session(
+        &self,
+        id: &SessionId,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<Option<proto::SessionInfo>> {
+        Ok(newest_live(&self.daemon_sessions(expected_daemon_id)?, id))
     }
 
     /// Create the daemon session for `spec`, reaping any tombstone it replaces.
-    fn create_session(&self, spec: &SessionSpec) -> Result<proto::SessionInfo> {
-        let existing = self.daemon_sessions()?;
+    fn create_session(
+        &self,
+        spec: &SessionSpec,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(proto::SessionInfo, Option<String>)> {
+        let existing = self.daemon_sessions(expected_daemon_id)?;
         if newest_live(&existing, &spec.id).is_some() {
             bail!("a session for {} is already running", spec.id);
         }
@@ -590,11 +690,12 @@ impl DaemonBackend {
             .iter()
             .filter(|session| session.workspace_id == spec.id.as_str())
         {
-            self.kill_daemon_session(&tombstone.id)?;
+            self.kill_daemon_session(&tombstone.id, expected_daemon_id)?;
         }
 
         let request_id = self.request_id();
-        self.request(
+        self.request_seen(
+            expected_daemon_id,
             request_id,
             Frame::CreateSession {
                 // The seam's id, which is what makes a daemon session findable
@@ -629,19 +730,29 @@ impl DaemonBackend {
 
     /// The argv that gets a client onto one daemon session. No round trip: the
     /// binary and the address are the endpoint's, and the id is the caller's.
-    fn session_argv(&self, id: &proto::SessionId) -> Vec<String> {
+    fn session_argv(&self, id: &proto::SessionId, expected_daemon_id: Option<&str>) -> Vec<String> {
         let mut argv = vec![
             self.endpoint.bin_path.display().to_string(),
             "attach".to_owned(),
             id.to_string(),
         ];
         argv.extend(client_argv(&self.endpoint.address));
+        // The attach client owns a separate connection.
+        if let Some(expected) = expected_daemon_id {
+            argv.push("--expected-daemon-id".to_owned());
+            argv.push(expected.to_owned());
+        }
         argv
     }
 
-    fn kill_daemon_session(&self, id: &proto::SessionId) -> Result<()> {
+    fn kill_daemon_session(
+        &self,
+        id: &proto::SessionId,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         let request_id = self.request_id();
         self.request(
+            expected_daemon_id,
             request_id,
             Frame::Kill {
                 session_id: id.clone(),
@@ -661,11 +772,20 @@ impl DaemonBackend {
 }
 
 impl SessionBackend for DaemonBackend {
-    fn create(&self, spec: &SessionSpec) -> Result<SessionId> {
-        self.create_session(spec)?;
+    fn create(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<SessionId> {
+        self.create_session(spec, expected_daemon_id)?;
         // The seam's id, not the daemon's: the registry caches this, and it has
         // to be the same string `attach` and `exists` are called with later.
         Ok(spec.id.clone())
+    }
+
+    fn create_identified(
+        &self,
+        spec: &SessionSpec,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(SessionId, Option<String>)> {
+        let (_, daemon_id) = self.create_session(spec, expected_daemon_id)?;
+        Ok((spec.id.clone(), daemon_id))
     }
 
     /// A sibling session in a workspace the daemon already holds.
@@ -676,10 +796,16 @@ impl SessionBackend for DaemonBackend {
     /// the caller never mentioned. The daemon's `ensure_workspace` leaves an
     /// existing workspace record — and its layout — untouched, so the new
     /// session enters the document only when this window captures it.
-    fn create_session_in_workspace(&self, workspace_id: &str, cwd: &Path) -> Result<String> {
+    fn create_session_in_workspace(
+        &self,
+        workspace_id: &str,
+        cwd: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<String> {
         let request_id = self.request_id();
         let session = self
             .request(
+                expected_daemon_id,
                 request_id,
                 Frame::CreateSession {
                     workspace_id: workspace_id.to_owned(),
@@ -712,9 +838,16 @@ impl SessionBackend for DaemonBackend {
     }
 
     fn list(&self) -> Result<Vec<SessionInfo>> {
+        Ok(self.list_identified()?.items)
+    }
+
+    fn list_identified(&self) -> Result<Identified<SessionInfo>> {
+        // Global discovery, so no fence — and the identity of the connection
+        // that answered comes back with the rows, because reading it afterwards
+        // could name the status connection's daemon instead.
+        let (sessions, daemon_id) = self.daemon_sessions_seen(None)?;
         let mut seen = HashSet::new();
-        Ok(self
-            .daemon_sessions()?
+        let items = sessions
             .into_iter()
             .filter(|session| session.status != SessionStatus::Exited)
             .filter(|session| !session.workspace_id.is_empty())
@@ -722,11 +855,12 @@ impl SessionBackend for DaemonBackend {
             .map(|session| SessionInfo {
                 id: SessionId::from(session.workspace_id),
             })
-            .collect())
+            .collect();
+        Ok(Identified { daemon_id, items })
     }
 
-    fn exists(&self, id: &SessionId) -> Result<bool> {
-        Ok(self.live_session(id)?.is_some())
+    fn exists(&self, id: &SessionId, expected_daemon_id: Option<&str>) -> Result<bool> {
+        Ok(self.live_session(id, expected_daemon_id)?.is_some())
     }
 
     /// Every workspace record the daemon holds, sessions or no sessions.
@@ -737,55 +871,46 @@ impl SessionBackend for DaemonBackend {
     /// case a listing of *sessions* cannot see, and exactly the one an empty
     /// registry most needs told about.
     fn list_workspaces(&self) -> Result<Vec<BackendWorkspace>> {
-        let request_id = self.request_id();
-        let workspaces = self
-            .request(
-                request_id,
-                Frame::ListWorkspaces {
-                    request_id: Some(request_id),
-                },
-                |frame| match frame {
-                    Frame::WorkspaceList {
-                        workspaces,
-                        request_id: Some(reply_id),
-                    } if *reply_id == request_id => Some(workspaces.clone()),
-                    _ => None,
-                },
-            )
-            .context("listing the daemon's workspaces")?;
-        Ok(workspaces
-            .into_iter()
-            .map(|workspace| BackendWorkspace {
-                id: workspace.id,
-                name: workspace.name,
-                project_root: workspace.project_root,
-                created_at: workspace.created_at,
-            })
-            .collect())
+        Ok(self.list_workspaces_identified()?.items)
     }
 
-    fn attach(&self, spec: &SessionSpec) -> Result<Attached> {
+    fn list_workspaces_identified(&self) -> Result<Identified<BackendWorkspace>> {
+        let (items, daemon_id) = self.daemon_workspaces_seen()?;
+        Ok(Identified { daemon_id, items })
+    }
+
+    fn attach(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<Attached> {
         // Attach-or-create, like tmux's `new-session -A`: the first open of a
         // workspace that has no session is one step, and reopening a pane on a
         // live one reattaches to everything still running in it.
-        let session = match self.live_session(&spec.id)? {
+        // Both the listing and possible create are fenced.
+        let session = match self.live_session(&spec.id, expected_daemon_id)? {
             Some(session) => session,
-            None => self.create_session(spec)?,
+            None => self.create_session(spec, expected_daemon_id)?.0,
         };
         Ok(Attached {
-            argv: self.session_argv(&session.id),
+            argv: self.session_argv(&session.id, expected_daemon_id),
             session_id: session.id.to_string(),
         })
     }
 
-    fn attach_session(&self, session_id: &str) -> Result<Vec<String>> {
-        Ok(self.session_argv(&proto::SessionId::new(session_id)))
+    fn attach_session(
+        &self,
+        session_id: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<Vec<String>> {
+        Ok(self.session_argv(&proto::SessionId::new(session_id), expected_daemon_id))
     }
 
-    fn open_workspace(&self, workspace_id: &str) -> Result<WorkspaceLayout> {
+    fn open_workspace(
+        &self,
+        workspace_id: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<WorkspaceLayout> {
         let request_id = self.request_id();
         let workspace = self
             .request(
+                expected_daemon_id,
                 request_id,
                 Frame::OpenWorkspace {
                     workspace_id: workspace_id.to_owned(),
@@ -807,9 +932,16 @@ impl SessionBackend for DaemonBackend {
         })
     }
 
-    fn update_layout(&self, workspace_id: &str, layout: &LayoutDoc, rev: u64) -> Result<()> {
+    fn update_layout(
+        &self,
+        workspace_id: &str,
+        layout: &LayoutDoc,
+        rev: u64,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         let request_id = self.request_id();
         self.request(
+            expected_daemon_id,
             request_id,
             Frame::UpdateLayout {
                 workspace_id: workspace_id.to_owned(),
@@ -830,8 +962,8 @@ impl SessionBackend for DaemonBackend {
         .with_context(|| format!("storing layout rev {rev} for workspace {workspace_id}"))
     }
 
-    fn kill_session(&self, session_id: &str) -> Result<()> {
-        self.kill_daemon_session(&proto::SessionId::new(session_id))
+    fn kill_session(&self, session_id: &str, expected_daemon_id: Option<&str>) -> Result<()> {
+        self.kill_daemon_session(&proto::SessionId::new(session_id), expected_daemon_id)
     }
 
     /// One frame, answered with the renamed workspace. The daemon holds the
@@ -843,9 +975,15 @@ impl SessionBackend for DaemonBackend {
     /// only this client believes in. A daemon old enough not to speak the
     /// envelope at all never gets this far: it fails the handshake, where
     /// §6.1's diagnosis names it.
-    fn rename_workspace(&self, workspace_id: &str, name: &str) -> Result<()> {
+    fn rename_workspace(
+        &self,
+        workspace_id: &str,
+        name: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         let request_id = self.request_id();
         self.request(
+            expected_daemon_id,
             request_id,
             Frame::RenameWorkspace {
                 workspace_id: workspace_id.to_owned(),
@@ -872,9 +1010,10 @@ impl SessionBackend for DaemonBackend {
     /// Not [`Self::kill`] with extra steps: that one takes the sessions and
     /// leaves the workspace behind, holding a layout full of tabs whose
     /// sessions are gone.
-    fn kill_workspace(&self, workspace_id: &str) -> Result<()> {
+    fn kill_workspace(&self, workspace_id: &str, expected_daemon_id: Option<&str>) -> Result<()> {
         let request_id = self.request_id();
         self.request(
+            expected_daemon_id,
             request_id,
             Frame::KillWorkspace {
                 workspace_id: workspace_id.to_owned(),
@@ -922,22 +1061,25 @@ impl SessionBackend for DaemonBackend {
         Ok(())
     }
 
-    fn kill(&self, id: &SessionId) -> Result<()> {
-        // Every row for this workspace, exited ones included: the caller asked
-        // for the session to be gone, and leaving a tombstone behind would make
-        // it reappear as "gone" instead of as never-created.
+    fn kill(&self, id: &SessionId, expected_daemon_id: Option<&str>) -> Result<()> {
+        // Include exited rows; the fenced listing cannot aim kills at a peer.
         for session in self
-            .daemon_sessions()?
+            .daemon_sessions(expected_daemon_id)?
             .iter()
             .filter(|session| session.workspace_id == id.as_str())
         {
-            self.kill_daemon_session(&session.id)?;
+            self.kill_daemon_session(&session.id, expected_daemon_id)?;
         }
         Ok(())
     }
 
-    fn reset_workspace_sessions(&self, id: &SessionId, directory: &Path) -> Result<()> {
-        self.kill(id)?;
+    fn reset_workspace_sessions(
+        &self,
+        id: &SessionId,
+        directory: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        self.kill(id, expected_daemon_id)?;
         if let Transport::Forwarded(link) = &self.endpoint.transport {
             link.recover_stale_daemon_processes(directory)?;
         }
@@ -1055,7 +1197,9 @@ async fn stream_status_once(
     known_workspaces: &mut HashMap<String, KnownWorkspace>,
     has_workspace_snapshot: &mut bool,
 ) -> Result<()> {
-    let mut connection = endpoint.connect().await?;
+    // The identity of this connection is deliberately dropped: the status
+    // channel observes, and never authorizes a control request.
+    let mut connection = endpoint.connect().await?.connection;
 
     // **Subscribe first, list second.** The daemon's events name its own
     // session ids while this crate's callers name workspaces, and the listing
@@ -1514,7 +1658,7 @@ impl Endpoint {
     /// [`Self::open`] + handshake, and what it rebuilds differs per transport —
     /// a fresh `--stdio-proxy` child locally, a fresh socket or loopback
     /// connect behind a forward.
-    async fn connect(&self) -> Result<DaemonConnection> {
+    async fn connect(&self) -> Result<Control> {
         if let Transport::Forwarded(link) = &self.transport {
             // Blocking, deliberately: `--ensure` and the forward are one
             // short ssh command and one process spawn, and bringing a
@@ -1528,10 +1672,12 @@ impl Endpoint {
             link.ensure_ready()?;
         }
         let (connection, ack) = handshaken(|| self.open()).await?;
-        // A nameless success clears stale identity; a failed handshake never
-        // reaches this assignment.
-        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id;
-        Ok(connection)
+        // Shared for observation only; requests use `Control::instance_id`.
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id.clone();
+        Ok(Control {
+            connection,
+            instance_id: ack.instance_id,
+        })
     }
 
     /// One connection, opened and not yet handshaken.
@@ -3097,6 +3243,12 @@ mod control_connection {
         KeepTalking(Frame),
         /// An answer whose handshake carries the specified identity.
         WithIdentity(Option<String>, Vec<Frame>),
+        /// Handshake under this identity, then report every frame it receives
+        /// to the test and answer a `ListSessions` with nothing.
+        ///
+        /// What proves a frame was *not* sent: a later request that does arrive
+        /// is the first thing the channel yields.
+        Watched(Option<String>, std::sync::mpsc::Sender<Frame>),
     }
 
     fn ack() -> proto::HelloAck {
@@ -3309,6 +3461,29 @@ mod control_connection {
                                 .expect("sending SessionList");
                             continue;
                         }
+                        if let Script::Watched(instance_id, seen) = script {
+                            let mut hello_ack = ack();
+                            hello_ack.instance_id = instance_id;
+                            daemon
+                                .send(&Frame::HelloAck(hello_ack))
+                                .await
+                                .expect("sending the ack");
+                            while let Ok(frame) = daemon.recv().await {
+                                if let Frame::ListSessions { request_id } = &frame {
+                                    daemon
+                                        .send(&Frame::SessionList {
+                                            sessions: Vec::new(),
+                                            request_id: *request_id,
+                                        })
+                                        .await
+                                        .expect("answering the listing");
+                                }
+                                if seen.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         let mut hello_ack = ack();
                         let (quiet_for, frames, repeated) = match script {
                             Script::EofDuringHandshake => continue,
@@ -3321,6 +3496,7 @@ mod control_connection {
                             }
                             Script::LegacySessionList(_) => unreachable!(),
                             Script::SubscriptionSnapshot { .. } => unreachable!(),
+                            Script::Watched(..) => unreachable!(),
                         };
                         daemon
                             .send(&Frame::HelloAck(hello_ack))
@@ -3377,7 +3553,7 @@ mod control_connection {
             },
         ])]);
 
-        let listed = bounded("the listing", move || backend.daemon_sessions());
+        let listed = bounded("the listing", move || backend.daemon_sessions(None));
         assert!(
             listed
                 .expect("the listing, not the unsolicited error")
@@ -3407,7 +3583,7 @@ mod control_connection {
             format!(
                 "{:#}",
                 backend
-                    .daemon_sessions()
+                    .daemon_sessions(None)
                     .expect_err("a reply that cannot match is not an answer to wait on")
             )
         });
@@ -3443,7 +3619,7 @@ mod control_connection {
             format!(
                 "{:#}",
                 backend
-                    .daemon_sessions()
+                    .daemon_sessions(None)
                     .expect_err("a daemon that only ever talks past a request is not answering it")
             )
         });
@@ -3500,7 +3676,7 @@ mod control_connection {
             }],
         )]);
 
-        let listed = bounded("the slow listing", move || backend.daemon_sessions());
+        let listed = bounded("the slow listing", move || backend.daemon_sessions(None));
         assert!(listed.expect("a slow answer is still an answer").is_empty());
     }
 
@@ -3528,11 +3704,13 @@ mod control_connection {
 
         let backend = bounded("the abandoned request", move || {
             backend
-                .daemon_sessions()
+                .daemon_sessions(None)
                 .expect_err("a reply that cannot match is not an answer to wait on");
             backend
         });
-        let listed = bounded("the listing after it", move || backend.daemon_sessions());
+        let listed = bounded("the listing after it", move || {
+            backend.daemon_sessions(None)
+        });
         assert!(
             listed
                 .expect("the host is still usable after one request gave up")
@@ -3547,7 +3725,7 @@ mod control_connection {
             request_id: Some(1),
         }])]);
         source
-            .daemon_sessions()
+            .daemon_sessions(None)
             .expect("establishing the control connection");
         let connection = source
             .connection
@@ -3604,7 +3782,7 @@ mod control_connection {
         let failure = format!(
             "{:#}",
             backend
-                .daemon_sessions()
+                .daemon_sessions(None)
                 .expect_err("an error against this rid answers the request")
         );
         assert!(
@@ -3626,7 +3804,9 @@ mod control_connection {
             }]),
         ]);
 
-        let listed = bounded("the retried handshake", move || backend.daemon_sessions());
+        let listed = bounded("the retried handshake", move || {
+            backend.daemon_sessions(None)
+        });
         assert!(listed.expect("the retry gets a healthy daemon").is_empty());
     }
 
@@ -3642,7 +3822,7 @@ mod control_connection {
 
     fn listed(backend: DaemonBackend) -> DaemonBackend {
         bounded("the listing", move || {
-            backend.daemon_sessions().expect("listing");
+            backend.daemon_sessions(None).expect("listing");
             backend
         })
     }
@@ -3694,11 +3874,191 @@ mod control_connection {
         force_reconnect(&backend);
         let backend = bounded("the failed reconnect", move || {
             backend
-                .daemon_sessions()
+                .daemon_sessions(None)
                 .expect_err("both attempts ended in EOF");
             backend
         });
         assert_eq!(backend.instance_id(), Some("host-instance-1".to_owned()));
+    }
+
+    /// **A refused operation costs the wrong daemon nothing.** The frame is
+    /// what kills a workspace, so the fence has to stop it before the write —
+    /// an error read off the wire afterwards would already be too late.
+    #[test]
+    fn a_destructive_request_for_another_daemon_is_never_sent() {
+        let (seen, received) = std::sync::mpsc::channel();
+        let backend = scripted_daemon(vec![Script::Watched(Some("daemon-a".to_owned()), seen)]);
+
+        let backend = bounded("the fenced kill", move || {
+            let refused = backend
+                .kill_workspace("ade-proj-000001", Some("daemon-b"))
+                .expect_err("a workspace held by another daemon");
+            assert!(
+                format!("{refused:#}").contains("daemon-b"),
+                "the refusal names the daemon the operation belongs to: {refused:#}"
+            );
+            // A permitted request on the same connection, so what the daemon
+            // received can be asserted rather than merely awaited.
+            backend.list().expect("an unfenced listing");
+            backend
+        });
+
+        assert!(
+            matches!(
+                received.recv().expect("the daemon received something"),
+                Frame::ListSessions { .. }
+            ),
+            "the kill reached the wrong daemon"
+        );
+        drop(backend);
+    }
+
+    /// A daemon too old to name itself must not inherit a named daemon's rows:
+    /// "no identity" is the answer every pre-identity daemon gives.
+    #[test]
+    fn an_expected_identity_refuses_a_nameless_daemon() {
+        let backend = scripted_daemon(vec![identity_listing(None, 1)]);
+
+        let refused = bounded("the fenced kill", move || {
+            backend
+                .kill_session("s1", Some("daemon-a"))
+                .expect_err("a nameless daemon cannot answer for a named one")
+        });
+        assert!(
+            format!("{refused:#}").contains("an unnamed daemon"),
+            "{refused:#}"
+        );
+    }
+
+    /// A cached connection to the daemon that has since been replaced is worth
+    /// one reconnect: nothing was written for this request, so nothing can be
+    /// written twice.
+    #[test]
+    fn a_cached_connection_to_another_daemon_is_reconnected_once() {
+        let backend = listed(scripted_daemon(vec![
+            identity_listing(Some("daemon-a"), 1),
+            Script::WithIdentity(
+                Some("daemon-b".to_owned()),
+                vec![Frame::WorkspaceRemoved {
+                    workspace_id: "ade-proj-000001".to_owned(),
+                    persisted: true,
+                    request_id: Some(2),
+                }],
+            ),
+        ]));
+
+        bounded("the fenced kill", move || {
+            backend
+                .kill_workspace("ade-proj-000001", Some("daemon-b"))
+                .expect("the replacement daemon answers it");
+        });
+    }
+
+    /// **The status channel observes; it never authorizes.** Both connections
+    /// handshake independently, so the identity a UI reads can already be the
+    /// next daemon's while the control connection still holds the last one.
+    #[test]
+    fn a_status_identity_cannot_authorize_a_control_request() {
+        let (seen, received) = std::sync::mpsc::channel();
+        let backend = scripted_daemon(vec![
+            Script::Watched(Some("daemon-a".to_owned()), seen.clone()),
+            Script::Watched(Some("daemon-a".to_owned()), seen),
+        ]);
+
+        let backend = bounded("the first listing", move || {
+            backend.list().expect("the listing that connects");
+            backend
+        });
+        assert!(matches!(
+            received.recv().expect("the listing arrived"),
+            Frame::ListSessions { .. }
+        ));
+        // What a status connection to a replacement daemon records.
+        *backend
+            .endpoint
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some("daemon-b".to_owned());
+
+        let backend = bounded("the fenced kill", move || {
+            backend
+                .kill_workspace("ade-proj-000001", Some("daemon-b"))
+                .expect_err("the control connection is still daemon-a's");
+            backend.list().expect("an unfenced listing still works");
+            backend
+        });
+        assert!(matches!(
+            received.recv().expect("the second listing arrived"),
+            Frame::ListSessions { .. }
+        ));
+        assert_eq!(
+            backend.instance_id(),
+            Some("daemon-a".to_owned()),
+            "the fresh control handshake replaces the stale status observation"
+        );
+        drop(backend);
+    }
+
+    /// A listing is attributed to the connection that answered it, not to
+    /// whatever the endpoint's shared identity says afterwards.
+    #[test]
+    fn a_listing_carries_the_identity_that_answered_it() {
+        let backend = scripted_daemon(vec![
+            Script::WithIdentity(
+                Some("daemon-a".to_owned()),
+                vec![Frame::SessionList {
+                    sessions: Vec::new(),
+                    request_id: Some(1),
+                }],
+            ),
+            Script::WithIdentity(
+                Some("daemon-a".to_owned()),
+                vec![Frame::WorkspaceList {
+                    workspaces: Vec::new(),
+                    request_id: Some(2),
+                }],
+            ),
+        ]);
+
+        let sessions = bounded("the session listing", move || {
+            let sessions = backend.list_identified().expect("the session listing");
+            // The status channel's answer, landing between the two listings.
+            *backend
+                .endpoint
+                .identity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some("daemon-b".to_owned());
+            force_reconnect(&backend);
+            let workspaces = backend
+                .list_workspaces_identified()
+                .expect("the workspace listing");
+            assert_eq!(workspaces.daemon_id.as_deref(), Some("daemon-a"));
+            sessions
+        });
+        assert_eq!(sessions.daemon_id.as_deref(), Some("daemon-a"));
+    }
+
+    /// The attach argv is where a persisted identity reaches the attach client,
+    /// which connects on its own and cannot be fenced from here.
+    #[test]
+    fn an_attach_argv_carries_the_expected_daemon_identity() {
+        let backend = scripted_daemon(Vec::new());
+
+        let argv = backend
+            .attach_session("s1", Some("daemon-a"))
+            .expect("the argv is built without a round trip");
+        assert_eq!(
+            argv.windows(2)
+                .find(|pair| pair[0] == "--expected-daemon-id"),
+            Some(["--expected-daemon-id".to_owned(), "daemon-a".to_owned()].as_slice()),
+        );
+        assert!(
+            !backend
+                .attach_session("s1", None)
+                .expect("the unfenced argv")
+                .contains(&"--expected-daemon-id".to_owned()),
+            "a legacy row names no daemon"
+        );
     }
 
     #[test]
@@ -3872,7 +4232,7 @@ mod control_connection {
         ]);
 
         let failure = bounded("the incompatible reconnect", move || {
-            backend.daemon_sessions()
+            backend.daemon_sessions(None)
         })
         .expect_err("the incompatible daemon must be surfaced to the connect flow");
         assert!(
@@ -4116,32 +4476,32 @@ mod tests {
 
         // Creating hands back the *caller's* id, so the registry can go on
         // caching the name it derived.
-        assert_eq!(backend.create(&spec).unwrap(), spec.id);
+        assert_eq!(backend.create(&spec, None).unwrap(), spec.id);
         assert_eq!(
             backend.list().unwrap(),
             vec![SessionInfo {
                 id: spec.id.clone()
             }]
         );
-        assert!(backend.exists(&spec.id).unwrap());
+        assert!(backend.exists(&spec.id, None).unwrap());
         assert!(
             !backend
-                .exists(&SessionId::from("ade-other-000002"))
+                .exists(&SessionId::from("ade-other-000002"), None)
                 .unwrap()
         );
 
         // Creating twice is refused rather than silently duplicated.
-        assert!(backend.create(&spec).is_err());
+        assert!(backend.create(&spec, None).is_err());
 
         // Detaching is a no-op that leaves everything running.
         backend.detach(&spec.id).unwrap();
-        assert!(backend.exists(&spec.id).unwrap());
+        assert!(backend.exists(&spec.id, None).unwrap());
 
-        backend.kill(&spec.id).unwrap();
-        assert!(!backend.exists(&spec.id).unwrap());
+        backend.kill(&spec.id, None).unwrap();
+        assert!(!backend.exists(&spec.id, None).unwrap());
         assert!(backend.list().unwrap().is_empty());
         // And killing what is already gone is the state the caller asked for.
-        backend.kill(&spec.id).unwrap();
+        backend.kill(&spec.id, None).unwrap();
     }
 
     #[test]
@@ -4150,9 +4510,9 @@ mod tests {
         let spec = spec("ade-main-000003", &dir);
 
         // Attach-or-create: nothing exists yet, and the argv still works.
-        let attached = backend.attach(&spec).unwrap();
+        let attached = backend.attach(&spec, None).unwrap();
         let argv = &attached.argv;
-        assert!(backend.exists(&spec.id).unwrap());
+        assert!(backend.exists(&spec.id, None).unwrap());
         assert_eq!(argv[0], "/opt/ade/ade-daemon");
         assert_eq!(argv[1], "attach");
         assert_eq!(argv[3], "--socket");
@@ -4161,12 +4521,12 @@ mod tests {
         // The id in the argv is the daemon's own, which is the only name the
         // client can attach by — and it comes back beside the argv, because a
         // creating attach is the one caller that cannot know it in advance.
-        let session = backend.live_session(&spec.id).unwrap().unwrap();
+        let session = backend.live_session(&spec.id, None).unwrap().unwrap();
         assert_eq!(argv[2], session.id.to_string());
         assert_eq!(attached.session_id, session.id.to_string());
 
         // Attaching again reattaches rather than creating a second session.
-        assert_eq!(backend.attach(&spec).unwrap(), attached);
+        assert_eq!(backend.attach(&spec, None).unwrap(), attached);
         assert_eq!(backend.list().unwrap().len(), 1);
     }
 
@@ -4174,18 +4534,18 @@ mod tests {
     fn a_new_backend_reattaches_after_the_app_disconnects_without_duplicating() {
         let (dir, server, backend) = backend();
         let spec = spec("ade-reconnect-000004", &dir);
-        let first = backend.attach(&spec).expect("the first app attaches");
+        let first = backend.attach(&spec, None).expect("the first app attaches");
         drop(backend);
 
         let reopened = DaemonBackend::connected_to(server.socket_path(), "/opt/ade/ade-daemon");
         let second = reopened
-            .attach(&spec)
+            .attach(&spec, None)
             .expect("the restarted app reattaches");
 
         assert_eq!(second, first);
         assert_eq!(
             reopened
-                .daemon_sessions()
+                .daemon_sessions(None)
                 .expect("listing after reconnect")
                 .into_iter()
                 .filter(|session| session.workspace_id == spec.id.as_str())
@@ -4203,18 +4563,18 @@ mod tests {
     fn a_workspace_holds_more_than_one_session() {
         let (dir, _server, backend) = backend();
         let spec = spec("ade-plural-000020", &dir);
-        backend.create(&spec).unwrap();
-        let first = backend.live_session(&spec.id).unwrap().unwrap().id;
+        backend.create(&spec, None).unwrap();
+        let first = backend.live_session(&spec.id, None).unwrap().unwrap().id;
 
         let second = backend
-            .create_session_in_workspace(spec.id.as_str(), dir.path())
+            .create_session_in_workspace(spec.id.as_str(), dir.path(), None)
             .unwrap();
         assert_ne!(second, first.to_string(), "the daemon mints a fresh id");
 
         // Both are the daemon's, both are in the workspace, and neither reaping
         // nor a one-live-session guard took the other.
         let held: Vec<String> = backend
-            .daemon_sessions()
+            .daemon_sessions(None)
             .unwrap()
             .into_iter()
             .filter(|session| session.workspace_id == spec.id.as_str())
@@ -4225,7 +4585,7 @@ mod tests {
 
         // The seam above is keyed by the workspace, so N sessions are still one
         // row and one dot.
-        assert!(backend.exists(&spec.id).unwrap());
+        assert!(backend.exists(&spec.id, None).unwrap());
         assert_eq!(
             backend.list().unwrap(),
             vec![SessionInfo {
@@ -4235,7 +4595,7 @@ mod tests {
 
         // A document naming both is accepted: the daemon validates that every
         // terminal tab is a session it owns, and both are.
-        let stored = backend.open_workspace(spec.id.as_str()).unwrap();
+        let stored = backend.open_workspace(spec.id.as_str(), None).unwrap();
         let both = LayoutDoc::new(ade_session::LayoutNode::leaf(vec![
             ade_session::Tab::Terminal {
                 session_id: first.clone(),
@@ -4245,37 +4605,40 @@ mod tests {
             },
         ]));
         backend
-            .update_layout(spec.id.as_str(), &both, stored.rev + 1)
+            .update_layout(spec.id.as_str(), &both, stored.rev + 1, None)
             .unwrap();
         assert_eq!(
-            backend.open_workspace(spec.id.as_str()).unwrap().layout,
+            backend
+                .open_workspace(spec.id.as_str(), None)
+                .unwrap()
+                .layout,
             both
         );
 
         // Closing one tab takes one session. The sibling keeps running and the
         // workspace record — layout and all — is untouched, which is what makes
         // this different from `kill`.
-        backend.kill_session(&second).unwrap();
-        assert!(backend.exists(&spec.id).unwrap());
+        backend.kill_session(&second, None).unwrap();
+        assert!(backend.exists(&spec.id, None).unwrap());
         let left: Vec<String> = backend
-            .daemon_sessions()
+            .daemon_sessions(None)
             .unwrap()
             .into_iter()
             .filter(|session| session.workspace_id == spec.id.as_str())
             .map(|session| session.id.to_string())
             .collect();
         assert_eq!(left, vec![first.to_string()]);
-        assert!(backend.open_workspace(spec.id.as_str()).is_ok());
+        assert!(backend.open_workspace(spec.id.as_str(), None).is_ok());
 
         let replacement = backend
-            .create_session_in_workspace(spec.id.as_str(), dir.path())
+            .create_session_in_workspace(spec.id.as_str(), dir.path(), None)
             .unwrap();
         let sibling = SessionSpec::new("ade-plural-sibling-000021", dir.path());
-        backend.create(&sibling).unwrap();
+        backend.create(&sibling, None).unwrap();
 
-        backend.kill(&spec.id).unwrap();
+        backend.kill(&spec.id, None).unwrap();
 
-        let remaining = backend.daemon_sessions().unwrap();
+        let remaining = backend.daemon_sessions(None).unwrap();
         assert!(
             !remaining
                 .iter()
@@ -4289,20 +4652,20 @@ mod tests {
             "a sibling workspace must remain alive: {remaining:?}"
         );
         assert!(
-            backend.open_workspace(spec.id.as_str()).is_ok(),
+            backend.open_workspace(spec.id.as_str(), None).is_ok(),
             "killing sessions must keep the workspace record"
         );
         assert!(
-            backend.open_workspace(sibling.id.as_str()).is_ok(),
+            backend.open_workspace(sibling.id.as_str(), None).is_ok(),
             "killing one workspace's sessions must keep its sibling"
         );
-        assert!(!backend.exists(&spec.id).unwrap());
+        assert!(!backend.exists(&spec.id, None).unwrap());
 
-        assert_eq!(backend.create(&spec).unwrap(), spec.id);
-        assert!(backend.exists(&spec.id).unwrap());
+        assert_eq!(backend.create(&spec, None).unwrap(), spec.id);
+        assert!(backend.exists(&spec.id, None).unwrap());
         assert!(
             backend
-                .daemon_sessions()
+                .daemon_sessions(None)
                 .unwrap()
                 .iter()
                 .all(|session| session.id.to_string() != replacement),
@@ -4318,12 +4681,12 @@ mod tests {
     fn a_layout_is_stored_against_a_revision_and_a_stale_write_loses() {
         let (dir, _server, backend) = backend();
         let spec = spec("ade-layout-000010", &dir);
-        backend.create(&spec).unwrap();
-        let session = backend.live_session(&spec.id).unwrap().unwrap();
+        backend.create(&spec, None).unwrap();
+        let session = backend.live_session(&spec.id, None).unwrap().unwrap();
 
         // The daemon made the workspace record when the session named it, and
         // seeded it with the one tab that session is.
-        let stored = backend.open_workspace(spec.id.as_str()).unwrap();
+        let stored = backend.open_workspace(spec.id.as_str(), None).unwrap();
         assert_eq!(
             stored.layout,
             LayoutDoc::single_terminal(session.id.clone()),
@@ -4344,27 +4707,30 @@ mod tests {
             ]),
         });
         backend
-            .update_layout(spec.id.as_str(), &split, stored.rev + 1)
+            .update_layout(spec.id.as_str(), &split, stored.rev + 1, None)
             .unwrap();
 
-        let reread = backend.open_workspace(spec.id.as_str()).unwrap();
+        let reread = backend.open_workspace(spec.id.as_str(), None).unwrap();
         assert_eq!(reread.layout, split);
         assert_eq!(reread.rev, stored.rev + 1);
 
         // The same revision again is a client writing from a view it has been
         // told is out of date. It loses, and learns that it lost.
         let error = backend
-            .update_layout(spec.id.as_str(), &split, stored.rev + 1)
+            .update_layout(spec.id.as_str(), &split, stored.rev + 1, None)
             .unwrap_err();
         assert!(
             format!("{error:#}").contains("stale"),
             "a refused write must say why: {error:#}"
         );
         // And the refusal changed nothing.
-        assert_eq!(backend.open_workspace(spec.id.as_str()).unwrap(), reread);
+        assert_eq!(
+            backend.open_workspace(spec.id.as_str(), None).unwrap(),
+            reread
+        );
 
         // A workspace nobody ever made has no layout to render.
-        assert!(backend.open_workspace("ade-nothing-000011").is_err());
+        assert!(backend.open_workspace("ade-nothing-000011", None).is_err());
     }
 
     /// An accepted layout reaches this client's *event* stream, because that is
@@ -4374,14 +4740,14 @@ mod tests {
     fn an_accepted_layout_comes_back_on_the_event_stream() {
         let (dir, _server, backend) = backend();
         let spec = spec("ade-layout-000012", &dir);
-        backend.create(&spec).unwrap();
-        let session = backend.live_session(&spec.id).unwrap().unwrap();
+        backend.create(&spec, None).unwrap();
+        let session = backend.live_session(&spec.id, None).unwrap().unwrap();
 
         let events = backend.subscribe_events().unwrap();
         // Drains the subscribe snapshot and proves the stream is live.
         smol::block_on(next_session(&events));
 
-        let stored = backend.open_workspace(spec.id.as_str()).unwrap();
+        let stored = backend.open_workspace(spec.id.as_str(), None).unwrap();
         let layout = LayoutDoc::new(ade_session::LayoutNode::leaf(vec![
             ade_session::Tab::Terminal {
                 session_id: session.id,
@@ -4391,7 +4757,7 @@ mod tests {
             },
         ]));
         backend
-            .update_layout(spec.id.as_str(), &layout, stored.rev + 1)
+            .update_layout(spec.id.as_str(), &layout, stored.rev + 1, None)
             .unwrap();
 
         let event = smol::block_on(async {
@@ -4413,21 +4779,21 @@ mod tests {
     fn killing_a_workspace_takes_its_sessions_and_its_record() {
         let (dir, _server, backend) = backend();
         let spec = spec("ade-layout-000014", &dir);
-        backend.create(&spec).unwrap();
-        assert!(backend.open_workspace(spec.id.as_str()).is_ok());
+        backend.create(&spec, None).unwrap();
+        assert!(backend.open_workspace(spec.id.as_str(), None).is_ok());
 
         let events = backend.subscribe_events().unwrap();
         // Drains the subscribe snapshot and proves the stream is live.
         smol::block_on(next_session(&events));
 
-        backend.kill_workspace(spec.id.as_str()).unwrap();
+        backend.kill_workspace(spec.id.as_str(), None).unwrap();
 
         // The sessions are gone, and so is the workspace they were in — unlike
         // `kill`, which would leave the record behind holding dead tabs.
         assert!(backend.list().unwrap().is_empty());
-        assert!(!backend.exists(&spec.id).unwrap());
+        assert!(!backend.exists(&spec.id, None).unwrap());
         assert!(
-            backend.open_workspace(spec.id.as_str()).is_err(),
+            backend.open_workspace(spec.id.as_str(), None).is_err(),
             "a killed workspace has no layout left to open"
         );
 
@@ -4445,7 +4811,7 @@ mod tests {
         // Killing what is already gone is refused rather than silently
         // succeeding: the caller above it falls back to the session kill, which
         // is what finishes the registry's side of the job.
-        assert!(backend.kill_workspace(spec.id.as_str()).is_err());
+        assert!(backend.kill_workspace(spec.id.as_str(), None).is_err());
     }
 
     /// What adoption reads: the workspaces the daemon holds, whether or not
@@ -4461,7 +4827,7 @@ mod tests {
         assert!(backend.list_workspaces().unwrap().is_empty());
 
         let spec = spec("ade-adopt-000020", &dir);
-        backend.create(&spec).unwrap();
+        backend.create(&spec, None).unwrap();
 
         let listed = backend.list_workspaces().unwrap();
         assert_eq!(listed.len(), 1);
@@ -4474,12 +4840,12 @@ mod tests {
 
         // A rename is the daemon's to own, so adoption sees the new name.
         backend
-            .rename_workspace(&workspace.id, "vector DB")
+            .rename_workspace(&workspace.id, "vector DB", None)
             .unwrap();
         assert_eq!(backend.list_workspaces().unwrap()[0].name, "vector DB");
 
         // Killed: gone from the listing, so there is nothing to adopt back.
-        backend.kill_workspace(spec.id.as_str()).unwrap();
+        backend.kill_workspace(spec.id.as_str(), None).unwrap();
         assert!(backend.list_workspaces().unwrap().is_empty());
     }
 
@@ -4489,10 +4855,10 @@ mod tests {
     fn attaching_by_session_id_names_the_client_without_creating_anything() {
         let (dir, _server, backend) = backend();
         let spec = spec("ade-layout-000013", &dir);
-        backend.create(&spec).unwrap();
-        let session = backend.live_session(&spec.id).unwrap().unwrap();
+        backend.create(&spec, None).unwrap();
+        let session = backend.live_session(&spec.id, None).unwrap().unwrap();
 
-        let argv = backend.attach_session(session.id.as_str()).unwrap();
+        let argv = backend.attach_session(session.id.as_str(), None).unwrap();
         assert_eq!(argv[0], "/opt/ade/ade-daemon");
         assert_eq!(argv[1], "attach");
         assert_eq!(argv[2], session.id.to_string());
@@ -4501,11 +4867,11 @@ mod tests {
         // A session id nobody owns still produces an argv — the client is what
         // discovers that, and nothing is created here either way.
         assert_eq!(backend.list().unwrap().len(), 1);
-        backend.attach_session("not-a-session").unwrap();
+        backend.attach_session("not-a-session", None).unwrap();
         assert_eq!(backend.list().unwrap().len(), 1);
 
         // And killing by the daemon's own id takes that one session.
-        backend.kill_session(session.id.as_str()).unwrap();
+        backend.kill_session(session.id.as_str(), None).unwrap();
         assert!(backend.list().unwrap().is_empty());
     }
 
@@ -4513,20 +4879,20 @@ mod tests {
     fn a_session_whose_process_is_gone_is_not_a_live_session() {
         let (dir, server, backend) = backend();
         let spec = spec("ade-main-000004", &dir);
-        backend.create(&spec).unwrap();
-        let session = backend.live_session(&spec.id).unwrap().unwrap();
+        backend.create(&spec, None).unwrap();
+        let session = backend.live_session(&spec.id, None).unwrap().unwrap();
 
         // The shell exits: the daemon keeps the row, and this seam stops
         // reporting it, so the workspace reads as disconnected upstairs.
         smol::block_on(server.sessions().write(&session.id, b"exit\n")).unwrap();
         eventually("the session to be reported dead", || {
-            !backend.exists(&spec.id).unwrap()
+            !backend.exists(&spec.id, None).unwrap()
         });
         assert!(backend.list().unwrap().is_empty());
 
         // Recreating replaces the tombstone instead of piling up beside it.
-        backend.create(&spec).unwrap();
-        assert!(backend.exists(&spec.id).unwrap());
+        backend.create(&spec, None).unwrap();
+        assert!(backend.exists(&spec.id, None).unwrap());
         assert_eq!(server.sessions().list().len(), 1);
     }
 
@@ -4539,7 +4905,7 @@ mod tests {
         // pushes a snapshot of it, and receiving that is also what proves the
         // subscription is live before anything below depends on it.
         let existing = spec("ade-existing-000005", &dir);
-        backend.create(&existing).unwrap();
+        backend.create(&existing, None).unwrap();
         let events = backend.subscribe_events().unwrap();
         let snapshot = smol::block_on(next_session(&events));
         assert_eq!(snapshot.id, existing.id);
@@ -4550,7 +4916,7 @@ mod tests {
 
         // And one that appears afterwards, which the daemon announces itself.
         let fresh = spec("ade-fresh-000006", &dir);
-        backend.create(&fresh).unwrap();
+        backend.create(&fresh, None).unwrap();
         let created = smol::block_on(next_for(&events, &fresh.id));
         assert_eq!(
             created.change,
@@ -4559,7 +4925,7 @@ mod tests {
         assert_eq!(created.change.status(), Some(WorkspaceStatus::Running));
 
         // Killing takes the row out, and that is pushed too.
-        backend.kill(&fresh.id).unwrap();
+        backend.kill(&fresh.id, None).unwrap();
         let removed = smol::block_on(next_for(&events, &fresh.id));
         assert_eq!(removed.change, SessionChange::Removed);
         assert_eq!(removed.change.status(), None);

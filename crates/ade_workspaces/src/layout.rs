@@ -2218,7 +2218,11 @@ mod tests {
     }
 
     impl SessionBackend for UnreachableBackend {
-        fn create(&self, spec: &SessionSpec) -> anyhow::Result<SeamSessionId> {
+        fn create(
+            &self,
+            spec: &SessionSpec,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<SeamSessionId> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2230,6 +2234,7 @@ mod tests {
             &self,
             workspace_id: &str,
             cwd: &std::path::Path,
+            _expected: Option<&str>,
         ) -> anyhow::Result<String> {
             self.created_working_directories
                 .lock()
@@ -2246,11 +2251,15 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SeamSessionId) -> anyhow::Result<bool> {
+        fn exists(&self, _id: &SeamSessionId, _expected: Option<&str>) -> anyhow::Result<bool> {
             Ok(false)
         }
 
-        fn attach(&self, spec: &SessionSpec) -> anyhow::Result<crate::Attached> {
+        fn attach(
+            &self,
+            spec: &SessionSpec,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<crate::Attached> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2258,7 +2267,11 @@ mod tests {
             bail!("no route to the host");
         }
 
-        fn attach_session(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        fn attach_session(
+            &self,
+            session_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<Vec<String>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2270,12 +2283,12 @@ mod tests {
             Ok(())
         }
 
-        fn kill(&self, id: &SeamSessionId) -> anyhow::Result<()> {
+        fn kill(&self, id: &SeamSessionId, _expected: Option<&str>) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("kill:{id}"));
             Ok(())
         }
 
-        fn kill_session(&self, session_id: &str) -> anyhow::Result<()> {
+        fn kill_session(&self, session_id: &str, _expected: Option<&str>) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2283,7 +2296,11 @@ mod tests {
             Ok(())
         }
 
-        fn kill_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        fn kill_workspace(
+            &self,
+            workspace_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2295,7 +2312,11 @@ mod tests {
             StatusDelivery::Push
         }
 
-        fn open_workspace(&self, workspace_id: &str) -> anyhow::Result<WorkspaceLayout> {
+        fn open_workspace(
+            &self,
+            workspace_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<WorkspaceLayout> {
             self.layouts
                 .lock()
                 .unwrap()
@@ -2312,6 +2333,7 @@ mod tests {
             workspace_id: &str,
             layout: &LayoutDoc,
             rev: u64,
+            _expected: Option<&str>,
         ) -> anyhow::Result<()> {
             self.calls
                 .lock()

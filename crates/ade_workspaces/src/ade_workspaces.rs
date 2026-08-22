@@ -40,9 +40,9 @@ pub use missing_tab::MissingTab;
 pub use registry::AdeWorkspaceRegistry;
 pub use rename_workspace_modal::open_rename_workspace_modal;
 pub use session_backend::{
-    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, LayoutEvent, SessionBackend,
-    SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery, StatusEvent,
-    WorkspaceEvent, WorkspaceLayout,
+    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, Identified, LayoutEvent,
+    SessionBackend, SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery,
+    StatusEvent, WorkspaceEvent, WorkspaceLayout,
 };
 pub use store::AdeWorkspaceStore;
 pub use terminal_pane::open_workspace_terminal;
