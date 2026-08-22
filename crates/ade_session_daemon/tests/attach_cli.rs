@@ -653,3 +653,102 @@ fn attaching_without_a_daemon_fails_instead_of_starting_one() {
         assert!(!socket.exists(), "no daemon was started");
     });
 }
+
+/// The daemon's own instance id, which is what `--expected-daemon-id` names.
+async fn daemon_id(socket: &Path) -> String {
+    let stream = UnixStream::connect(socket).await.expect("connecting");
+    let mut connection = Connection::new(stream);
+    connection
+        .handshake(Hello::current())
+        .await
+        .expect("handshake")
+        .instance_id
+        .expect("the daemon reports an instance id")
+}
+
+fn fenced_attach(socket: &Path, session_id: &str, expected: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_ade-daemon"))
+        .arg("attach")
+        .arg(session_id)
+        .arg("--socket")
+        .arg(socket)
+        .arg("--expected-daemon-id")
+        .arg(expected)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning the attach client")
+}
+
+/// An address outlives the daemon behind it — a socket path is rebound, a
+/// forwarded port is reused — so a terminal that names its daemon reaches that
+/// daemon and no other. Both halves against one real daemon: the id it reports
+/// attaches, any other id is refused before a frame goes out.
+#[test]
+fn attach_is_fenced_to_the_daemon_it_names() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut control = control(server.socket_path()).await;
+        let session = create(&mut control, dir.path(), "sh -c 'printf HELLO; sleep 30'").await;
+        watch_until(&mut control, &session.id, b"HELLO").await;
+        let id = daemon_id(server.socket_path()).await;
+
+        let mut client = fenced_attach(server.socket_path(), session.id.as_str(), &id);
+        let mut stdout = client.stdout.take().expect("piped stdout");
+        let seen = read_until(&mut stdout, b"HELLO").await;
+        assert!(
+            contains(&seen, b"HELLO"),
+            "the fenced attach did not replay the session: {seen:?}"
+        );
+        kill(&mut control, &session.id).await;
+        let status = within("the client to exit", client.status()).await;
+        assert!(status.expect("client status").success());
+
+        let client = fenced_attach(
+            server.socket_path(),
+            session.id.as_str(),
+            "some-other-daemon",
+        );
+        let output = within("the client to exit", client.output())
+            .await
+            .expect("client output");
+        assert!(!output.status.success(), "another daemon is an error");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("some-other-daemon") && stderr.contains(&id),
+            "the error names the daemon expected and the one that answered: {stderr}"
+        );
+    });
+}
+
+/// Attach-only, refused by name: a daemon does not check its own identity, and
+/// a proxy carries whatever the client behind it handshakes with.
+#[test]
+fn expected_daemon_id_is_only_for_attach() {
+    let dir = TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    smol::block_on(async {
+        let daemon = Command::new(env!("CARGO_BIN_EXE_ade-daemon"))
+            .arg("--ensure")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--expected-daemon-id")
+            .arg("daemon-a")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawning ade-daemon");
+        let output = within("ade-daemon to exit", daemon.output())
+            .await
+            .expect("its output");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--expected-daemon-id is only for attach"),
+            "the error says where the flag belongs: {stderr}"
+        );
+        // Refused before anything is started, the same as `--tcp` is.
+        assert!(!socket.exists(), "no daemon was started");
+    });
+}

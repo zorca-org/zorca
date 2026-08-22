@@ -63,6 +63,7 @@ fn main() -> anyhow::Result<()> {
     let mut socket_given = false;
     let mut tcp = None;
     let mut view_id = None;
+    let mut expected_daemon_id = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -99,6 +100,10 @@ fn main() -> anyhow::Result<()> {
                 Some(id) => view_id = Some(id),
                 None => bail!("--view-id needs an id"),
             },
+            "--expected-daemon-id" => match args.next() {
+                Some(id) => expected_daemon_id = Some(id),
+                None => bail!("--expected-daemon-id needs an id"),
+            },
             other => bail!("unknown argument {other:?}\n\n{USAGE}"),
         }
     }
@@ -121,7 +126,8 @@ fn main() -> anyhow::Result<()> {
             Some(address) => AttachConfig::tcp(address, session_id),
             None => AttachConfig::new(config.socket_path, session_id),
         }
-        .with_view_id(view_id);
+        .with_view_id(view_id)
+        .with_expected_daemon_id(expected_daemon_id);
         return smol::block_on(attach::run(attach_config));
     }
 
@@ -129,6 +135,11 @@ fn main() -> anyhow::Result<()> {
     // itself; a loopback address only ever names the local end of a forward.
     if tcp.is_some() {
         bail!("--tcp is only for attach\n\n{USAGE}");
+    }
+    // A daemon does not check its own identity, and a proxy carries whatever
+    // the client behind it handshakes with.
+    if expected_daemon_id.is_some() {
+        bail!("--expected-daemon-id is only for attach\n\n{USAGE}");
     }
 
     if ensure {
@@ -165,6 +176,7 @@ Usage: ade-daemon [--socket <path>] [--state-dir <dir>]
        ade-daemon --ensure [--socket <path>] [--state-dir <dir>]
        ade-daemon attach <session-id> [--socket <path> | --tcp <address>]
                                       [--view-id <id>]
+                                      [--expected-daemon-id <id>]
 
 Options:
       --stdio-proxy       Pipe stdin/stdout to the daemon socket, starting a
@@ -187,6 +199,11 @@ Options:
       --view-id <id>      Which terminal view this attach draws, so the daemon
                           can hold the pty at this view's size while it has
                           focus. Attach only.
+      --expected-daemon-id <id>
+                          Which daemon instance this terminal is for. If the
+                          daemon answering is another one, or reports no id,
+                          the attach fails instead of reaching a stranger's
+                          session. Attach only.
       --state-dir <dir>   Where sessions.json lives (default: ~/.ade/daemon)
   -V, --version           Print the version and exit
   -h, --help              Print this help and exit";
@@ -205,6 +222,7 @@ fn main() -> anyhow::Result<()> {
     let mut attach_to = None;
     let mut tcp = None;
     let mut view_id = None;
+    let mut expected_daemon_id = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -228,6 +246,10 @@ fn main() -> anyhow::Result<()> {
                 Some(id) => view_id = Some(id),
                 None => bail!("--view-id needs an id"),
             },
+            "--expected-daemon-id" => match args.next() {
+                Some(id) => expected_daemon_id = Some(id),
+                None => bail!("--expected-daemon-id needs an id"),
+            },
             // Not "unsupported flag": there is no Unix socket to name on this
             // client, which is the whole reason `--tcp` exists.
             "--socket" => bail!(
@@ -250,7 +272,9 @@ fn main() -> anyhow::Result<()> {
         bail!("attach needs --tcp <address> on Windows\n\n{USAGE}");
     };
     smol::block_on(attach::run(
-        AttachConfig::tcp(address, session_id).with_view_id(view_id),
+        AttachConfig::tcp(address, session_id)
+            .with_view_id(view_id)
+            .with_expected_daemon_id(expected_daemon_id),
     ))
 }
 
@@ -259,6 +283,7 @@ const USAGE: &str = "\
 ade-daemon — the ADE per-host session daemon (Windows: attach only)
 
 Usage: ade-daemon attach <session-id> --tcp <address> [--view-id <id>]
+                                                      [--expected-daemon-id <id>]
 
 Options:
       attach <id>         Attach this terminal to a session on a host's daemon:
@@ -271,6 +296,11 @@ Options:
       --view-id <id>      Which terminal view this attach draws, so the daemon
                           can hold the pty at this view's size while it has
                           focus.
+      --expected-daemon-id <id>
+                          Which daemon instance this terminal is for. If the
+                          daemon answering is another one, or reports no id,
+                          the attach fails instead of reaching a stranger's
+                          session.
   -V, --version           Print the version and exit
   -h, --help              Print this help and exit
 
