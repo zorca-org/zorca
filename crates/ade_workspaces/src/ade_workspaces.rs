@@ -250,6 +250,9 @@ pub struct AdeWorkspace {
     /// The backend's session id — a tmux session name today — once a session
     /// has been created for this workspace. See [`SessionId`].
     pub terminal_session_id: Option<String>,
+    /// The daemon's own identity, as of this row's last adoption, rebind, or
+    /// creation. `None` if the daemon reports no identity of its own.
+    pub daemon_id: Option<String>,
     pub status: WorkspaceStatus,
     pub created_at: OffsetDateTime,
     pub last_opened_at: OffsetDateTime,
@@ -273,6 +276,7 @@ impl AdeWorkspace {
             remote_host: None,
             remote_workspace_path: None,
             terminal_session_id: None,
+            daemon_id: None,
             status: WorkspaceStatus::Creating,
             created_at: now,
             last_opened_at: now,
@@ -360,7 +364,7 @@ pub(crate) fn now_whole_seconds() -> OffsetDateTime {
 
 /// Column order shared by the registry's `SELECT`/`INSERT` statements and by
 /// the [`Bind`]/[`Column`] impls below.
-const COLUMN_COUNT: usize = 11;
+const COLUMN_COUNT: usize = 12;
 
 impl StaticColumnCount for AdeWorkspace {
     fn column_count() -> usize {
@@ -378,6 +382,7 @@ impl Bind for AdeWorkspace {
         let next_index = statement.bind(&self.remote_host, next_index)?;
         let next_index = statement.bind(&self.remote_workspace_path, next_index)?;
         let next_index = statement.bind(&self.terminal_session_id, next_index)?;
+        let next_index = statement.bind(&self.daemon_id, next_index)?;
         let next_index = statement.bind(&self.status, next_index)?;
         let next_index = statement.bind(&self.created_at.unix_timestamp(), next_index)?;
         statement.bind(&self.last_opened_at.unix_timestamp(), next_index)
@@ -394,6 +399,7 @@ impl Column for AdeWorkspace {
         let (remote_host, next_index) = Option::<String>::column(statement, next_index)?;
         let (remote_workspace_path, next_index) = Option::<PathBuf>::column(statement, next_index)?;
         let (terminal_session_id, next_index) = Option::<String>::column(statement, next_index)?;
+        let (daemon_id, next_index) = Option::<String>::column(statement, next_index)?;
         let (status, next_index) = WorkspaceStatus::column(statement, next_index)?;
         let (created_at, next_index) = i64::column(statement, next_index)?;
         let (last_opened_at, next_index) = i64::column(statement, next_index)?;
@@ -407,6 +413,7 @@ impl Column for AdeWorkspace {
             remote_host,
             remote_workspace_path,
             terminal_session_id,
+            daemon_id,
             status,
             created_at: OffsetDateTime::from_unix_timestamp(created_at)?,
             last_opened_at: OffsetDateTime::from_unix_timestamp(last_opened_at)?,
