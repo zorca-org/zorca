@@ -531,6 +531,13 @@ pub trait SessionBackend: Send + Sync {
     /// onwards — post to a channel, wake a task — and must never call back into
     /// the backend.
     fn observe_daemon_freshness(&self, _observer: DaemonFreshnessObserver) {}
+
+    /// This host's daemon identity, as of the last successful handshake —
+    /// `None` before any handshake or for a backend with no identity of its
+    /// own. Read-only and non-blocking, like [`Self::daemon_stale`].
+    fn instance_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Run when a backend learns that its host's daemon is, or is no longer,

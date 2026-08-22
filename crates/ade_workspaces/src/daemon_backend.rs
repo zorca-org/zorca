@@ -325,6 +325,7 @@ impl DaemonBackend {
                     state_dir,
                 },
             ))),
+            identity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -342,6 +343,7 @@ impl DaemonBackend {
             address: LocalEndpoint::Socket(socket_path.into()),
             state_dir: PathBuf::new(),
             transport: Transport::Direct,
+            identity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -535,6 +537,15 @@ impl DaemonBackend {
         if let Transport::Forwarded(link) = &self.endpoint.transport {
             link.observe_daemon_freshness(observer);
         }
+    }
+
+    /// The identity from the last successful handshake on either connection.
+    pub fn instance_id(&self) -> Option<String> {
+        self.endpoint
+            .identity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// Every session the daemon holds, exited ones included.
@@ -895,6 +906,10 @@ impl SessionBackend for DaemonBackend {
     /// See [`DaemonBackend::observe_daemon_freshness`].
     fn observe_daemon_freshness(&self, observer: DaemonFreshnessObserver) {
         DaemonBackend::observe_daemon_freshness(self, observer);
+    }
+
+    fn instance_id(&self) -> Option<String> {
+        DaemonBackend::instance_id(self)
     }
 
     fn detach(&self, _: &SessionId) -> Result<()> {
@@ -1430,6 +1445,8 @@ struct Endpoint {
     address: LocalEndpoint,
     state_dir: PathBuf,
     transport: Transport,
+    /// Shared by the independently opened control and status connections.
+    identity: Arc<Mutex<Option<String>>>,
 }
 
 /// How [`Endpoint::address`] is reached.
@@ -1457,6 +1474,7 @@ impl Endpoint {
             address: LocalEndpoint::Socket(expand_home(DEFAULT_SOCKET_PATH)),
             state_dir: expand_home(DEFAULT_STATE_DIR),
             transport: Transport::Proxy,
+            identity: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1482,6 +1500,7 @@ impl Endpoint {
             // this would feed is never built for a forwarded endpoint.
             state_dir: PathBuf::new(),
             transport: Transport::Forwarded(Arc::new(HostLink::new(host, address))),
+            identity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1508,7 +1527,11 @@ impl Endpoint {
             // answer anyway.
             link.ensure_ready()?;
         }
-        handshaken(|| self.open()).await
+        let (connection, ack) = handshaken(|| self.open()).await?;
+        // A nameless success clears stale identity; a failed handshake never
+        // reaches this assignment.
+        *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id;
+        Ok(connection)
     }
 
     /// One connection, opened and not yet handshaken.
@@ -1595,7 +1618,7 @@ impl Endpoint {
 /// diagnosed. Anything else is an *answer*: a generation outside this client's
 /// range, an explicit error frame, a spawn that failed. Retrying an answer
 /// would just get it twice.
-async fn handshaken<C, F>(open: C) -> Result<DaemonConnection>
+async fn handshaken<C, F>(open: C) -> Result<(DaemonConnection, proto::HelloAck)>
 where
     C: Fn() -> F,
     F: Future<Output = Result<DaemonConnection>>,
@@ -1604,7 +1627,7 @@ where
     loop {
         let mut connection = open().await?;
         let error = match connection.handshake().await {
-            Ok(()) => return Ok(connection),
+            Ok(ack) => return Ok((connection, ack)),
             Err(error) => error,
         };
         // Before the delay, not after: the failed connection is a proxy child
@@ -2359,7 +2382,7 @@ impl HostLink {
             })
             .await
             {
-                Ok(connection) => connection,
+                Ok((connection, _ack)) => connection,
                 Err(error) if force && is_incompatible_daemon(&error) => {
                     return self.kill_pre_cut_daemon(paths);
                 }
@@ -2552,7 +2575,7 @@ enum DaemonConnection {
 }
 
 impl DaemonConnection {
-    async fn handshake(&mut self) -> Result<()> {
+    async fn handshake(&mut self) -> Result<proto::HelloAck> {
         // Pinned at generation 2: this client still implements gen-2 semantics
         // (auto-created workspaces, the combined create), while the crate can
         // already speak 3. Announcing 3 would have the daemon hold it to the
@@ -2603,7 +2626,7 @@ impl DaemonConnection {
                 ack.host_os,
             );
         }
-        Ok(())
+        Ok(ack)
     }
 
     async fn send(&mut self, frame: &Frame) -> Result<()> {
@@ -3072,6 +3095,8 @@ mod control_connection {
         /// already-encoded bytes makes the writer a memcpy and the reader a
         /// JSON decode, which is the asymmetry the real case has.
         KeepTalking(Frame),
+        /// An answer whose handshake carries the specified identity.
+        WithIdentity(Option<String>, Vec<Frame>),
     }
 
     fn ack() -> proto::HelloAck {
@@ -3284,16 +3309,21 @@ mod control_connection {
                                 .expect("sending SessionList");
                             continue;
                         }
+                        let mut hello_ack = ack();
                         let (quiet_for, frames, repeated) = match script {
                             Script::EofDuringHandshake => continue,
                             Script::AnswerWith(frames) => (Duration::ZERO, frames, None),
                             Script::AnswerAfter(quiet_for, frames) => (quiet_for, frames, None),
                             Script::KeepTalking(frame) => (Duration::ZERO, Vec::new(), Some(frame)),
+                            Script::WithIdentity(instance_id, frames) => {
+                                hello_ack.instance_id = instance_id;
+                                (Duration::ZERO, frames, None)
+                            }
                             Script::LegacySessionList(_) => unreachable!(),
                             Script::SubscriptionSnapshot { .. } => unreachable!(),
                         };
                         daemon
-                            .send(&Frame::HelloAck(ack()))
+                            .send(&Frame::HelloAck(hello_ack))
                             .await
                             .expect("sending the ack");
                         let _request = daemon.recv().await;
@@ -3324,6 +3354,7 @@ mod control_connection {
             address: LocalEndpoint::Loopback(port),
             state_dir: PathBuf::new(),
             transport: Transport::Direct,
+            identity: Arc::new(Mutex::new(None)),
         });
         backend.answer_timeout = SCRIPTED_ANSWER_TIMEOUT;
         backend
@@ -3597,6 +3628,77 @@ mod control_connection {
 
         let listed = bounded("the retried handshake", move || backend.daemon_sessions());
         assert!(listed.expect("the retry gets a healthy daemon").is_empty());
+    }
+
+    fn identity_listing(instance_id: Option<&str>, request_id: u64) -> Script {
+        Script::WithIdentity(
+            instance_id.map(str::to_owned),
+            vec![Frame::SessionList {
+                sessions: Vec::new(),
+                request_id: Some(request_id),
+            }],
+        )
+    }
+
+    fn listed(backend: DaemonBackend) -> DaemonBackend {
+        bounded("the listing", move || {
+            backend.daemon_sessions().expect("listing");
+            backend
+        })
+    }
+
+    fn force_reconnect(backend: &DaemonBackend) {
+        *backend
+            .connection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    #[test]
+    fn instance_id_is_none_before_any_handshake() {
+        let backend = scripted_daemon(Vec::new());
+        assert_eq!(backend.instance_id(), None);
+    }
+
+    #[test]
+    fn a_successful_handshake_remembers_the_daemons_identity() {
+        let backend = listed(scripted_daemon(vec![identity_listing(
+            Some("host-instance-1"),
+            1,
+        )]));
+        assert_eq!(backend.instance_id(), Some("host-instance-1".to_owned()));
+    }
+
+    #[test]
+    fn a_nameless_successful_handshake_clears_a_stale_identity() {
+        let backend = listed(scripted_daemon(vec![
+            identity_listing(Some("host-instance-1"), 1),
+            identity_listing(None, 2),
+        ]));
+        assert_eq!(backend.instance_id(), Some("host-instance-1".to_owned()));
+
+        force_reconnect(&backend);
+        let backend = listed(backend);
+        assert_eq!(backend.instance_id(), None);
+    }
+
+    #[test]
+    fn a_failed_handshake_retains_the_last_successful_identity() {
+        let backend = listed(scripted_daemon(vec![
+            identity_listing(Some("host-instance-1"), 1),
+            Script::EofDuringHandshake,
+            Script::EofDuringHandshake,
+        ]));
+        assert_eq!(backend.instance_id(), Some("host-instance-1".to_owned()));
+
+        force_reconnect(&backend);
+        let backend = bounded("the failed reconnect", move || {
+            backend
+                .daemon_sessions()
+                .expect_err("both attempts ended in EOF");
+            backend
+        });
+        assert_eq!(backend.instance_id(), Some("host-instance-1".to_owned()));
     }
 
     #[test]
@@ -4511,6 +4613,7 @@ mod tests {
             address: LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock")),
             state_dir: PathBuf::from("/var/lib/ade"),
             transport: Transport::Proxy,
+            identity: Arc::new(Mutex::new(None)),
         };
         assert_eq!(
             endpoint.proxy_argv(),
@@ -4668,6 +4771,7 @@ mod tests {
             address: LocalEndpoint::Socket(PathBuf::from("/run/ade/daemon.sock")),
             state_dir: PathBuf::from("/var/lib/ade"),
             transport: Transport::Proxy,
+            identity: Arc::new(Mutex::new(None)),
         };
         assert_eq!(
             local.to_string(),
