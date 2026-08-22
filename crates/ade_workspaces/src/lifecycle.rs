@@ -551,6 +551,7 @@ impl WorkspaceLifecycleService {
             .filter(|candidate| {
                 candidate.id != workspace.id
                     && candidate.remote_host == workspace.remote_host
+                    && candidate.daemon_id == workspace.daemon_id
                     && (candidate.daemon_workspace_id() == daemon_workspace_id
                         || (candidate.project_id == workspace.project_id
                             && candidate.repository_path == workspace.repository_path))
@@ -737,11 +738,10 @@ impl WorkspaceLifecycleService {
     /// is [`AdeWorkspaceRegistry::delete_workspace`], and a killed one reads as
     /// never-created, ready to be recreated under the same name.
     ///
-    /// A backend with no workspace of its own — tmux — says so, and the
-    /// fallback is [`Self::kill_workspace_session`], which takes the sessions
-    /// this workspace is known to have. A daemon that has never heard of the
-    /// workspace lands in the same place, and the fallback is the one that
-    /// reports a failure if it fails too.
+    /// An identityless legacy backend may have no workspace record of its own;
+    /// its fallback is [`Self::kill_workspace_session`]. An identified daemon's
+    /// refusal must propagate, because falling back could hide an identity
+    /// mismatch while leaving the workspace record and layout behind.
     pub async fn kill_workspace(&self, id: &WorkspaceId) -> Result<AdeWorkspace> {
         let mut workspace = self.get(id)?;
         let backend = self.backend_for(&workspace)?;
@@ -749,6 +749,10 @@ impl WorkspaceLifecycleService {
             &workspace.daemon_workspace_id(),
             workspace.daemon_id.as_deref(),
         ) {
+            if workspace.daemon_id.is_some() {
+                return Err(error)
+                    .with_context(|| format!("killing daemon workspace {}", workspace.id));
+            }
             log::warn!(
                 "no workspace-level kill for {}, killing its session instead: {error:#}",
                 workspace.id
@@ -2566,6 +2570,45 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_an_identified_workspace_kill_never_falls_back_after_refusal() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_identified_kill_refusal").await;
+        let backend = Arc::new(
+            FakeBackend::new("local")
+                .identified("daemon-a")
+                .without_workspace_kill(),
+        );
+        let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
+        let workspace = service
+            .create_workspace("main", "project-a", "/repos/zed", None, None)
+            .await
+            .unwrap();
+        let session = workspace.daemon_workspace_id();
+
+        service
+            .kill_workspace(&workspace.id)
+            .await
+            .expect_err("an identified daemon refusal must propagate");
+
+        assert!(
+            backend
+                .calls()
+                .contains(&format!("kill_workspace:{session}|daemon-a"))
+        );
+        assert!(
+            !backend
+                .calls()
+                .contains(&format!("kill:{session}|daemon-a"))
+        );
+        assert_eq!(
+            service
+                .registry()
+                .get_workspace(workspace.id.clone())
+                .unwrap(),
+            Some(workspace)
+        );
+    }
+
+    #[gpui::test]
     async fn test_resetting_workspace_sessions_deletes_duplicates_and_preserves_target() {
         let registry =
             AdeWorkspaceRegistry::open_test_db("test_reset_workspace_sessions_scoped").await;
@@ -2743,6 +2786,43 @@ mod tests {
             Some(other_project),
             "resetting one project must not delete another project's registry row"
         );
+    }
+
+    #[gpui::test]
+    async fn test_reset_preserves_the_same_workspace_id_on_another_daemon() {
+        let registry =
+            AdeWorkspaceRegistry::open_test_db("test_reset_preserves_other_daemon").await;
+        let backend = Arc::new(FakeBackend::new("local").identified("daemon-a"));
+        let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
+        let session_id = "ade-main-000001".to_owned();
+        let target = AdeWorkspace {
+            terminal_session_id: Some(session_id.clone()),
+            daemon_id: Some("daemon-a".to_owned()),
+            ..AdeWorkspace::new("main", "project-a", "/repos/shared")
+        };
+        let other = AdeWorkspace {
+            terminal_session_id: Some(session_id),
+            daemon_id: Some("daemon-b".to_owned()),
+            ..AdeWorkspace::new("main-copy", "project-a", "/repos/shared")
+        };
+        service
+            .registry()
+            .create_workspace(target.clone())
+            .await
+            .unwrap();
+        service
+            .registry()
+            .create_workspace(other.clone())
+            .await
+            .unwrap();
+
+        service.reset_workspace_sessions(&target.id).await.unwrap();
+
+        assert_eq!(
+            service.registry().get_workspace(other.id.clone()).unwrap(),
+            Some(other)
+        );
+        assert!(!backend.calls().iter().any(|call| call.contains("daemon-b")));
     }
 
     #[gpui::test]

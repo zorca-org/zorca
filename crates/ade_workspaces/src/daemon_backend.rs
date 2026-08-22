@@ -1081,7 +1081,7 @@ impl SessionBackend for DaemonBackend {
     ) -> Result<()> {
         self.kill(id, expected_daemon_id)?;
         if let Transport::Forwarded(link) = &self.endpoint.transport {
-            link.recover_stale_daemon_processes(directory)?;
+            link.recover_stale_daemon_processes(directory, expected_daemon_id)?;
         }
         Ok(())
     }
@@ -1197,8 +1197,6 @@ async fn stream_status_once(
     known_workspaces: &mut HashMap<String, KnownWorkspace>,
     has_workspace_snapshot: &mut bool,
 ) -> Result<()> {
-    // The identity of this connection is deliberately dropped: the status
-    // channel observes, and never authorizes a control request.
     let mut connection = endpoint.connect().await?.connection;
 
     // **Subscribe first, list second.** The daemon's events name its own
@@ -1869,7 +1867,10 @@ fn pre_cut_kill_script(state_dir: &str, socket: &str) -> String {
 
 /// Reap terminal process groups an older daemon may have acknowledged before
 /// they actually exited. The exact remote worktree is the safety boundary.
-fn stale_daemon_recovery_script(directory: &Path) -> Result<String> {
+fn stale_daemon_recovery_script(
+    directory: &Path,
+    daemon_identity: Option<(&str, &str)>,
+) -> Result<String> {
     use ade_session::deploy::shell_quote;
 
     let directory = directory.to_str().with_context(|| {
@@ -1878,6 +1879,24 @@ fn stale_daemon_recovery_script(directory: &Path) -> Result<String> {
             directory.display()
         )
     })?;
+    let identity_guard = daemon_identity
+        .map(|(state_dir, expected_daemon_id)| {
+            format!(
+                concat!(
+                    "instance_file={instance_file}\n",
+                    "expected_daemon_id={expected_daemon_id}\n",
+                    "if ! actual_daemon_id=$(cat \"$instance_file\" 2>/dev/null) || [ -z \"$actual_daemon_id\" ]; then\n",
+                    "  echo \"cannot verify daemon identity at $instance_file\" >&2; exit 3\n",
+                    "fi\n",
+                    "if [ \"$actual_daemon_id\" != \"$expected_daemon_id\" ]; then\n",
+                    "  echo \"daemon identity mismatch at $instance_file\" >&2; exit 3\n",
+                    "fi\n",
+                ),
+                instance_file = shell_quote(&format!("{state_dir}/instance.id")),
+                expected_daemon_id = shell_quote(expected_daemon_id),
+            )
+        })
+        .unwrap_or_default();
     Ok(format!(
         concat!(
             "root={root}\n",
@@ -1885,6 +1904,7 @@ fn stale_daemon_recovery_script(directory: &Path) -> Result<String> {
             "  echo \"cannot enter the worktree at $root\" >&2; exit 2\n",
             "fi\n",
             "if [ \"$root\" = / ]; then echo \"refusing to recover every terminal on the host\" >&2; exit 2; fi\n",
+            "{identity_guard}",
             "[ -r /proc/$$/stat ] || exit 0\n",
             "own_stat=$(cat /proc/$$/stat) || exit 2\n",
             "set -- ${{own_stat##*) }}\n",
@@ -1918,6 +1938,7 @@ fn stale_daemon_recovery_script(directory: &Path) -> Result<String> {
             "exit 1\n",
         ),
         root = shell_quote(directory),
+        identity_guard = identity_guard,
     ))
 }
 
@@ -2605,15 +2626,33 @@ impl HostLink {
         Ok(())
     }
 
-    fn recover_stale_daemon_processes(&self, directory: &Path) -> Result<()> {
+    fn recover_stale_daemon_processes(
+        &self,
+        directory: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         use ade_session::deploy::HostExec as _;
 
+        let state_dir = expected_daemon_id
+            .map(|_| {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .paths
+                    .as_ref()
+                    .context("the remote daemon paths were not resolved")
+                    .map(|paths| paths.state_dir.clone())
+            })
+            .transpose()?;
         let output = self
             .host
             .run(&[
                 "sh".to_owned(),
                 "-c".to_owned(),
-                stale_daemon_recovery_script(directory)?,
+                stale_daemon_recovery_script(
+                    directory,
+                    state_dir.as_deref().zip(expected_daemon_id),
+                )?,
             ])
             .with_context(|| {
                 format!(
@@ -4412,15 +4451,20 @@ mod pre_cut_fallback_tests {
     #[test]
     #[cfg(unix)]
     fn stale_daemon_recovery_is_scoped_to_terminal_groups_in_the_worktree() {
-        let script =
-            super::stale_daemon_recovery_script(std::path::Path::new("/home/user name/repo"))
-                .expect("the remote worktree path should produce a script");
+        let script = super::stale_daemon_recovery_script(
+            std::path::Path::new("/home/user name/repo"),
+            Some(("/home/user name/.ade/daemon", "daemon-a")),
+        )
+        .expect("the remote worktree path should produce a script");
 
         assert!(script.contains("root='/home/user name/repo'"));
+        assert!(script.contains("instance_file='/home/user name/.ade/daemon/instance.id'"));
+        assert!(script.contains("expected_daemon_id='daemon-a'"));
         assert!(script.contains("\"$root\"|\"$root\"/*"));
         assert!(script.contains("tty=$5"));
         assert!(script.contains("kill -HUP -\"$group\""));
         assert!(script.contains("kill -KILL -\"$group\""));
+        assert!(script.find("actual_daemon_id=").unwrap() < script.find("kill -HUP").unwrap());
         assert!(script.contains("refusing to recover every terminal on the host"));
         assert!(
             smol::block_on(
@@ -4431,6 +4475,43 @@ mod pre_cut_fallback_tests {
             .expect("sh should parse the recovery script")
             .success()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn stale_daemon_recovery_refuses_the_wrong_or_missing_daemon() {
+        use std::{fs, process::Command};
+
+        let worktree = tempfile::TempDir::new().expect("temporary worktree");
+        let state = tempfile::TempDir::new().expect("temporary daemon state");
+        let instance_file = state.path().join("instance.id");
+        fs::write(&instance_file, "daemon-a\n").expect("writing daemon identity");
+
+        let run = |expected_daemon_id: Option<&str>| {
+            let state_dir = state.path().to_str().expect("UTF-8 state path");
+            let script = super::stale_daemon_recovery_script(
+                worktree.path(),
+                expected_daemon_id.map(|expected| (state_dir, expected)),
+            )
+            .expect("recovery script");
+            Command::new("sh")
+                .args(["-c", &script])
+                .output()
+                .expect("running recovery script")
+        };
+
+        assert!(run(Some("daemon-a")).status.success());
+
+        let mismatch = run(Some("daemon-b"));
+        assert!(!mismatch.status.success());
+        assert!(String::from_utf8_lossy(&mismatch.stderr).contains("daemon identity mismatch"));
+
+        fs::remove_file(instance_file).expect("removing daemon identity");
+        let missing = run(Some("daemon-a"));
+        assert!(!missing.status.success());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("cannot verify daemon identity"));
+
+        assert!(run(None).status.success());
     }
 }
 
