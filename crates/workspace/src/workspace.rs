@@ -941,7 +941,13 @@ impl ProjectItemRegistry {
                                     if let Some(broken_project_item_view) =
                                         cx.update(|window, cx| {
                                             T::for_broken_project_item(
-                                                abs_path, is_local, &e, window, cx,
+                                                project.clone(),
+                                                project_path.clone(),
+                                                abs_path,
+                                                is_local,
+                                                &e,
+                                                window,
+                                                cx,
                                             )
                                         })?
                                     {

@@ -78,7 +78,10 @@ pub use environment::ProjectEnvironment;
 
 use futures::{
     StreamExt,
-    channel::mpsc::{self, UnboundedReceiver},
+    channel::{
+        mpsc::{self, UnboundedReceiver},
+        oneshot,
+    },
     future::try_join_all,
 };
 pub use image_store::{ImageItem, ImageStore};
@@ -259,7 +262,27 @@ struct DownloadingFile {
     destination_path: PathBuf,
     chunks: Vec<u8>,
     total_size: u64,
-    file_id: Option<u64>, // Set when we receive the State message
+    file_id: Option<u64>,
+    completion: oneshot::Sender<Result<()>>,
+}
+
+impl DownloadingFile {
+    async fn save(self) {
+        let result = smol::fs::write(&self.destination_path, self.chunks)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to save downloaded file to {}",
+                    self.destination_path.display()
+                )
+            });
+        if let Err(result) = self.completion.send(result) {
+            match result {
+                Ok(()) => log::debug!("download task was dropped before the file was saved"),
+                Err(error) => log::error!("{error:#}"),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3195,6 +3218,7 @@ impl Project {
         let project_id = self.remote_id().unwrap_or(REMOTE_SERVER_PROJECT_ID);
         let downloading_files = self.downloading_files.clone();
         let path_str = path.as_unix_str().to_owned();
+        let (completion, completed) = oneshot::channel();
 
         static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let file_id = NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3207,12 +3231,13 @@ impl Project {
             file_id
         );
         downloading_files.lock().insert(
-            key,
+            key.clone(),
             DownloadingFile {
-                destination_path: destination_path,
+                destination_path,
                 chunks: Vec::new(),
                 total_size: 0,
                 file_id: Some(file_id),
+                completion,
             },
         );
         log::debug!(
@@ -3229,10 +3254,18 @@ impl Project {
                     path: path_str.clone(),
                     file_id,
                 })
-                .await?;
+                .await;
+
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    downloading_files.lock().remove(&key);
+                    return Err(error);
+                }
+            };
 
             log::debug!("download_file: got response, file_id={}", response.file_id);
-            // The file_id is set from the State message, we just confirm the request succeeded
+            completed.await.context("download was canceled")??;
             Ok(())
         })
     }
@@ -5917,7 +5950,7 @@ impl Project {
                     let key = (worktree_id, path);
                     log::debug!("handle_create_file_for_peer: looking up key={:?}", key);
 
-                    let empty_file_destination: Option<PathBuf> = {
+                    let empty_file = {
                         let mut files = downloading_files.lock();
                         log::trace!(
                             "handle_create_file_for_peer: current downloading_files keys: {:?}",
@@ -5940,28 +5973,14 @@ impl Project {
                         }
 
                         if state.content_size == 0 {
-                            // No chunks will arrive for an empty file; write it now.
-                            files.remove(&key).map(|entry| entry.destination_path)
+                            files.remove(&key)
                         } else {
                             None
                         }
                     };
 
-                    if let Some(destination) = empty_file_destination {
-                        log::debug!(
-                            "handle_create_file_for_peer: writing empty file to {:?}",
-                            destination
-                        );
-                        match smol::fs::write(&destination, &[] as &[u8]).await {
-                            Ok(_) => log::info!(
-                                "handle_create_file_for_peer: successfully wrote file to {:?}",
-                                destination
-                            ),
-                            Err(e) => log::error!(
-                                "handle_create_file_for_peer: failed to write empty file: {:?}",
-                                e
-                            ),
-                        }
+                    if let Some(empty_file) = empty_file {
+                        empty_file.save().await;
                     }
                 } else {
                     log::warn!("handle_create_file_for_peer: State has no file field");
@@ -5975,13 +5994,9 @@ impl Project {
                 );
 
                 // Extract data while holding the lock, then release it before await
-                let (key_to_remove, write_info): (
-                    Option<(WorktreeId, String)>,
-                    Option<(PathBuf, Vec<u8>)>,
-                ) = {
+                let completed_file = {
                     let mut files = downloading_files.lock();
-                    let mut found_key: Option<(WorktreeId, String)> = None;
-                    let mut write_data: Option<(PathBuf, Vec<u8>)> = None;
+                    let mut completed_key = None;
 
                     for (key, file_entry) in files.iter_mut() {
                         if file_entry.file_id == Some(chunk.file_id) {
@@ -5995,40 +6010,16 @@ impl Project {
                             if file_entry.chunks.len() as u64 >= file_entry.total_size
                                 && file_entry.total_size > 0
                             {
-                                let destination = file_entry.destination_path.clone();
-                                let content = std::mem::take(&mut file_entry.chunks);
-                                found_key = Some(key.clone());
-                                write_data = Some((destination, content));
+                                completed_key = Some(key.clone());
                             }
                             break;
                         }
                     }
-                    (found_key, write_data)
-                }; // MutexGuard is dropped here
+                    completed_key.and_then(|key| files.remove(&key))
+                };
 
-                // Perform the async write outside the lock
-                if let Some((destination, content)) = write_info {
-                    log::debug!(
-                        "handle_create_file_for_peer: writing {} bytes to {:?}",
-                        content.len(),
-                        destination
-                    );
-                    match smol::fs::write(&destination, &content).await {
-                        Ok(_) => log::info!(
-                            "handle_create_file_for_peer: successfully wrote file to {:?}",
-                            destination
-                        ),
-                        Err(e) => log::error!(
-                            "handle_create_file_for_peer: failed to write file: {:?}",
-                            e
-                        ),
-                    }
-                }
-
-                // Remove the completed entry
-                if let Some(key) = key_to_remove {
-                    downloading_files.lock().remove(&key);
-                    log::debug!("handle_create_file_for_peer: removed completed download entry");
+                if let Some(completed_file) = completed_file {
+                    completed_file.save().await;
                 }
             }
             None => {
