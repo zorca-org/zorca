@@ -541,9 +541,6 @@ pub mod agent {
             ReauthenticateAgent,
             /// Logs out of the current external agent
             LogoutAgent,
-            /// Add the current selection as context for threads in the agent panel.
-            #[action(deprecated_aliases = ["assistant::QuoteSelection", "agent::QuoteSelection"])]
-            AddSelectionToThread,
             /// Resets the agent panel zoom levels (agent UI and buffer font sizes).
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.

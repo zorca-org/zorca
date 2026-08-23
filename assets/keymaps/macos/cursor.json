@@ -17,8 +17,6 @@
     "bindings": {
       "cmd-i": "agent::ToggleFocus",
       "cmd-shift-i": "agent::ToggleFocus",
-      "cmd-shift-l": "agent::AddSelectionToThread", // In cursor uses "Ask" mode
-      "cmd-l": "agent::AddSelectionToThread", // In cursor uses "Agent" mode
     },
   },
   {

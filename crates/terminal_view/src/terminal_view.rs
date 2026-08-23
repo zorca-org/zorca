@@ -61,7 +61,6 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
-use zed_actions::agent::AddSelectionToThread;
 
 struct ImeState {
     marked_text: String,
@@ -541,7 +540,6 @@ impl TerminalView {
     pub fn deploy_context_menu(
         &mut self,
         position: GpuiPoint<Pixels>,
-        has_selection: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -563,19 +561,6 @@ impl TerminalView {
                 .when(
                     !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| menu.action("Clear", Box::new(Clear)),
-                )
-                // ponytail: was also gated on TerminalPanel::assistant_enabled, which died
-                // with the inline-assist subsystem. This whole entry goes in the agent-removal stage.
-                .when(
-                    !matches!(self.mode, TerminalMode::Embedded { .. }),
-                    |menu| {
-                        menu.separator().when(
-                            has_selection && self.shows_workspace_actions(),
-                            |menu| {
-                                menu.action("Add to Agent Thread", Box::new(AddSelectionToThread))
-                            },
-                        )
-                    },
                 )
                 .when(self.shows_workspace_actions(), |menu| {
                     menu.separator().action(
@@ -1394,15 +1379,7 @@ impl Render for TerminalView {
                                 terminal.select_word_at_event_position(event);
                             });
                         }
-                        let has_selection = !had_selection
-                            || this
-                                .terminal
-                                .read(cx)
-                                .last_content
-                                .selection_text
-                                .as_ref()
-                                .is_some_and(|text| !text.is_empty());
-                        this.deploy_context_menu(event.position, has_selection, window, cx);
+                        this.deploy_context_menu(event.position, window, cx);
                         cx.notify();
                     }
                 }),
