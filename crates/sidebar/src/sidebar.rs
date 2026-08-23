@@ -4662,6 +4662,11 @@ impl Sidebar {
     ) -> Option<AnyElement> {
         let can_create_worktree = context.can_create_worktree;
         let workspace_key = context.workspace_key.clone();
+        let daemon_upgrade_action = self.render_daemon_upgrade_action(
+            context,
+            "workspace-manager-row-upgrade-daemon-hover",
+            cx,
+        );
 
         Some(
             h_flex()
@@ -4694,6 +4699,7 @@ impl Sidebar {
                         )
                     },
                 )
+                .when_some(daemon_upgrade_action, |this, action| this.child(action))
                 .into_any_element(),
         )
     }
@@ -4701,6 +4707,7 @@ impl Sidebar {
     fn render_daemon_upgrade_action(
         &self,
         context: &WorkspaceRowContext,
+        button_id: &'static str,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let host = daemon_row_host(context.kind, context.ade_host.as_deref())?.to_owned();
@@ -4717,16 +4724,13 @@ impl Sidebar {
                     .size(IconSize::Small)
                     .color(Color::Success)
                     .into_any_element(),
-                DaemonIndicator::Upgrade => IconButton::new(
-                    "workspace-manager-row-upgrade-daemon-visible",
-                    IconName::ArrowUp,
-                )
-                .icon_size(IconSize::Small)
-                .tooltip(Tooltip::text("Upgrade Host Daemon"))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.upgrade_host_daemon(host.clone(), cx);
-                }))
-                .into_any_element(),
+                DaemonIndicator::Upgrade => IconButton::new(button_id, IconName::ArrowUp)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Upgrade Host Daemon"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.upgrade_host_daemon(host.clone(), cx);
+                    }))
+                    .into_any_element(),
             },
         )
     }
@@ -5408,7 +5412,11 @@ impl Sidebar {
                             .any(|path| path.matches(root, context.host_key.as_deref()))
                     });
                 let hover_actions = self.render_workspace_manager_row_actions(ix, &context, cx);
-                let daemon_upgrade_action = self.render_daemon_upgrade_action(&context, cx);
+                let daemon_upgrade_action = self.render_daemon_upgrade_action(
+                    &context,
+                    "workspace-manager-row-upgrade-daemon-visible",
+                    cx,
+                );
 
                 let rename_editor = match row_kind {
                     workspace_manager::RowKind::Group(id) => tree
