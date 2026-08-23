@@ -176,17 +176,14 @@ of agents across projects.
 
 ## Planned directions
 
-These roadmap items are directions, not current capabilities. The project does
-not promise dates for them.
+These roadmap items are planned directions. They are not current capabilities.
+The project does not promise dates for them.
 
 The roadmap includes these directions:
 
-- **REST API and CLI.** ZOrca will start a server that manages sessions, terminals, agents, and workspaces through a REST API. The CLI will use the same API. The project will evaluate OpenAPI for client generation.
-- **Mobile app.** The app will manage sessions, terminals, agents, and workspaces on a Mac or host that the user controls. It will connect through the REST API over Tailscale or a local network.
-- **Automations.** Cron schedules will start agents with automation prompts. The agents can run on the local machine or an SSH-connected remote host.
-
-The project will also evaluate a Cloudflare stack for mobile access, remote
-schedules, and API coordination. The final deployment model is not set.
+- **REST API and CLI.** ZOrca will support external control and integrations.
+- **Mobile app.** Users will manage workspaces and agent sessions away from the desktop.
+- **Automations.** Users will start agent work from saved prompts and schedules.
 
 ## Relationship to Zed
 
