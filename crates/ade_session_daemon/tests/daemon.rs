@@ -2972,6 +2972,48 @@ fn attach_repaints_at_the_last_resized_size() {
     });
 }
 
+/// A terminal can attach before its real pane size is known. When that pane
+/// later resizes, it must receive a repaint at the corrected size instead of
+/// keeping the tiny initial screen until the child happens to redraw.
+#[test]
+fn resize_after_attach_repaints_at_the_new_size() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut connection,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+
+        let mut viewer = client(server.socket_path()).await;
+        let _ = attach(&mut viewer, &session.id).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending Resize");
+
+        match recv(&mut viewer, "the resized repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                assert!(!contains(&bytes, b"\x1b[9;1H"), "{bytes:?}");
+                assert!(contains(&bytes, b"line12"), "{bytes:?}");
+            }
+            other => panic!("expected resized repaint, got {other:?}"),
+        }
+    });
+}
+
 /// A focus claim that arrives before its view attaches is honored the moment
 /// the view does: the repaint comes out at the focused ask, not at the
 /// smallest sibling's ask that stood in for it while the claim was pending.

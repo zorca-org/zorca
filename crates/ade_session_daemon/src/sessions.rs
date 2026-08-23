@@ -788,6 +788,31 @@ impl OutputHub {
         }
     }
 
+    /// Repaint one attached viewer after its effective terminal size changes.
+    fn repaint(&mut self, session_id: &SessionId, subscriber: SubscriberId) {
+        let Some(grid) = self.grid.as_ref() else {
+            return;
+        };
+        let Some(outbound) = self
+            .subscribers
+            .iter()
+            .find(|(id, _)| *id == subscriber)
+            .map(|(_, outbound)| outbound.clone())
+        else {
+            return;
+        };
+        let bytes = grid.repaint();
+        if bytes.len() as u64 + ATTACH_RESERVE_BYTES > outbound.free_bytes() {
+            return;
+        }
+        if !outbound.push(Frame::Output {
+            session_id: session_id.clone(),
+            bytes,
+        }) {
+            self.subscribers.retain(|(id, _)| *id != subscriber);
+        }
+    }
+
     /// `true` if `subscriber` was actually attached here.
     fn detach(&mut self, subscriber: SubscriberId) -> bool {
         let before = self.subscribers.len();
@@ -2270,7 +2295,7 @@ impl SessionTable {
         cols: u16,
         rows: u16,
     ) -> TableResult<()> {
-        let effective = {
+        let (effective, hub) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2291,9 +2316,13 @@ impl SessionTable {
             if effective == (session.cols, session.rows) {
                 return Ok(());
             }
-            effective
+            (effective, session.hub.clone())
         };
-        self.apply_size(id, effective.0, effective.1).await
+        self.apply_size(id, effective.0, effective.1).await?;
+        hub.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .repaint(id, subscriber);
+        Ok(())
     }
 
     /// The generation-2 resize: last request wins, applied straight to the pty.
