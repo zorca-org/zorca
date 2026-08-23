@@ -33,10 +33,11 @@ use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use theme::{ActiveTheme, CLIENT_SIDE_DECORATION_ROUNDING};
 use ui::{
-    ContextMenu, PopoverMenu, PopoverMenuHandle, ThreadItemWorktreeInfo, TintColor, Tooltip,
-    prelude::*, right_click_menu,
+    CommonAnimationExt as _, ContextMenu, PopoverMenu, PopoverMenuHandle, ThreadItemWorktreeInfo,
+    TintColor, Tooltip, prelude::*, right_click_menu,
 };
 use util::ResultExt as _;
 use util::path_list::PathList;
@@ -160,22 +161,64 @@ fn update_cached_worktree_path(
     }
 }
 
-/// The host of a row that draws the daemon upgrade arrow, given a `is_stale`
-/// answer for a host. Only a project row has a host of its own to upgrade: a
-/// group row spans hosts, and a worktree row's daemon is its project's.
-///
-/// Separate from `Sidebar::stale_daemon_host` so the rule can be tested without
-/// an `App`; `is_stale` is the lifecycle service in production.
-fn stale_daemon_host_for_row(
-    kind: workspace_manager::RowKind,
-    ade_host: Option<&str>,
-    is_stale: impl FnOnce(&str) -> bool,
-) -> Option<String> {
-    if !matches!(kind, workspace_manager::RowKind::Project(_)) {
-        return None;
+fn daemon_row_host(kind: workspace_manager::RowKind, ade_host: Option<&str>) -> Option<&str> {
+    matches!(kind, workspace_manager::RowKind::Project(_))
+        .then_some(ade_host)
+        .flatten()
+}
+
+const DAEMON_UPGRADE_CHECK_LINGER: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonUpgradeUi {
+    InProgress,
+    Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonUpgradeStep {
+    Started,
+    Succeeded,
+    Failed,
+    Expired,
+}
+
+fn record_daemon_upgrade_step(
+    states: &mut HashMap<String, DaemonUpgradeUi>,
+    host: &str,
+    step: DaemonUpgradeStep,
+) {
+    match step {
+        DaemonUpgradeStep::Started => {
+            states.insert(host.to_owned(), DaemonUpgradeUi::InProgress);
+        }
+        DaemonUpgradeStep::Succeeded => {
+            states.insert(host.to_owned(), DaemonUpgradeUi::Done);
+        }
+        DaemonUpgradeStep::Failed => {
+            states.remove(host);
+        }
+        DaemonUpgradeStep::Expired => {
+            if states.get(host) == Some(&DaemonUpgradeUi::Done) {
+                states.remove(host);
+            }
+        }
     }
-    let host = ade_host?;
-    is_stale(host).then(|| host.to_owned())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonIndicator {
+    Upgrade,
+    InProgress,
+    Done,
+}
+
+fn daemon_indicator(stale: bool, upgrade: Option<DaemonUpgradeUi>) -> Option<DaemonIndicator> {
+    match upgrade {
+        Some(DaemonUpgradeUi::InProgress) => Some(DaemonIndicator::InProgress),
+        Some(DaemonUpgradeUi::Done) => Some(DaemonIndicator::Done),
+        None => stale.then_some(DaemonIndicator::Upgrade),
+    }
 }
 
 /// What a workspace-manager row's menus act on.
@@ -550,6 +593,7 @@ pub struct Sidebar {
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
     update_task: Option<Task<()>>,
+    daemon_upgrades: HashMap<String, DaemonUpgradeUi>,
     /// Redraws the rows when a host's daemon starts or stops being behind this
     /// client's. Held rather than detached, so closing the window drops the
     /// receiver and the lifecycle service stops keeping a sender for it.
@@ -836,6 +880,7 @@ impl Sidebar {
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
             update_task: None,
+            daemon_upgrades: HashMap::default(),
             _daemon_freshness_watch: Self::watch_daemon_freshness(cx),
         }
     }
@@ -4617,7 +4662,6 @@ impl Sidebar {
     ) -> Option<AnyElement> {
         let can_create_worktree = context.can_create_worktree;
         let workspace_key = context.workspace_key.clone();
-        let stale_daemon_host = self.stale_daemon_host(context, cx);
 
         Some(
             h_flex()
@@ -4650,20 +4694,6 @@ impl Sidebar {
                         )
                     },
                 )
-                // Remote rows only, and only where a hash comparison already
-                // found the host's daemon behind: an arrow that is always
-                // there says "an upgrade is conceivable", not "an update
-                // exists". The local daemon is replaced when the app is.
-                .when_some(stale_daemon_host, |this, host| {
-                    this.child(
-                        IconButton::new("workspace-manager-row-upgrade-daemon", IconName::ArrowUp)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Upgrade Host Daemon"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.upgrade_host_daemon(host.clone(), cx);
-                            })),
-                    )
-                })
                 .into_any_element(),
         )
     }
@@ -4673,34 +4703,32 @@ impl Sidebar {
         context: &WorkspaceRowContext,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let host = self.stale_daemon_host(context, cx)?;
+        let host = daemon_row_host(context.kind, context.ade_host.as_deref())?.to_owned();
+        let stale = ade_workspaces::try_lifecycle_service(cx)
+            .is_some_and(|lifecycle| lifecycle.host_daemon_stale(&host));
         Some(
-            IconButton::new(
-                "workspace-manager-row-upgrade-daemon-visible",
-                IconName::ArrowUp,
-            )
-            .icon_size(IconSize::Small)
-            .tooltip(Tooltip::text("Upgrade Host Daemon"))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.upgrade_host_daemon(host.clone(), cx);
-            }))
-            .into_any_element(),
+            match daemon_indicator(stale, self.daemon_upgrades.get(&host).copied())? {
+                DaemonIndicator::InProgress => Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element(),
+                DaemonIndicator::Done => Icon::new(IconName::Check)
+                    .size(IconSize::Small)
+                    .color(Color::Success)
+                    .into_any_element(),
+                DaemonIndicator::Upgrade => IconButton::new(
+                    "workspace-manager-row-upgrade-daemon-visible",
+                    IconName::ArrowUp,
+                )
+                .icon_size(IconSize::Small)
+                .tooltip(Tooltip::text("Upgrade Host Daemon"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.upgrade_host_daemon(host.clone(), cx);
+                }))
+                .into_any_element(),
+            },
         )
-    }
-
-    /// This row's host, when something has already found its daemon behind the
-    /// binary this client would deploy. `None` for a local row, and for a host
-    /// nobody has compared — an unanswered question must not draw an arrow.
-    ///
-    /// `try_lifecycle_service` and not the eager one: a render must not be what
-    /// builds the service, which opens the workspace registry's database on the
-    /// way. No service means nothing has contacted any host, which reads the
-    /// same as "not stale".
-    fn stale_daemon_host(&self, context: &WorkspaceRowContext, cx: &App) -> Option<String> {
-        stale_daemon_host_for_row(context.kind, context.ade_host.as_deref(), |host| {
-            ade_workspaces::try_lifecycle_service(cx)
-                .is_some_and(|lifecycle| lifecycle.host_daemon_stale(host))
-        })
     }
 
     /// Build the current daemon binary and put it on `host`, replacing the one
@@ -4721,7 +4749,9 @@ impl Sidebar {
         // would keep the window's workspace alive long after it closed just to
         // deliver a toast nobody can see.
         let workspace = self.active_workspace(cx).map(|w| w.downgrade());
-        cx.spawn(async move |_, cx| {
+        record_daemon_upgrade_step(&mut self.daemon_upgrades, &host, DaemonUpgradeStep::Started);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_spawn({
                     let host = host.clone();
@@ -4741,17 +4771,40 @@ impl Sidebar {
                 Ok(_) => log::info!("{message}"),
                 Err(_) => log::warn!("{message}"),
             }
-            let Some(workspace) = workspace else {
-                return;
+            let step = match &outcome {
+                Ok(_) => DaemonUpgradeStep::Succeeded,
+                Err(_) => DaemonUpgradeStep::Failed,
             };
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.show_toast(
-                        Toast::new(NotificationId::unique::<UpgradeHostDaemon>(), message),
-                        cx,
-                    )
-                })
-                .ok();
+            this.update(cx, |this, cx| {
+                record_daemon_upgrade_step(&mut this.daemon_upgrades, &host, step);
+                cx.notify();
+            })
+            .ok();
+            if let Some(workspace) = workspace {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            Toast::new(NotificationId::unique::<UpgradeHostDaemon>(), message),
+                            cx,
+                        )
+                    })
+                    .ok();
+            }
+            if step != DaemonUpgradeStep::Succeeded {
+                return;
+            }
+            cx.background_executor()
+                .timer(DAEMON_UPGRADE_CHECK_LINGER)
+                .await;
+            this.update(cx, |this, cx| {
+                record_daemon_upgrade_step(
+                    &mut this.daemon_upgrades,
+                    &host,
+                    DaemonUpgradeStep::Expired,
+                );
+                cx.notify();
+            })
+            .ok();
         })
         .detach();
     }
