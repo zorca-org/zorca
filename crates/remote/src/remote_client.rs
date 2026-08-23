@@ -42,7 +42,7 @@ use std::{
     ops::ControlFlow,
     path::PathBuf,
     sync::{
-        Arc, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
     },
     time::{Duration, Instant},
@@ -351,6 +351,28 @@ pub enum ConnectionIdentifier {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+// Separates remote-server state belonging to different client processes.
+static CLIENT_TOKEN: OnceLock<String> = OnceLock::new();
+
+fn client_token(installation_id: &str, process_id: u32) -> String {
+    use sha2::Digest as _;
+
+    format!(
+        "{:x}",
+        sha2::Sha256::digest(format!("{installation_id}:{process_id}"))
+    )
+    .chars()
+    .take(8)
+    .collect()
+}
+
+/// Namespaces remote-server state to the current client process.
+pub fn set_client_installation_id(installation_id: &str) {
+    if !installation_id.is_empty() {
+        CLIENT_TOKEN.get_or_init(|| client_token(installation_id, std::process::id()));
+    }
+}
+
 impl ConnectionIdentifier {
     pub fn setup() -> Self {
         Self::Setup(NEXT_ID.fetch_add(1, SeqCst))
@@ -361,17 +383,34 @@ impl ConnectionIdentifier {
     //   /home/{username}/.local/share/zed/server_state/{name}/stdout.sock
     // Must be less than about 100 characters
     //   https://unix.stackexchange.com/questions/367008/why-is-socket-path-length-limited-to-a-hundred-chars
-    // So our strings should be at most 20 characters or so.
+    // Keep the installation token short because this name shares that budget
+    // with the remote home directory and workspace id.
     fn to_string(&self, cx: &App) -> String {
         let identifier_prefix = match ReleaseChannel::global(cx) {
             ReleaseChannel::Stable => "".to_string(),
             release_channel => format!("{}-", release_channel.dev_name()),
         };
-        match self {
-            Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
-            Self::Workspace(workspace_id) => {
-                format!("{identifier_prefix}workspace-{workspace_id}",)
-            }
+        identifier_string(
+            &identifier_prefix,
+            CLIENT_TOKEN.get().map(|s| s.as_str()),
+            self,
+        )
+    }
+}
+
+fn identifier_string(prefix: &str, token: Option<&str>, variant: &ConnectionIdentifier) -> String {
+    match (variant, token) {
+        (ConnectionIdentifier::Setup(setup_id), Some(token)) => {
+            format!("{prefix}s-{token}-{setup_id:x}")
+        }
+        (ConnectionIdentifier::Setup(setup_id), None) => {
+            format!("{prefix}setup-{setup_id}")
+        }
+        (ConnectionIdentifier::Workspace(workspace_id), Some(token)) => {
+            format!("{prefix}w-{token}-{workspace_id:x}")
+        }
+        (ConnectionIdentifier::Workspace(workspace_id), None) => {
+            format!("{prefix}workspace-{workspace_id}")
         }
     }
 }
@@ -1402,6 +1441,83 @@ mod tests {
     use crate::MockDelegate;
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+
+    #[test]
+    fn identifier_string_formats() {
+        assert_eq!(
+            identifier_string(
+                "dev-",
+                Some("abcd1234"),
+                &ConnectionIdentifier::Workspace(6)
+            ),
+            "dev-w-abcd1234-6"
+        );
+        assert_eq!(
+            identifier_string("", Some("abcd1234"), &ConnectionIdentifier::Workspace(6)),
+            "w-abcd1234-6"
+        );
+        assert_eq!(
+            identifier_string("dev-", None, &ConnectionIdentifier::Workspace(6)),
+            "dev-workspace-6"
+        );
+        assert_eq!(
+            identifier_string("dev-", Some("abcd1234"), &ConnectionIdentifier::Setup(1)),
+            "dev-s-abcd1234-1"
+        );
+    }
+
+    #[test]
+    fn client_processes_have_short_distinct_tokens() {
+        let first = client_token("0e3ce496-199d-4bc0-8a84-56c9bf394fbb", 1);
+        let second_installation = client_token("0e3ce496-aaaa-bbbb-cccc-56c9bf394fbb", 1);
+        let second_process = client_token("0e3ce496-199d-4bc0-8a84-56c9bf394fbb", 2);
+        assert_eq!(first.len(), 8);
+        assert_ne!(first, second_installation);
+        assert_ne!(first, second_process);
+        assert_eq!(
+            first,
+            client_token("0e3ce496-199d-4bc0-8a84-56c9bf394fbb", 1)
+        );
+        assert_ne!(
+            identifier_string("dev-", Some(&first), &ConnectionIdentifier::Setup(1)),
+            identifier_string(
+                "dev-",
+                Some(&second_process),
+                &ConnectionIdentifier::Setup(1)
+            )
+        );
+        assert_ne!(
+            identifier_string("dev-", Some(&first), &ConnectionIdentifier::Workspace(6)),
+            identifier_string(
+                "dev-",
+                Some(&second_installation),
+                &ConnectionIdentifier::Workspace(6)
+            )
+        );
+    }
+
+    #[test]
+    fn identifier_string_stays_within_socket_path_budget() {
+        let workspace = identifier_string(
+            "dev-",
+            Some("abcd1234"),
+            &ConnectionIdentifier::Workspace(i64::MAX),
+        );
+        let setup = identifier_string(
+            "dev-",
+            Some("abcd1234"),
+            &ConnectionIdentifier::Setup(u64::MAX),
+        );
+        for identifier in [workspace, setup] {
+            let socket_path = format!(
+                "/home/abcdefghijklmnopqrst/.local/share/zorca/server_state/{identifier}/stdout.sock"
+            );
+            assert!(
+                socket_path.len() < 104,
+                "socket path is too long: {socket_path}"
+            );
+        }
+    }
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {

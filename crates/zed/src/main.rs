@@ -594,6 +594,9 @@ fn main() {
 
         let system_id = cx.foreground_executor().block_on(system_id).ok();
         let installation_id = cx.foreground_executor().block_on(installation_id).ok();
+        if let Some(installation_id) = installation_id.as_ref() {
+            remote::set_client_installation_id(&installation_id.to_string());
+        }
         let session = cx.foreground_executor().block_on(session);
 
         let telemetry = client.telemetry();
