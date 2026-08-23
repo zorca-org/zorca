@@ -135,16 +135,20 @@ pub fn open_workspace_session(
                 } else {
                     match attached {
                         Some(attached) => {
+                            let daemon_id = attached.daemon_id.clone();
+                            let record_attach = state == SessionState::NeverCreated
+                                || (workspace.daemon_id.is_none() && daemon_id.is_some());
                             let opened =
                                 attach_terminal(&zed_workspace, &workspace, attached, cx).await;
-                            match (opened, state) {
-                                // The pane's own attach-or-create is what brought
-                                // the session into being, so the registry has to be
-                                // told the name it now points at — otherwise the dot
-                                // would keep reading muted over a running session.
-                                (Ok(()), SessionState::NeverCreated) => {
+                            match (opened, record_attach) {
+                                // The successful pane owns the exact session and
+                                // daemon identity this row can now record.
+                                (Ok(()), true) => {
                                     cx.background_spawn(async move {
-                                        lifecycle.record_attached_session(&id).await.map(|_| ())
+                                        lifecycle
+                                            .record_attached_session(&id, daemon_id)
+                                            .await
+                                            .map(|_| ())
                                     })
                                     .await
                                 }
@@ -550,6 +554,7 @@ mod tests {
     fn failed_attach() -> Attached {
         Attached {
             session_id: "missing-session".to_owned(),
+            daemon_id: None,
             argv: Vec::new(),
         }
     }

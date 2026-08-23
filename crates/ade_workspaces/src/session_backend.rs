@@ -124,6 +124,8 @@ pub struct Attached {
     /// [`SessionBackend::attach_session`] takes. tmux does not mint ids, so
     /// there it is the seam id itself.
     pub session_id: String,
+    /// The exact daemon handshake that selected or created this session.
+    pub daemon_id: Option<String>,
     pub argv: Vec<String>,
 }
 
@@ -383,6 +385,16 @@ pub trait SessionBackend: Send + Sync {
         _expected_daemon_id: Option<&str>,
     ) -> Result<String> {
         bail!("this session backend holds one session per workspace")
+    }
+
+    fn create_session_in_workspace_identified(
+        &self,
+        workspace_id: &str,
+        cwd: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let session = self.create_session_in_workspace(workspace_id, cwd, expected_daemon_id)?;
+        Ok((session, self.instance_id()))
     }
 
     /// Every live session this app owns. Sessions belonging to anything else

@@ -209,6 +209,16 @@ impl AdeWorkspaceRegistry {
         }
     }
 
+    query! {
+        pub async fn update_terminal_session_and_daemon_id(
+            id: WorkspaceId,
+            terminal_session_id: Option<String>,
+            daemon_id: Option<String>
+        ) -> Result<()> {
+            UPDATE ade_workspaces SET terminal_session_id = ?2, daemon_id = ?3 WHERE id = ?1
+        }
+    }
+
     // One statement: remote_host and daemon_id are learned from the same
     // handshake, and an interrupted write must not update one but not the
     // other.

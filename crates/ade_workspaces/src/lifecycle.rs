@@ -653,13 +653,28 @@ impl WorkspaceLifecycleService {
     ///
     /// Only sound after an attach the caller watched succeed. Anything that
     /// merely *hopes* a session exists wants [`Self::probe`].
-    pub async fn record_attached_session(&self, id: &WorkspaceId) -> Result<AdeWorkspace> {
+    pub async fn record_attached_session(
+        &self,
+        id: &WorkspaceId,
+        daemon_id: Option<String>,
+    ) -> Result<AdeWorkspace> {
         let mut workspace = self.get(id)?;
 
         // No backend is asked for: this is the registry writing down what the
         // pane already did, and it is as true of a remote host as a local one.
         let session = SessionId::from(workspace.daemon_workspace_id());
-        self.adopt_session(&mut workspace, session).await?;
+        let daemon_id = workspace.daemon_id.clone().or(daemon_id);
+        self.registry
+            .update_terminal_session_and_daemon_id(
+                workspace.id.clone(),
+                Some(session.to_string()),
+                daemon_id.clone(),
+            )
+            .await?;
+        workspace.terminal_session_id = Some(session.to_string());
+        workspace.daemon_id = daemon_id;
+        self.set_status(&mut workspace, WorkspaceStatus::Running)
+            .await?;
         Ok(workspace)
     }
 
@@ -1001,14 +1016,15 @@ impl WorkspaceLifecycleService {
     ) -> Result<(String, Vec<String>)> {
         let backend = self.backend_for(workspace)?;
         let spec = Self::session_spec(workspace);
-        let session = backend
-            .create_session_in_workspace(
+        let (session, daemon_id) = backend
+            .create_session_in_workspace_identified(
                 spec.id.as_str(),
                 working_directory,
                 workspace.daemon_id.as_deref(),
             )
             .with_context(|| format!("creating another session in {}", spec.id))?;
-        let argv = backend.attach_session(&session, workspace.daemon_id.as_deref())?;
+        let daemon_id = workspace.daemon_id.as_deref().or(daemon_id.as_deref());
+        let argv = backend.attach_session(&session, daemon_id)?;
         Ok((session, argv))
     }
 
@@ -3445,6 +3461,7 @@ mod tests {
             self.record(format!("attach:{}{}", spec.id, fence(expected)))?;
             Ok(Attached {
                 session_id: spec.id.to_string(),
+                daemon_id: self.instance_id.clone(),
                 argv: vec![format!("{}-attach", self.label), spec.id.to_string()],
             })
         }
@@ -3621,7 +3638,7 @@ mod tests {
         // down what that produced — no backend is consulted, which is why the
         // failing backend never comes up.
         let recorded = service
-            .record_attached_session(&workspace.id)
+            .record_attached_session(&workspace.id, Some("daemon-a".to_owned()))
             .await
             .unwrap();
         assert_eq!(
@@ -3629,6 +3646,7 @@ mod tests {
             Some(workspace.tmux_session_name().as_str())
         );
         assert_eq!(recorded.status, WorkspaceStatus::Running);
+        assert_eq!(recorded.daemon_id.as_deref(), Some("daemon-a"));
 
         // And it is the stored row that moved, not just the returned copy.
         let stored = service
@@ -3641,10 +3659,11 @@ mod tests {
             Some(workspace.tmux_session_name().as_str())
         );
         assert_eq!(stored.status, WorkspaceStatus::Running);
+        assert_eq!(stored.daemon_id.as_deref(), Some("daemon-a"));
 
         // Idempotent: a second attach to the same session changes nothing.
         let again = service
-            .record_attached_session(&workspace.id)
+            .record_attached_session(&workspace.id, None)
             .await
             .unwrap();
         assert_eq!(again, stored);

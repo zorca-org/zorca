@@ -1451,6 +1451,43 @@ mod handshake_tests {
         assert!(sent_nothing, "the reconnect sent a frame to daemon B");
     }
 
+    #[test]
+    fn the_live_attach_loop_refuses_a_replaced_daemon() {
+        let (result, first, second) = smol::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("the bound port").to_string();
+            let serving = smol::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("daemon A");
+                let first = scripted_daemon(stream, 3, Some("daemon-a".to_owned())).await;
+                let (stream, _) = listener.accept().await.expect("daemon B");
+                let second = scripted_daemon(stream, 3, Some("daemon-b".to_owned())).await;
+                (first, second)
+            });
+            let config = AttachConfig::tcp(address.clone(), "s-1")
+                .with_expected_daemon_id(Some("daemon-a".to_owned()));
+            let connect = || {
+                let address = address.clone();
+                async move {
+                    let stream = TcpStream::connect(&address).await?;
+                    Ok((stream.clone(), stream))
+                }
+            };
+            let result = attached(config, connect).await;
+            let (first, second) = serving.await;
+            (result, first, second)
+        });
+
+        let error = result.expect_err("daemon B must end the live attach");
+        assert!(format!("{error:#}").contains("daemon-b"));
+        assert!(
+            first
+                .iter()
+                .any(|frame| matches!(frame, Frame::Attach { .. })),
+            "the initial attach never reached daemon A"
+        );
+        assert!(second.is_empty(), "the reconnect sent a frame to daemon B");
+    }
+
     /// No flag, no fence: a caller that never asked to be fenced attaches to
     /// whatever answers, identity or not.
     #[test]

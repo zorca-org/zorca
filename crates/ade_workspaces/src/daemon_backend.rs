@@ -669,7 +669,16 @@ impl DaemonBackend {
         id: &SessionId,
         expected_daemon_id: Option<&str>,
     ) -> Result<Option<proto::SessionInfo>> {
-        Ok(newest_live(&self.daemon_sessions(expected_daemon_id)?, id))
+        Ok(self.live_session_seen(id, expected_daemon_id)?.0)
+    }
+
+    fn live_session_seen(
+        &self,
+        id: &SessionId,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(Option<proto::SessionInfo>, Option<String>)> {
+        let (sessions, daemon_id) = self.daemon_sessions_seen(expected_daemon_id)?;
+        Ok((newest_live(&sessions, id), daemon_id))
     }
 
     /// Create the daemon session for `spec`, reaping any tombstone it replaces.
@@ -769,6 +778,21 @@ impl DaemonBackend {
         )
         .with_context(|| format!("killing daemon session {id}"))
     }
+
+    fn kill_workspace_sessions_seen(
+        &self,
+        id: &SessionId,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let (sessions, daemon_id) = self.daemon_sessions_seen(expected_daemon_id)?;
+        for session in sessions
+            .iter()
+            .filter(|session| session.workspace_id == id.as_str())
+        {
+            self.kill_daemon_session(&session.id, daemon_id.as_deref())?;
+        }
+        Ok(daemon_id)
+    }
 }
 
 impl SessionBackend for DaemonBackend {
@@ -802,9 +826,20 @@ impl SessionBackend for DaemonBackend {
         cwd: &Path,
         expected_daemon_id: Option<&str>,
     ) -> Result<String> {
+        Ok(self
+            .create_session_in_workspace_identified(workspace_id, cwd, expected_daemon_id)?
+            .0)
+    }
+
+    fn create_session_in_workspace_identified(
+        &self,
+        workspace_id: &str,
+        cwd: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
         let request_id = self.request_id();
-        let session = self
-            .request(
+        let (session, daemon_id) = self
+            .request_seen(
                 expected_daemon_id,
                 request_id,
                 Frame::CreateSession {
@@ -834,7 +869,7 @@ impl SessionBackend for DaemonBackend {
                 },
             )
             .with_context(|| format!("creating a session in workspace {workspace_id}"))?;
-        Ok(session.id.to_string())
+        Ok((session.id.to_string(), daemon_id))
     }
 
     fn list(&self) -> Result<Vec<SessionInfo>> {
@@ -884,13 +919,14 @@ impl SessionBackend for DaemonBackend {
         // workspace that has no session is one step, and reopening a pane on a
         // live one reattaches to everything still running in it.
         // Both the listing and possible create are fenced.
-        let session = match self.live_session(&spec.id, expected_daemon_id)? {
-            Some(session) => session,
-            None => self.create_session(spec, expected_daemon_id)?.0,
+        let (session, daemon_id) = match self.live_session_seen(&spec.id, expected_daemon_id)? {
+            (Some(session), daemon_id) => (session, daemon_id),
+            (None, _) => self.create_session(spec, expected_daemon_id)?,
         };
         Ok(Attached {
-            argv: self.session_argv(&session.id, expected_daemon_id),
+            argv: self.session_argv(&session.id, daemon_id.as_deref()),
             session_id: session.id.to_string(),
+            daemon_id,
         })
     }
 
@@ -1062,14 +1098,7 @@ impl SessionBackend for DaemonBackend {
     }
 
     fn kill(&self, id: &SessionId, expected_daemon_id: Option<&str>) -> Result<()> {
-        // Include exited rows; the fenced listing cannot aim kills at a peer.
-        for session in self
-            .daemon_sessions(expected_daemon_id)?
-            .iter()
-            .filter(|session| session.workspace_id == id.as_str())
-        {
-            self.kill_daemon_session(&session.id, expected_daemon_id)?;
-        }
+        self.kill_workspace_sessions_seen(id, expected_daemon_id)?;
         Ok(())
     }
 
@@ -1079,9 +1108,9 @@ impl SessionBackend for DaemonBackend {
         directory: &Path,
         expected_daemon_id: Option<&str>,
     ) -> Result<()> {
-        self.kill(id, expected_daemon_id)?;
+        let daemon_id = self.kill_workspace_sessions_seen(id, expected_daemon_id)?;
         if let Transport::Forwarded(link) = &self.endpoint.transport {
-            link.recover_stale_daemon_processes(directory, expected_daemon_id)?;
+            link.recover_stale_daemon_processes(directory, daemon_id.as_deref())?;
         }
         Ok(())
     }
@@ -2666,17 +2695,18 @@ impl HostLink {
     ) -> Result<()> {
         use ade_session::deploy::HostExec as _;
 
-        let state_dir = expected_daemon_id
-            .map(|_| {
-                self.state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .paths
-                    .as_ref()
-                    .context("the remote daemon paths were not resolved")
-                    .map(|paths| paths.state_dir.clone())
-            })
-            .transpose()?;
+        let Some(expected_daemon_id) = expected_daemon_id else {
+            return Ok(());
+        };
+        let state_dir = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .paths
+            .as_ref()
+            .context("the remote daemon paths were not resolved")?
+            .state_dir
+            .clone();
         let output = self
             .host
             .run(&[
@@ -2684,7 +2714,7 @@ impl HostLink {
                 "-c".to_owned(),
                 stale_daemon_recovery_script(
                     directory,
-                    state_dir.as_deref().zip(expected_daemon_id),
+                    Some((state_dir.as_str(), expected_daemon_id)),
                 )?,
             ])
             .with_context(|| {
@@ -4114,6 +4144,17 @@ mod control_connection {
         assert_eq!(sessions.daemon_id.as_deref(), Some("daemon-a"));
     }
 
+    #[test]
+    fn an_unclaimed_reset_keeps_the_identity_observed_by_its_listing() {
+        let backend = scripted_daemon(vec![identity_listing(Some("daemon-a"), 1)]);
+        let daemon_id = bounded("the reset listing", move || {
+            backend
+                .kill_workspace_sessions_seen(&SessionId::from("workspace"), None)
+                .expect("listing sessions for reset")
+        });
+        assert_eq!(daemon_id.as_deref(), Some("daemon-a"));
+    }
+
     /// The attach argv is where a persisted identity reaches the attach client,
     /// which connects on its own and cannot be fenced from here.
     #[test]
@@ -4694,6 +4735,13 @@ mod tests {
         assert_eq!(argv[1], "attach");
         assert_eq!(argv[3], "--socket");
         assert!(argv[4].ends_with("daemon.sock"), "{argv:?}");
+        let daemon_id = attached.daemon_id.as_deref().expect("the daemon is named");
+        assert_eq!(
+            argv.windows(2)
+                .find(|pair| pair[0] == "--expected-daemon-id")
+                .map(|pair| (pair[0].as_str(), pair[1].as_str())),
+            Some(("--expected-daemon-id", daemon_id)),
+        );
 
         // The id in the argv is the daemon's own, which is the only name the
         // client can attach by — and it comes back beside the argv, because a
