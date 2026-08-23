@@ -66,36 +66,57 @@ fn test_cached_worktree_path_supports_consecutive_renames() {
 }
 
 #[test]
-fn test_stale_daemon_host_for_row() {
+fn test_daemon_row_host() {
     use workspace_manager::{GroupId, ProjectId, RowKind, WorktreeId};
 
-    let stale = |_: &str| true;
-    let fresh = |_: &str| false;
-
     assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), Some("host"), stale),
-        Some("host".to_owned())
+        daemon_row_host(RowKind::Project(ProjectId(0)), Some("host")),
+        Some("host")
     );
-    assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), Some("host"), fresh),
-        None
-    );
-    assert_eq!(
-        stale_daemon_host_for_row(RowKind::Project(ProjectId(0)), None, stale),
-        None
-    );
+    assert_eq!(daemon_row_host(RowKind::Project(ProjectId(0)), None), None);
     for kind in [
         RowKind::Group(GroupId(0)),
         RowKind::Worktree(WorktreeId(0)),
         RowKind::PinnedSection,
     ] {
-        assert_eq!(
-            stale_daemon_host_for_row(kind, Some("host"), |_| {
-                panic!("a non-project row must not query daemon freshness")
-            }),
-            None
-        );
+        assert_eq!(daemon_row_host(kind, Some("host")), None);
     }
+}
+
+#[test]
+fn test_daemon_indicator() {
+    assert_eq!(daemon_indicator(false, None), None);
+    assert_eq!(daemon_indicator(true, None), Some(DaemonIndicator::Upgrade));
+    assert_eq!(
+        daemon_indicator(false, Some(DaemonUpgradeUi::InProgress)),
+        Some(DaemonIndicator::InProgress)
+    );
+    assert_eq!(
+        daemon_indicator(false, Some(DaemonUpgradeUi::Done)),
+        Some(DaemonIndicator::Done)
+    );
+}
+
+#[test]
+fn test_daemon_upgrade_state_machine() {
+    let mut states = HashMap::default();
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::InProgress));
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Succeeded);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::Done));
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Expired);
+    assert_eq!(states.get("host"), None);
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Failed);
+    assert_eq!(states.get("host"), None);
+
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Started);
+    record_daemon_upgrade_step(&mut states, "host", DaemonUpgradeStep::Expired);
+    assert_eq!(states.get("host"), Some(&DaemonUpgradeUi::InProgress));
 }
 
 #[test]
