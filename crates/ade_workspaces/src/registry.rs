@@ -1,10 +1,11 @@
 use crate::{AdeWorkspace, WorkspaceId, WorkspaceStatus};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use db::{
     query,
     sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
+use std::cmp::Reverse;
 use time::OffsetDateTime;
 
 /// Durable metadata store for [`AdeWorkspace`]s, in Zed's shared sqlite
@@ -124,6 +125,9 @@ impl AdeWorkspaceRegistry {
         .await
     }
 
+    // Usage-only: a row is a workspace this client used, not one a daemon
+    // happens to hold. Every normal read hides a quarantined row
+    // (used_by_client_at IS NULL); only unconfirmed_workspaces() below sees it.
     query! {
         pub fn get_workspace(id: WorkspaceId) -> Result<Option<AdeWorkspace>> {
             SELECT
@@ -140,7 +144,7 @@ impl AdeWorkspaceRegistry {
                 created_at,
                 last_opened_at
             FROM ade_workspaces
-            WHERE id = ?
+            WHERE id = ? AND used_by_client_at IS NOT NULL
         }
     }
 
@@ -160,6 +164,7 @@ impl AdeWorkspaceRegistry {
                 created_at,
                 last_opened_at
             FROM ade_workspaces
+            WHERE used_by_client_at IS NOT NULL
             ORDER BY last_opened_at DESC
         }
     }
@@ -180,8 +185,78 @@ impl AdeWorkspaceRegistry {
                 created_at,
                 last_opened_at
             FROM ade_workspaces
-            WHERE project_id = ?
+            WHERE project_id = ? AND used_by_client_at IS NOT NULL
             ORDER BY last_opened_at DESC
+        }
+    }
+
+    /// Quarantined rows in deterministic promotion order: current daemon,
+    /// branch metadata, recency, then id.
+    pub(crate) fn promotion_candidates(
+        &self,
+        daemon_id: Option<&str>,
+    ) -> Result<Vec<AdeWorkspace>> {
+        let mut rows = self.unconfirmed_workspaces()?;
+        rows.sort_by(|left, right| {
+            let key = |row: &AdeWorkspace| {
+                (
+                    !daemon_id.is_some_and(|id| row.daemon_id.as_deref() == Some(id)),
+                    row.branch.is_none(),
+                    Reverse(row.last_opened_at),
+                )
+            };
+            key(left)
+                .cmp(&key(right))
+                .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+        });
+        Ok(rows)
+    }
+
+    query! {
+        pub(crate) fn unconfirmed_workspaces() -> Result<Vec<AdeWorkspace>> {
+            SELECT
+                id,
+                name,
+                project_id,
+                repository_path,
+                branch,
+                remote_host,
+                remote_workspace_path,
+                terminal_session_id,
+                daemon_id,
+                status,
+                created_at,
+                last_opened_at
+            FROM ade_workspaces
+            WHERE used_by_client_at IS NULL
+        }
+    }
+
+    /// Promotes a quarantined row if nobody has claimed it first.
+    pub(crate) async fn confirm_workspace(
+        &self,
+        id: WorkspaceId,
+        remote_host: Option<String>,
+        daemon_id: Option<String>,
+        at: OffsetDateTime,
+    ) -> Result<bool> {
+        Ok(self
+            .confirm_workspace_internal(id, remote_host, daemon_id, at.unix_timestamp())
+            .await?
+            .is_some())
+    }
+
+    query! {
+        async fn confirm_workspace_internal(
+            id: WorkspaceId,
+            remote_host: Option<String>,
+            daemon_id: Option<String>,
+            at: i64
+        ) -> Result<Option<WorkspaceId>> {
+            UPDATE ade_workspaces
+            SET remote_host = ?2, daemon_id = ?3, used_by_client_at = ?4, last_opened_at = ?4
+            WHERE id = ?1 AND used_by_client_at IS NULL
+            RETURNING id
         }
     }
 
@@ -189,6 +264,130 @@ impl AdeWorkspaceRegistry {
         pub async fn update_status(id: WorkspaceId, status: WorkspaceStatus) -> Result<()> {
             UPDATE ade_workspaces SET status = ?2 WHERE id = ?1
         }
+    }
+
+    /// Rebinds route and daemon identity only if the row still has the values
+    /// the caller read.
+    pub(crate) async fn rebind_workspace_route(
+        &self,
+        id: WorkspaceId,
+        expected_remote_host: Option<String>,
+        expected_daemon_id: Option<String>,
+        remote_host: Option<String>,
+        daemon_id: Option<String>,
+    ) -> Result<bool> {
+        Ok(self
+            .rebind_workspace_route_internal(
+                id,
+                expected_remote_host,
+                expected_daemon_id,
+                remote_host,
+                daemon_id,
+            )
+            .await?
+            .is_some())
+    }
+
+    query! {
+        async fn rebind_workspace_route_internal(
+            id: WorkspaceId,
+            expected_remote_host: Option<String>,
+            expected_daemon_id: Option<String>,
+            remote_host: Option<String>,
+            daemon_id: Option<String>
+        ) -> Result<Option<WorkspaceId>> {
+            UPDATE ade_workspaces
+            SET remote_host = ?4, daemon_id = ?5
+            WHERE id = ?1 AND remote_host IS ?2 AND daemon_id IS ?3
+            RETURNING id
+        }
+    }
+
+    /// Resolves a route rebind that collided with another row already bound to
+    /// the same daemon record. The migration's survivor order decides which
+    /// metadata survives; the verified loser is deleted in the same savepoint.
+    pub(crate) async fn resolve_rebind_conflict(
+        &self,
+        candidate_id: WorkspaceId,
+        expected_remote_host: Option<String>,
+        expected_daemon_id: Option<String>,
+        remote_host: Option<String>,
+        daemon_id: Option<String>,
+        terminal_session_id: String,
+    ) -> Result<Option<WorkspaceId>> {
+        if daemon_id.is_none() {
+            return Ok(None);
+        }
+        self.write(move |connection| {
+            connection.with_savepoint_rollback("ade_resolve_rebind", || {
+                // Acquire the write lock before the read that chooses a
+                // survivor, so another process cannot change either row in
+                // between.
+                Statement::prepare(connection, "UPDATE ade_workspaces SET id = id WHERE 0")?
+                    .exec()?;
+
+                let query = format!(
+                    "SELECT {COLUMNS}
+                     FROM ade_workspaces
+                     WHERE used_by_client_at IS NOT NULL
+                       AND (id = ?1 OR (daemon_id IS ?2 AND terminal_session_id = ?3))"
+                );
+                let mut statement = Statement::prepare(connection, query)?;
+                let next_index = statement.bind(&candidate_id, 1)?;
+                let next_index = statement.bind(&daemon_id, next_index)?;
+                statement.bind(&terminal_session_id, next_index)?;
+                let rows = statement.rows::<AdeWorkspace>()?;
+
+                let owner = rows.iter().find(|row| {
+                    row.daemon_id == daemon_id
+                        && row.terminal_session_id.as_deref() == Some(&terminal_session_id)
+                });
+                let Some(owner) = owner else {
+                    return Ok(None);
+                };
+                let candidate = rows.iter().find(|row| {
+                    row.id == candidate_id
+                        && row.remote_host == expected_remote_host
+                        && row.daemon_id == expected_daemon_id
+                        && row.terminal_session_id.as_deref() == Some(&terminal_session_id)
+                });
+
+                let mut contenders = vec![owner];
+                if let Some(candidate) = candidate
+                    && candidate.id != owner.id
+                {
+                    contenders.push(candidate);
+                }
+                contenders.sort_by(|left, right| {
+                    (left.branch.is_none(), Reverse(left.last_opened_at))
+                        .cmp(&(right.branch.is_none(), Reverse(right.last_opened_at)))
+                        .then_with(|| left.id.as_str().cmp(right.id.as_str()))
+                });
+                let survivor = *contenders
+                    .first()
+                    .context("a rebind conflict has no survivor")?;
+
+                for loser in contenders.into_iter().skip(1) {
+                    let mut delete =
+                        Statement::prepare(connection, "DELETE FROM ade_workspaces WHERE id = ?1")?;
+                    delete.bind(&loser.id, 1)?;
+                    delete.exec()?;
+                }
+
+                let mut update = Statement::prepare(
+                    connection,
+                    "UPDATE ade_workspaces
+                     SET remote_host = ?2, daemon_id = ?3
+                     WHERE id = ?1",
+                )?;
+                let next_index = update.bind(&survivor.id, 1)?;
+                let next_index = update.bind(&remote_host, next_index)?;
+                update.bind(&daemon_id, next_index)?;
+                update.exec()?;
+                Ok(Some(survivor.id.clone()))
+            })
+        })
+        .await
     }
 
     // Renames a workspace. The id is untouched — a name is display metadata,
@@ -258,9 +457,11 @@ impl AdeWorkspaceRegistry {
 
 #[cfg(test)]
 impl AdeWorkspaceRegistry {
+    // Puts a row back in the quarantine the usage migration leaves legacy rows
+    // in, so a promotion can be tested against a real one.
     query! {
-        fn used_by_client_at(id: WorkspaceId) -> Result<Option<i64>> {
-            SELECT used_by_client_at FROM ade_workspaces WHERE id = ?
+        pub(crate) async fn quarantine_workspace(id: WorkspaceId) -> Result<()> {
+            UPDATE ade_workspaces SET used_by_client_at = NULL WHERE id = ?
         }
     }
 }
@@ -362,34 +563,41 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_migration_and_rolled_back_writes_stay_visible() {
+    async fn test_migration_quarantines_rows_written_before_the_usage_column() {
         let name = "test_usage_provenance_rollback";
         let legacy = db::open_test_db::<BeforeUsageProvenance>(name).await;
         let before_upgrade = workspace("before-upgrade", "project-a");
         insert_without_usage_column(&legacy, before_upgrade.clone()).await;
 
+        // A row from before the usage column existed is quarantined, not
+        // smuggled past the reads below, whichever migration wrote it.
         let db = AdeWorkspaceRegistry::open_test_db(name).await;
-        assert_eq!(
-            db.get_workspace(before_upgrade.id.clone()).unwrap(),
-            Some(before_upgrade)
+        assert!(
+            db.get_workspace(before_upgrade.id.clone())
+                .unwrap()
+                .is_none()
         );
+        assert_eq!(db.unconfirmed_workspaces().unwrap().len(), 1);
 
         let after_rollback = workspace("after-rollback", "project-a");
         insert_without_usage_column(&legacy, after_rollback.clone()).await;
         drop(db);
 
+        // A downgrade-and-back writes the same way and is quarantined the
+        // same way: NULL is the default an older build's insert takes.
         let db = AdeWorkspaceRegistry::open_test_db(name).await;
-        assert_eq!(
-            db.get_workspace(after_rollback.id.clone()).unwrap(),
-            Some(after_rollback)
+        assert!(
+            db.get_workspace(after_rollback.id.clone())
+                .unwrap()
+                .is_none()
         );
+        assert_eq!(db.unconfirmed_workspaces().unwrap().len(), 2);
 
         let created_here = workspace("created-here", "project-a");
         db.create_workspace(created_here.clone()).await.unwrap();
-        assert!(
-            db.used_by_client_at(created_here.id)
-                .unwrap()
-                .is_some_and(|timestamp| timestamp > 0)
+        assert_eq!(
+            db.get_workspace(created_here.id.clone()).unwrap(),
+            Some(created_here)
         );
     }
 
@@ -657,10 +865,225 @@ mod tests {
 
         let db = AdeWorkspaceRegistry::open_test_db(name).await;
         assert_eq!(
-            db.list_workspaces().unwrap().len(),
+            db.unconfirmed_workspaces().unwrap().len(),
             2,
             "quarantined rows (used_by_client_at IS NULL) are never deleted or constrained"
         );
+    }
+
+    #[gpui::test]
+    async fn test_promotion_candidates_have_a_total_survivor_order() {
+        let db = AdeWorkspaceRegistry::open_test_db("test_promotion_candidate_order").await;
+        let candidate = |id: &str,
+                         daemon_id: Option<&str>,
+                         branch: Option<&str>,
+                         last_opened_at: i64| AdeWorkspace {
+            id: WorkspaceId::from(id),
+            daemon_id: daemon_id.map(str::to_owned),
+            branch: branch.map(str::to_owned),
+            last_opened_at: OffsetDateTime::from_unix_timestamp(last_opened_at).unwrap(),
+            ..workspace(id, "project-a")
+        };
+        for row in [
+            candidate("exact", Some("daemon-a"), None, 100),
+            candidate("branch", None, Some("feature/x"), 100),
+            candidate("newer", None, None, 300),
+            candidate("tie-a", None, None, 200),
+            candidate("tie-b", None, None, 200),
+        ] {
+            insert_confirmed_row(&db, row, None).await;
+        }
+
+        let ids = |rows: Vec<AdeWorkspace>| rows.into_iter().map(|row| row.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(db.promotion_candidates(Some("daemon-a")).unwrap()),
+            ["exact", "branch", "newer", "tie-a", "tie-b"]
+                .map(WorkspaceId::from)
+                .to_vec()
+        );
+        assert_eq!(
+            ids(db.promotion_candidates(None).unwrap()),
+            ["branch", "newer", "tie-a", "tie-b", "exact"]
+                .map(WorkspaceId::from)
+                .to_vec()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_confirming_a_quarantined_row_is_a_single_winner_claim() {
+        let db = AdeWorkspaceRegistry::open_test_db("test_confirm_workspace_cas").await;
+        let mut row = workspace("contested", "project-a");
+        row.terminal_session_id = Some("sess-1".into());
+        insert_confirmed_row(&db, row.clone(), None).await;
+
+        let won_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        assert!(
+            db.confirm_workspace(
+                row.id.clone(),
+                Some("box-a".into()),
+                Some("daemon-a".into()),
+                won_at,
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.confirm_workspace(
+                row.id.clone(),
+                Some("box-b".into()),
+                Some("daemon-b".into()),
+                OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap(),
+            )
+            .await
+            .unwrap()
+        );
+
+        let stored = db.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.remote_host.as_deref(), Some("box-a"));
+        assert_eq!(stored.daemon_id.as_deref(), Some("daemon-a"));
+        assert_eq!(stored.last_opened_at, won_at);
+    }
+
+    #[gpui::test]
+    async fn test_rebinding_a_route_is_a_single_winner_write() {
+        let db = AdeWorkspaceRegistry::open_test_db("test_rebind_workspace_route_cas").await;
+        let mut row = workspace("legacy", "project-a");
+        row.remote_host = Some("old-alias".into());
+        db.create_workspace(row.clone()).await.unwrap();
+
+        assert!(
+            db.rebind_workspace_route(
+                row.id.clone(),
+                Some("old-alias".into()),
+                None,
+                Some("new-alias".into()),
+                Some("daemon-a".into()),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !db.rebind_workspace_route(
+                row.id.clone(),
+                Some("old-alias".into()),
+                None,
+                Some("other-alias".into()),
+                Some("daemon-b".into()),
+            )
+            .await
+            .unwrap()
+        );
+
+        let stored = db.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.remote_host.as_deref(), Some("new-alias"));
+        assert_eq!(stored.daemon_id.as_deref(), Some("daemon-a"));
+    }
+
+    #[gpui::test]
+    async fn test_rebind_conflict_keeps_the_deterministic_legacy_survivor() {
+        let db = AdeWorkspaceRegistry::open_test_db("test_rebind_conflict_survivor").await;
+        let session_id = "ade-main-000001";
+
+        let mut first = workspace("first", "project-a");
+        first.remote_host = Some("alias-a".into());
+        first.terminal_session_id = Some(session_id.into());
+        first.last_opened_at = OffsetDateTime::from_unix_timestamp(200).unwrap();
+        db.create_workspace(first.clone()).await.unwrap();
+
+        let mut preferred = workspace("preferred", "project-a");
+        preferred.remote_host = Some("alias-b".into());
+        preferred.terminal_session_id = Some(session_id.into());
+        preferred.branch = Some("feature/x".into());
+        preferred.last_opened_at = OffsetDateTime::from_unix_timestamp(100).unwrap();
+        db.create_workspace(preferred.clone()).await.unwrap();
+
+        assert!(
+            db.rebind_workspace_route(
+                first.id.clone(),
+                first.remote_host.clone(),
+                None,
+                Some("alias-a".into()),
+                Some("daemon-a".into()),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            db.rebind_workspace_route(
+                preferred.id.clone(),
+                preferred.remote_host.clone(),
+                None,
+                Some("alias-b".into()),
+                Some("daemon-a".into()),
+            )
+            .await
+            .is_err(),
+            "the second legacy row collides with the owner bound first"
+        );
+
+        let survivor = db
+            .resolve_rebind_conflict(
+                preferred.id.clone(),
+                preferred.remote_host.clone(),
+                None,
+                Some("alias-b".into()),
+                Some("daemon-a".into()),
+                session_id.into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(survivor, Some(preferred.id.clone()));
+
+        let rows = db.list_workspaces().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, preferred.id);
+        assert_eq!(rows[0].branch.as_deref(), Some("feature/x"));
+        assert_eq!(rows[0].remote_host.as_deref(), Some("alias-b"));
+        assert_eq!(rows[0].daemon_id.as_deref(), Some("daemon-a"));
+    }
+
+    #[gpui::test]
+    async fn test_confirming_a_quarantined_row_makes_it_visible_and_preserves_metadata() {
+        let db = AdeWorkspaceRegistry::open_test_db(
+            "test_confirming_a_quarantined_row_makes_it_visible_and_preserves_metadata",
+        )
+        .await;
+
+        let mut quarantined = workspace("legacy", "project-a");
+        quarantined.branch = Some("feature/x".into());
+        quarantined.remote_host = Some("dev-box".into());
+        quarantined.terminal_session_id = Some("sess-1".into());
+        insert_confirmed_row(&db, quarantined.clone(), None).await;
+
+        // Quarantined: hidden from every normal read.
+        assert!(db.get_workspace(quarantined.id.clone()).unwrap().is_none());
+        assert!(db.list_workspaces().unwrap().is_empty());
+        assert!(
+            db.list_workspaces_for_project("project-a".into())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.unconfirmed_workspaces().unwrap().len(), 1);
+
+        let confirmed_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        db.confirm_workspace(
+            quarantined.id.clone(),
+            quarantined.remote_host.clone(),
+            quarantined.daemon_id.clone(),
+            confirmed_at,
+        )
+        .await
+        .unwrap();
+
+        // Confirmed: visible everywhere, id and metadata untouched, timestamp updated.
+        let confirmed = db.get_workspace(quarantined.id.clone()).unwrap().unwrap();
+        assert_eq!(confirmed.id, quarantined.id);
+        assert_eq!(confirmed.branch.as_deref(), Some("feature/x"));
+        assert_eq!(confirmed.remote_host.as_deref(), Some("dev-box"));
+        assert_eq!(confirmed.terminal_session_id.as_deref(), Some("sess-1"));
+        assert_eq!(confirmed.last_opened_at, confirmed_at);
+        assert_eq!(db.list_workspaces().unwrap().len(), 1);
+        assert!(db.unconfirmed_workspaces().unwrap().is_empty());
     }
 
     #[gpui::test]

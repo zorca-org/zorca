@@ -33,8 +33,8 @@
 //! never the whole tree.
 
 use crate::{
-    AdeWorkspace, AdeWorkspaceStore, SessionState, WorkspaceId, WorkspaceLifecycleService,
-    WorkspaceStatus,
+    AdeWorkspace, AdeWorkspaceStore, SessionState, WorkspaceEntry, WorkspaceId,
+    WorkspaceLifecycleService, WorkspaceStatus,
     attach::attach_terminal,
     create_workspace_modal::CreateWorkspaceModal,
     open_workspace_session,
@@ -72,25 +72,27 @@ pub(crate) enum SidebarRow {
         gone_count: usize,
     },
     Workspace {
-        workspace: AdeWorkspace,
-        state: SessionState,
+        entry: WorkspaceEntry,
     },
 }
 
 /// Flattens reconciled workspaces into project-grouped rows.
 ///
 /// Group order is first-appearance, and within a group the input order is
-/// preserved — the registry lists most-recently-opened first, so the project
-/// you last worked in floats to the top and its newest workspace leads it.
-pub(crate) fn group_rows(entries: &[(AdeWorkspace, SessionState)]) -> Vec<SidebarRow> {
-    let mut order: Vec<(Option<&str>, &str)> = Vec::new();
-    let mut grouped: HashMap<(Option<&str>, &str), Vec<&(AdeWorkspace, SessionState)>> =
-        HashMap::new();
+/// preserved — the pass lists the rows this client used most recently first and
+/// what its hosts merely hold after them, so the project you last worked in
+/// floats to the top and its newest workspace leads it.
+pub(crate) fn group_rows(entries: &[WorkspaceEntry]) -> Vec<SidebarRow> {
+    let mut order: Vec<(Option<String>, String)> = Vec::new();
+    let mut grouped: HashMap<(Option<String>, String), Vec<&WorkspaceEntry>> = HashMap::new();
 
     for entry in entries {
-        let key = (entry.0.remote_host.as_deref(), entry.0.project_id.as_str());
+        let key = (
+            entry.remote_host().map(ToOwned::to_owned),
+            entry.project_id(),
+        );
         grouped
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| {
                 order.push(key);
                 Vec::new()
@@ -99,32 +101,26 @@ pub(crate) fn group_rows(entries: &[(AdeWorkspace, SessionState)]) -> Vec<Sideba
     }
 
     let mut rows = Vec::with_capacity(entries.len() + order.len());
-    for (remote_host, project_id) in order {
-        let group = grouped
-            .remove(&(remote_host, project_id))
-            .unwrap_or_default();
+    for key in order {
+        let group = grouped.remove(&key).unwrap_or_default();
         let live_count = group
             .iter()
-            .filter(|(_, state)| *state == SessionState::Alive)
+            .filter(|entry| entry.state() == SessionState::Alive)
             .count();
         let gone_count = group
             .iter()
-            .filter(|(_, state)| *state == SessionState::Dead)
+            .filter(|entry| entry.state() == SessionState::Dead)
             .count();
+        let (remote_host, project_id) = key;
         rows.push(SidebarRow::Project {
-            project_id: project_id.to_owned(),
-            remote_host: remote_host.map(ToOwned::to_owned),
+            project_id,
+            remote_host,
             live_count,
             gone_count,
         });
-        rows.extend(
-            group
-                .into_iter()
-                .map(|(workspace, state)| SidebarRow::Workspace {
-                    workspace: workspace.clone(),
-                    state: *state,
-                }),
-        );
+        rows.extend(group.into_iter().map(|entry| SidebarRow::Workspace {
+            entry: entry.clone(),
+        }));
     }
     rows
 }
@@ -191,6 +187,7 @@ impl WorkspaceSidebar {
         if let Some(selected) = &self.selected
             && !entries
                 .iter()
+                .filter_map(WorkspaceEntry::persisted)
                 .any(|(workspace, _)| &workspace.id == selected)
         {
             self.selected = None;
@@ -246,6 +243,52 @@ impl WorkspaceSidebar {
                 this.error = outcome.err().map(|error| format!("{error:#}").into());
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Clicking a discovered row: confirm it first, which is what records that
+    /// this client uses the workspace, then open the row that comes back
+    /// exactly as any other row is opened.
+    ///
+    /// A record that vanished between the listing and the click comes back as
+    /// [`crate::lifecycle::WorkspaceGone`]; the reconcile that follows drops it from the
+    /// tree, so nothing is persisted for a workspace that no longer exists.
+    fn open_discovered(
+        &mut self,
+        remote_host: Option<String>,
+        wire_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lifecycle = self.lifecycle.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let confirmed = cx
+                .background_spawn(async move {
+                    lifecycle
+                        .confirm_discovered(remote_host.as_deref(), &wire_id)
+                        .await
+                })
+                .await;
+            match confirmed {
+                Ok(workspace) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.select_workspace(workspace.id, window, cx);
+                        this.reconcile(cx);
+                    })
+                    .ok();
+                }
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.error = error
+                            .downcast_ref::<crate::lifecycle::WorkspaceGone>()
+                            .is_none()
+                            .then(|| format!("{error:#}").into());
+                        this.reconcile(cx);
+                    })
+                    .ok();
+                }
+            }
         })
         .detach();
     }
@@ -326,7 +369,7 @@ impl WorkspaceSidebar {
     /// Forgets the workspace.
     ///
     /// **Registry only — this must never touch the session backend.** A
-    /// removed workspace's session goes on running and can be adopted again
+    /// removed workspace's session goes on running and can be discovered again
     /// later; that is exactly what makes removal safe to offer without a
     /// confirmation, and exactly what would be destroyed by "helpfully"
     /// killing the session here.
@@ -363,16 +406,17 @@ impl WorkspaceSidebar {
             .log_err();
     }
 
+    /// Rows only: a discovery is nothing this client has used, so cleanup —
+    /// which kills daemon records — must not reach one.
     fn gone_workspace_ids(&self) -> Vec<WorkspaceId> {
         self.rows
             .iter()
             .filter_map(|row| match row {
-                SidebarRow::Workspace {
-                    workspace,
-                    state: SessionState::Dead,
-                } => Some(workspace.id.clone()),
+                SidebarRow::Workspace { entry } => entry.persisted(),
                 _ => None,
             })
+            .filter(|(_, state)| *state == SessionState::Dead)
+            .map(|(workspace, _)| workspace.id.clone())
             .collect()
     }
 
@@ -519,6 +563,71 @@ impl WorkspaceSidebar {
     }
 
     fn render_workspace_row(
+        &self,
+        ix: usize,
+        entry: &WorkspaceEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match entry {
+            WorkspaceEntry::Persisted(workspace, state) => {
+                self.render_persisted_row(ix, workspace, *state, cx)
+            }
+            WorkspaceEntry::Discovered {
+                remote_host,
+                workspace,
+                state,
+            } => self.render_discovered_row(ix, entry, remote_host, &workspace.id, *state, cx),
+        }
+    }
+
+    /// A workspace a host's daemon holds and this client has never opened.
+    ///
+    /// **No destructive controls**, and no rename or recreate: every one of
+    /// them addresses a registry row, and there is none until the click below
+    /// confirms one. Promotion is what earns a row its context menu.
+    fn render_discovered_row(
+        &self,
+        ix: usize,
+        entry: &WorkspaceEntry,
+        remote_host: &Option<String>,
+        wire_id: &str,
+        state: SessionState,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let dot_color = status_color(match state {
+            SessionState::Alive => WorkspaceStatus::Running,
+            SessionState::Dead => WorkspaceStatus::Disconnected,
+            SessionState::NeverCreated | SessionState::Unknown => WorkspaceStatus::Stopped,
+        });
+        let name = entry.name();
+        let repository_path = entry.repository_path().to_string_lossy().into_owned();
+        let wire_id = wire_id.to_owned();
+        let remote_host = remote_host.clone();
+
+        ListItem::new(("ade-discovered-item", ix))
+            .spacing(ListItemSpacing::Sparse)
+            .indent_level(1)
+            .start_slot(Indicator::dot().color(dot_color))
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .child(Label::new(name).color(Color::Muted).truncate())
+                    .child(
+                        Label::new(format!("{wire_id} · {repository_path}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .buffer_font(cx)
+                            .truncate(),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_discovered(remote_host.clone(), wire_id.clone(), window, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn render_persisted_row(
         &self,
         ix: usize,
         workspace: &AdeWorkspace,
@@ -701,10 +810,10 @@ impl Render for WorkspaceSidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let rows = self.rows.clone();
         let selected_group = self.rows.iter().find_map(|row| match row {
-            SidebarRow::Workspace { workspace, .. }
-                if self.selected.as_ref() == Some(&workspace.id) =>
-            {
-                Some((workspace.remote_host.clone(), workspace.project_id.clone()))
+            SidebarRow::Workspace { entry } => {
+                let (workspace, _) = entry.persisted()?;
+                (self.selected.as_ref() == Some(&workspace.id))
+                    .then(|| (workspace.remote_host.clone(), workspace.project_id.clone()))
             }
             _ => None,
         });
@@ -770,8 +879,8 @@ impl Render for WorkspaceSidebar {
                                 ),
                                 cx,
                             ),
-                            SidebarRow::Workspace { workspace, state } => {
-                                self.render_workspace_row(ix, workspace, *state, cx)
+                            SidebarRow::Workspace { entry } => {
+                                self.render_workspace_row(ix, entry, cx)
                             }
                         }))
                     }),
@@ -916,10 +1025,41 @@ mod tests {
         project_id: &str,
         status: WorkspaceStatus,
         state: SessionState,
-    ) -> (AdeWorkspace, SessionState) {
+    ) -> WorkspaceEntry {
         let mut workspace = AdeWorkspace::new(name, project_id, PathBuf::from("/repos/zed"));
         workspace.status = status;
-        (workspace, state)
+        WorkspaceEntry::Persisted(workspace, state)
+    }
+
+    /// The same row, on a named host.
+    fn entry_on(
+        host: &str,
+        name: &str,
+        project_id: &str,
+        status: WorkspaceStatus,
+        state: SessionState,
+    ) -> WorkspaceEntry {
+        let WorkspaceEntry::Persisted(mut workspace, state) =
+            entry(name, project_id, status, state)
+        else {
+            unreachable!("entry builds a row")
+        };
+        workspace.remote_host = Some(host.to_owned());
+        WorkspaceEntry::Persisted(workspace, state)
+    }
+
+    /// A workspace a host holds that this client has never opened.
+    fn discovered(name: &str, root: &str, state: SessionState) -> WorkspaceEntry {
+        WorkspaceEntry::Discovered {
+            remote_host: None,
+            workspace: crate::BackendWorkspace {
+                id: name.to_owned(),
+                name: name.to_owned(),
+                project_root: root.to_owned(),
+                created_at: 1_700_000_000,
+            },
+            state,
+        }
     }
 
     #[test]
@@ -956,15 +1096,13 @@ mod tests {
         assert_eq!(
             rows[1],
             SidebarRow::Workspace {
-                workspace: entries[0].0.clone(),
-                state: SessionState::Alive,
+                entry: entries[0].clone(),
             }
         );
         assert_eq!(
             rows[2],
             SidebarRow::Workspace {
-                workspace: entries[2].0.clone(),
-                state: SessionState::Dead,
+                entry: entries[2].clone(),
             }
         );
         // The second project keeps first-appearance order, so it follows.
@@ -980,8 +1118,45 @@ mod tests {
         assert_eq!(
             rows[4],
             SidebarRow::Workspace {
-                workspace: entries[1].0.clone(),
-                state: SessionState::NeverCreated,
+                entry: entries[1].clone(),
+            }
+        );
+    }
+
+    /// A discovery groups by the project its root names, so it lands beside the
+    /// rows of the same checkout rather than under a heading of its own.
+    #[test]
+    fn test_group_rows_place_discoveries_in_their_project() {
+        let entries = vec![
+            entry("main", "zed", WorkspaceStatus::Running, SessionState::Alive),
+            discovered("ade-zed-2de8b3", "/repos/zed", SessionState::Alive),
+            discovered("ade-praxis-0f1e2d", "/repos/praxis", SessionState::Dead),
+        ];
+
+        let rows = group_rows(&entries);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0],
+            SidebarRow::Project {
+                project_id: "zed".into(),
+                remote_host: None,
+                live_count: 2,
+                gone_count: 0,
+            }
+        );
+        assert_eq!(
+            rows[2],
+            SidebarRow::Workspace {
+                entry: entries[1].clone(),
+            }
+        );
+        assert_eq!(
+            rows[3],
+            SidebarRow::Project {
+                project_id: "praxis".into(),
+                remote_host: None,
+                live_count: 0,
+                gone_count: 1,
             }
         );
     }
@@ -993,28 +1168,29 @@ mod tests {
 
     #[test]
     fn test_group_rows_scopes_projects_by_host() {
-        let mut first = entry(
-            "first",
-            "viral-studio",
-            WorkspaceStatus::Running,
-            SessionState::Alive,
-        );
-        first.0.remote_host = Some("user@host-a".into());
-        let mut other_host = entry(
-            "other-host",
-            "viral-studio",
-            WorkspaceStatus::Running,
-            SessionState::Alive,
-        );
-        other_host.0.remote_host = Some("user@host-b".into());
-        let mut second = entry(
-            "second",
-            "viral-studio",
-            WorkspaceStatus::Disconnected,
-            SessionState::Dead,
-        );
-        second.0.remote_host = Some("user@host-a".into());
-        let entries = vec![first, other_host, second];
+        let entries = vec![
+            entry_on(
+                "user@host-a",
+                "first",
+                "viral-studio",
+                WorkspaceStatus::Running,
+                SessionState::Alive,
+            ),
+            entry_on(
+                "user@host-b",
+                "other-host",
+                "viral-studio",
+                WorkspaceStatus::Running,
+                SessionState::Alive,
+            ),
+            entry_on(
+                "user@host-a",
+                "second",
+                "viral-studio",
+                WorkspaceStatus::Disconnected,
+                SessionState::Dead,
+            ),
+        ];
 
         let rows = group_rows(&entries);
         assert_eq!(rows.len(), 5);
@@ -1077,7 +1253,10 @@ mod tests {
         ));
         cx.update(|cx| cx.set_global(crate::GlobalLifecycleService(lifecycle.clone())));
 
-        let rows = group_rows(&[(dead_workspace, SessionState::Dead)]);
+        let rows = group_rows(&[WorkspaceEntry::Persisted(
+            dead_workspace,
+            SessionState::Dead,
+        )]);
         let (sidebar, cx) = cx.add_window_view(|_, cx| WorkspaceSidebar {
             workspace: WeakEntity::new_invalid(),
             lifecycle,
@@ -1134,8 +1313,11 @@ mod tests {
 
     #[test]
     fn test_a_dead_session_reads_disconnected_before_the_registry_catches_up() {
-        let (mut workspace, _) =
-            entry("main", "zed", WorkspaceStatus::Running, SessionState::Alive);
+        let WorkspaceEntry::Persisted(mut workspace, _) =
+            entry("main", "zed", WorkspaceStatus::Running, SessionState::Alive)
+        else {
+            unreachable!("entry builds a row")
+        };
         // The backend says gone; the row must not still show green.
         assert_eq!(
             workspace_status(&workspace, SessionState::Dead),

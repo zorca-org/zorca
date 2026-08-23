@@ -35,7 +35,7 @@ pub use layout::{
     arrangement_from_layout, broadcast_action, capture_layout, layout_from_arrangement,
     render_layout, session_task_id, split_flexes,
 };
-pub use lifecycle::{Reconciled, SessionState, WorkspaceLifecycleService};
+pub use lifecycle::{Reconciled, SessionState, WorkspaceEntry, WorkspaceLifecycleService};
 pub use missing_tab::MissingTab;
 pub use registry::AdeWorkspaceRegistry;
 pub use rename_workspace_modal::open_rename_workspace_modal;
@@ -250,8 +250,8 @@ pub struct AdeWorkspace {
     /// The backend's session id — a tmux session name today — once a session
     /// has been created for this workspace. See [`SessionId`].
     pub terminal_session_id: Option<String>,
-    /// The daemon's own identity, as of this row's last adoption, rebind, or
-    /// creation. `None` if the daemon reports no identity of its own.
+    /// The daemon's own identity, as of this row's last confirmation, rebind,
+    /// or creation. `None` if the daemon reports no identity of its own.
     pub daemon_id: Option<String>,
     pub status: WorkspaceStatus,
     pub created_at: OffsetDateTime,

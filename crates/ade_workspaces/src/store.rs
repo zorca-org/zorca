@@ -8,14 +8,16 @@
 //! ledger sidebar — that is a bug waiting on a second window. So the stream is
 //! consumed exactly once, here, in a process-wide global; the reconciled
 //! entries live on this entity, and every view observes it with
-//! [`gpui::Context::observe`]. Adding a third surface costs nothing.
+//! [`gpui::Context::observe`]. Adding a third surface costs nothing. A failed
+//! host listing retains its cached discoveries as `Unknown` until that host
+//! answers again.
 //!
 //! **Blocking.** The lifecycle service drives the session backend and reads
 //! sqlite, so every call into it goes through the background executor — the same
 //! rule that holds everywhere else in this crate.
 
 use crate::{
-    AdeWorkspace, AdeWorkspaceRegistry, SessionState, StatusDelivery, WorkspaceId,
+    AdeWorkspaceRegistry, SessionState, StatusDelivery, WorkspaceEntry, WorkspaceId,
     WorkspaceLifecycleService,
 };
 use gpui::{
@@ -30,11 +32,12 @@ struct GlobalWorkspaceStore(Entity<AdeWorkspaceStore>);
 
 impl Global for GlobalWorkspaceStore {}
 
-/// What the session backend last said about every registered workspace, kept
-/// current from the daemon's pushed status events.
+/// What the session backend last said about every workspace this client uses
+/// and every one its hosts hold, kept current from the daemon's pushed status
+/// events.
 pub struct AdeWorkspaceStore {
     lifecycle: Arc<WorkspaceLifecycleService>,
-    entries: Vec<(AdeWorkspace, SessionState)>,
+    entries: Vec<WorkspaceEntry>,
     /// One line per host the last pass could not reach. Their entries are still
     /// listed, showing what was last known of them.
     host_errors: Vec<SharedString>,
@@ -63,6 +66,7 @@ pub struct AdeWorkspaceStore {
     title_watchers: HashMap<EntityId, (WeakEntity<Terminal>, Subscription)>,
     refresh_task: Task<()>,
     _status_task: Task<()>,
+    _workspace_change_task: Task<()>,
 }
 
 impl AdeWorkspaceStore {
@@ -88,7 +92,9 @@ impl AdeWorkspaceStore {
         // backend gets a timer; a pushing one gets a reader and *no* timer,
         // because a timer beside the pushes would be exactly the polling the
         // daemon exists to end.
-        let (status_task, status_stream_error) = match lifecycle.status_delivery() {
+        let (status_task, workspace_change_task, status_stream_error) = match lifecycle
+            .status_delivery()
+        {
             StatusDelivery::Poll {
                 interval: refresh_interval,
             } => (
@@ -100,16 +106,29 @@ impl AdeWorkspaceStore {
                         }
                     }
                 }),
+                Task::ready(()),
                 None,
             ),
-            StatusDelivery::Push => match lifecycle.subscribe_status() {
-                Ok(events) => (
+            StatusDelivery::Push => match lifecycle.subscribe_status().and_then(|status_events| {
+                lifecycle
+                    .subscribe_workspace_changes()
+                    .map(|workspace_events| (status_events, workspace_events))
+            }) {
+                Ok((status_events, workspace_events)) => (
                     cx.spawn(async move |this, cx| {
-                        while events.recv().await.is_ok() {
+                        while status_events.recv().await.is_ok() {
                             // A burst — a session created, then its first
                             // status — is one refresh, not one per event:
                             // reconciling is a whole listing either way.
-                            while events.try_recv().is_ok() {}
+                            while status_events.try_recv().is_ok() {}
+                            if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                                break;
+                            }
+                        }
+                    }),
+                    cx.spawn(async move |this, cx| {
+                        while workspace_events.recv().await.is_ok() {
+                            while workspace_events.try_recv().is_ok() {}
                             if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
                                 break;
                             }
@@ -118,6 +137,7 @@ impl AdeWorkspaceStore {
                     None,
                 ),
                 Err(error) => (
+                    Task::ready(()),
                     Task::ready(()),
                     Some(SharedString::from(format!(
                         "status updates are off: {error:#}"
@@ -136,14 +156,16 @@ impl AdeWorkspaceStore {
             title_watchers: HashMap::new(),
             refresh_task: Task::ready(()),
             _status_task: status_task,
+            _workspace_change_task: workspace_change_task,
         };
         this.refresh(cx);
         this
     }
 
-    /// Every registered workspace with the state its session was last found in,
-    /// most recently opened first.
-    pub fn entries(&self) -> &[(AdeWorkspace, SessionState)] {
+    /// Every workspace with the state its session was last found in: the rows
+    /// this client uses first, most recently opened leading, then what the
+    /// hosts hold that it has never opened.
+    pub fn entries(&self) -> &[WorkspaceEntry] {
         &self.entries
     }
 
@@ -276,10 +298,15 @@ impl AdeWorkspaceStore {
                         // claimed about the session.
                         let entries = &this.entries;
                         this.session_titles.retain(|id, _| {
-                            entries.iter().any(|(workspace, state)| {
-                                &workspace.id == id
-                                    && matches!(state, SessionState::Alive | SessionState::Unknown)
-                            })
+                            entries.iter().filter_map(WorkspaceEntry::persisted).any(
+                                |(workspace, state)| {
+                                    &workspace.id == id
+                                        && matches!(
+                                            state,
+                                            SessionState::Alive | SessionState::Unknown
+                                        )
+                                },
+                            )
                         });
                     }
                     Err(error) => this.error = Some(format!("{error:#}").into()),
