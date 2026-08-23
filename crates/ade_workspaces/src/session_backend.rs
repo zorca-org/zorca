@@ -141,11 +141,11 @@ pub struct SessionInfo {
 
 /// One workspace the backend holds, as the source of truth describes it.
 ///
-/// The adoption half of "the backend is the source of truth, the registry is a
+/// The discovery half of "the backend is the source of truth, the registry is a
 /// cache": a client whose registry has never heard of a workspace — a fresh
 /// install, a second machine, a database that was thrown away — can only learn
 /// it exists from here. [`SessionInfo`] cannot stand in for it, because a
-/// workspace nobody has a *session* in still has to become a row.
+/// workspace nobody has a *session* in still has to be shown.
 ///
 /// Only the fields a registry row cannot derive: the id everything is keyed by,
 /// the display name (which the user may have changed, so it cannot be
@@ -419,9 +419,9 @@ pub trait SessionBackend: Send + Sync {
     /// the cache decides what the source of truth is allowed to contain.
     ///
     /// **An empty list, not an error, for a backend with no workspaces of its
-    /// own.** Adoption is a pass over every host, and tmux having nothing to
-    /// contribute is not a host failure — an error here reads as "this host
-    /// could not be asked", and the layers above treat it that way.
+    /// own.** Discovery is a pass over every host, and a backend having
+    /// nothing to contribute is not a host failure — an error here reads as
+    /// "this host could not be asked", and the layers above treat it that way.
     fn list_workspaces(&self) -> Result<Vec<BackendWorkspace>> {
         Ok(Vec::new())
     }

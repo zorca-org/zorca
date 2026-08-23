@@ -4,11 +4,11 @@
 //! The first window on a fresh connection used to open a plain centre-pane
 //! shell that died with the window, so connecting twice (or just closing and
 //! reopening Zorca) left throwaway shells and nothing to come back to. This
-//! module is the other branch of that fresh-window decision: it ensures the
-//! right daemon — this machine's or the ssh host's — adopts whatever it
-//! already holds, and then either reattaches to the project's most recently
-//! opened workspace or creates the first, exactly as the workspace panel's
-//! "Add workspace" would.
+//! module is the other branch of that fresh-window decision: it asks the right
+//! daemon — this machine's or the ssh host's — what it already holds, and then
+//! reattaches to the project's most recently opened workspace or creates the
+//! first. A workspace only the daemon knows stays available in the sidebar for
+//! the user to open instead of being duplicated here.
 //!
 //! Opening attaches: it builds the daemon's layout and attaches to the
 //! sessions it names, so a second connect reattaches rather than spawning, and
@@ -24,7 +24,7 @@
 //! reason.
 
 use crate::{
-    AdeWorkspace, SessionState, WorkspaceLifecycleService,
+    AdeWorkspace, SessionState, WorkspaceEntry, WorkspaceLifecycleService,
     attach::attach_terminal,
     open_workspace_session,
     store::AdeWorkspaceStore,
@@ -178,7 +178,7 @@ pub fn open_connection_workspace(
         }
 
         // Blocking, deliberately: the ensure drives the host's ssh connection
-        // (or the local daemon proxy) and adoption reads the daemon, then
+        // (or the local daemon proxy) and the listing reads the daemon, then
         // sqlite.
         let listed = cx
             .background_spawn({
@@ -261,7 +261,16 @@ pub fn open_connection_workspace(
         })
         .ok();
 
+        // A row this client already has for the root leads. A transient record
+        // stays in the sidebar until the user opens it; creating beside it
+        // would duplicate the daemon workspace.
         let existing = most_recent_workspace(ssh.as_ref(), &repository_path, &workspaces).cloned();
+        if existing.is_none()
+            && has_discovered_workspace(ssh.as_ref(), &repository_path, &workspaces)
+        {
+            open_plain_terminal_if_empty(&this, cx);
+            return;
+        }
         let opened = match existing {
             Some(existing) => open_or_recreate(&this, &lifecycle, existing, cx).await,
             None => {
@@ -451,9 +460,9 @@ fn open_plain_terminal_if_empty(this: &WeakEntity<Workspace>, cx: &mut AsyncWind
     .ok();
 }
 
-/// The daemon workspace this connection reattaches to: the most recently
-/// opened one for the connected root on this host. `None` means the project has
-/// no workspace yet, which is what makes a fresh connection create one.
+/// The row this connection reattaches to: the most recently opened one for the
+/// connected root on this host. `None` means this client has never opened a
+/// workspace here, which is what checks [`has_discovered_workspace`].
 ///
 /// `ssh` is `None` for the local connection, and matches only workspaces
 /// with no `remote_host` of their own — a local project must never reattach
@@ -461,12 +470,14 @@ fn open_plain_terminal_if_empty(this: &WeakEntity<Workspace>, cx: &mut AsyncWind
 fn most_recent_workspace<'a>(
     ssh: Option<&SshConnectionOptions>,
     root: &Path,
-    workspaces: &'a [AdeWorkspace],
+    entries: &'a [WorkspaceEntry],
 ) -> Option<&'a AdeWorkspace> {
-    workspaces
+    entries
         .iter()
+        .filter_map(WorkspaceEntry::persisted)
+        .map(|(workspace, _)| workspace)
         .filter(|workspace| {
-            workspace_matches_connection(ssh, workspace.remote_host.as_deref())
+            persisted_workspace_matches_connection(ssh, workspace)
                 && workspace.repository_path == root
         })
         // A tie keeps the earlier candidate, so a caller whose list is already
@@ -476,6 +487,40 @@ fn most_recent_workspace<'a>(
             Some(best) if best.last_opened_at >= workspace.last_opened_at => Some(best),
             _ => Some(workspace),
         })
+}
+
+fn persisted_workspace_matches_connection(
+    ssh: Option<&SshConnectionOptions>,
+    workspace: &AdeWorkspace,
+) -> bool {
+    match ssh {
+        Some(ssh) if workspace.daemon_id.is_none() => {
+            workspace.remote_host.as_deref() == Some(ssh_destination(ssh).as_str())
+        }
+        Some(ssh) => host_matches_destination(ssh, workspace.remote_host.as_deref()),
+        None => workspace.remote_host.is_none(),
+    }
+}
+
+/// Whether the host already holds a record for this connected root. The
+/// sidebar owns promotion; the connection flow only avoids duplicating it.
+fn has_discovered_workspace(
+    ssh: Option<&SshConnectionOptions>,
+    root: &Path,
+    entries: &[WorkspaceEntry],
+) -> bool {
+    entries.iter().any(|entry| match entry {
+        WorkspaceEntry::Discovered {
+            remote_host,
+            workspace,
+            ..
+        } if workspace_matches_connection(ssh, remote_host.as_deref())
+            && Path::new(&workspace.project_root) == root =>
+        {
+            true
+        }
+        _ => false,
+    })
 }
 
 /// Whether a workspace's stored `remote_host` names the connection this window
@@ -794,24 +839,36 @@ mod tests {
         ));
     }
 
+    /// Rows as a reconciled pass hands them over, for the matching tests.
+    fn rows(workspaces: Vec<AdeWorkspace>) -> Vec<WorkspaceEntry> {
+        workspaces
+            .into_iter()
+            .map(|workspace| WorkspaceEntry::Persisted(workspace, SessionState::Unknown))
+            .collect()
+    }
+
     #[test]
     fn test_most_recent_workspace_requires_the_exact_root() {
         let opened_at = |seconds| time::OffsetDateTime::from_unix_timestamp(seconds).unwrap();
         let ssh = ssh("wsl-box", Some("kingii"), None);
         let mut exact = AdeWorkspace::new("main", "testproj", "/home/kingii/testproj");
         exact.remote_host = Some("wsl-box".to_owned());
+        exact.daemon_id = Some("daemon-a".to_owned());
         exact.last_opened_at = opened_at(100);
         let mut inside_new = AdeWorkspace::new("new", "testproj", "/home/kingii/testproj/wt");
         inside_new.remote_host = Some("kingii@wsl-box".to_owned());
+        inside_new.daemon_id = Some("daemon-a".to_owned());
         inside_new.last_opened_at = opened_at(200);
         let mut elsewhere = AdeWorkspace::new("elsewhere", "other", "/home/kingii/other");
         elsewhere.remote_host = Some("wsl-box".to_owned());
+        elsewhere.daemon_id = Some("daemon-a".to_owned());
         elsewhere.last_opened_at = opened_at(300);
         let mut other_host = AdeWorkspace::new("other-host", "testproj", "/home/kingii/testproj");
         other_host.remote_host = Some("gpu-box".to_owned());
+        other_host.daemon_id = Some("daemon-b".to_owned());
         other_host.last_opened_at = opened_at(400);
 
-        let workspaces = vec![exact, inside_new, elsewhere, other_host];
+        let workspaces = rows(vec![exact, inside_new, elsewhere, other_host]);
         let best =
             most_recent_workspace(Some(&ssh), Path::new("/home/kingii/testproj"), &workspaces);
         assert_eq!(best.map(|workspace| workspace.name.as_str()), Some("main"));
@@ -835,15 +892,66 @@ mod tests {
         let mut local = AdeWorkspace::new("local", "testproj", "/home/kingii/testproj");
         local.remote_host = None;
 
-        let workspaces = vec![remote.clone()];
+        let workspaces = rows(vec![remote.clone()]);
         assert_eq!(
             most_recent_workspace(None, Path::new("/home/kingii/testproj"), &workspaces),
             None
         );
 
-        let workspaces = vec![remote, local];
+        let workspaces = rows(vec![remote, local]);
         let best = most_recent_workspace(None, Path::new("/home/kingii/testproj"), &workspaces);
         assert_eq!(best.map(|workspace| workspace.name.as_str()), Some("local"));
+    }
+
+    #[test]
+    fn test_identityless_rows_require_the_exact_route() {
+        let ssh = ssh("wsl-box", Some("kingii"), None);
+        let mut workspace = AdeWorkspace::new("main", "testproj", "/home/user/testproj");
+        workspace.remote_host = Some("wsl-box".to_owned());
+        assert!(!persisted_workspace_matches_connection(
+            Some(&ssh),
+            &workspace
+        ));
+
+        workspace.daemon_id = Some("daemon-a".to_owned());
+        assert!(persisted_workspace_matches_connection(
+            Some(&ssh),
+            &workspace
+        ));
+    }
+
+    /// A discovery for this host and exact root blocks duplicate creation.
+    #[test]
+    fn test_a_discovery_for_the_connected_root_blocks_creation() {
+        let ssh = ssh("wsl-box", Some("kingii"), None);
+        let discovered =
+            |id: &str, root: &str, host: &str, created_at| WorkspaceEntry::Discovered {
+                remote_host: Some(host.to_owned()),
+                workspace: crate::BackendWorkspace {
+                    id: id.to_owned(),
+                    name: id.to_owned(),
+                    project_root: root.to_owned(),
+                    created_at,
+                },
+                state: SessionState::Unknown,
+            };
+        let entries = vec![
+            discovered("ade-b", "/home/user/testproj", "wsl-box", 200),
+            discovered("ade-a", "/home/user/testproj", "kingii@wsl-box", 100),
+            discovered("ade-elsewhere", "/home/user/other", "wsl-box", 50),
+            discovered("ade-other-host", "/home/user/testproj", "gpu-box", 10),
+        ];
+
+        assert!(has_discovered_workspace(
+            Some(&ssh),
+            Path::new("/home/user/testproj"),
+            &entries
+        ));
+
+        assert!(
+            !has_discovered_workspace(None, Path::new("/home/user/testproj"), &entries),
+            "a local connection must not treat a remote host's record as its own"
+        );
     }
 
     #[gpui::test]
