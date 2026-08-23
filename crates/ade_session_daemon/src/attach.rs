@@ -851,16 +851,24 @@ async fn pump_input(
 ) {
     let mut stdin = Unblock::new(std::io::stdin());
     let mut buffer = vec![0u8; INPUT_CHUNK_BYTES];
-    let mut focus_in = FocusInDetector::default();
+    let mut interaction = TerminalInteractionDetector::default();
     loop {
         let read = match stdin.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        if focus_in.advance(&buffer[..read])
-            && !claim_focus(&outbound, &session_id, view_id.as_deref(), &can_focus).await
-        {
-            break;
+        if let Some(hover) = interaction.advance(&buffer[..read]) {
+            if !claim_focus(
+                &outbound,
+                &session_id,
+                view_id.as_deref(),
+                &can_focus,
+                hover,
+            )
+            .await
+            {
+                break;
+            }
         }
         let frame = Frame::Write {
             session_id: session_id.clone(),
@@ -873,19 +881,26 @@ async fn pump_input(
 }
 
 #[derive(Default)]
-struct FocusInDetector(u8);
+struct TerminalInteractionDetector(u8);
 
-impl FocusInDetector {
-    fn advance(&mut self, bytes: &[u8]) -> bool {
-        let mut found = false;
+impl TerminalInteractionDetector {
+    /// `Some(false)` for focus-in, `Some(true)` for an SGR mouse report.
+    fn advance(&mut self, bytes: &[u8]) -> Option<bool> {
+        let mut found = None;
         for &byte in bytes {
             self.0 = match (self.0, byte) {
                 (_, b'\x1b') => 1,
                 (1, b'[') => 2,
                 (2, b'I') => {
-                    found = true;
+                    found = Some(false);
                     0
                 }
+                (2, b'<') => 3,
+                (3, b'M' | b'm') => {
+                    found.get_or_insert(true);
+                    0
+                }
+                (3, b'0'..=b'9' | b';') => 3,
                 _ => 0,
             };
         }
@@ -1010,7 +1025,7 @@ async fn send_size(
     if is_zed_bootstrap_size((cols, rows)) {
         return true;
     }
-    if claim && !claim_focus(outbound, session_id, view_id, can_focus).await {
+    if claim && !claim_focus(outbound, session_id, view_id, can_focus, false).await {
         return false;
     }
     outbound
@@ -1028,6 +1043,7 @@ async fn claim_focus(
     session_id: &SessionId,
     view_id: Option<&str>,
     can_focus: &AtomicBool,
+    hover: bool,
 ) -> bool {
     if !can_focus.load(Ordering::SeqCst) {
         return true;
@@ -1039,7 +1055,7 @@ async fn claim_focus(
         .send(QueuedFrame::Persistent(Frame::FocusSession {
             session_id: session_id.clone(),
             view_id: view_id.to_owned(),
-            hover: false,
+            hover,
         }))
         .await
         .is_ok()
@@ -1447,6 +1463,7 @@ mod handshake_tests {
                     &SessionId::new("s-1"),
                     Some("view-1"),
                     &AtomicBool::new(true),
+                    false,
                 )
                 .await
             );
@@ -1466,12 +1483,13 @@ mod handshake_tests {
     }
 
     #[test]
-    fn focus_in_is_detected_across_reads() {
-        let mut detector = FocusInDetector::default();
-        assert!(!detector.advance(b"terminal reply\x1b"));
-        assert!(!detector.advance(b"["));
-        assert!(detector.advance(b"Ityped input"));
-        assert!(!detector.advance(b"\x1b[0n"));
+    fn focus_and_hover_are_detected_across_reads() {
+        let mut detector = TerminalInteractionDetector::default();
+        assert_eq!(detector.advance(b"terminal reply\x1b"), None);
+        assert_eq!(detector.advance(b"["), None);
+        assert_eq!(detector.advance(b"Ityped input"), Some(false));
+        assert_eq!(detector.advance(b"\x1b[0n\x1b[<35;"), None);
+        assert_eq!(detector.advance(b"42;7M"), Some(true));
     }
 
     /// A daemon that reports `generation` and `instance_id`, then records every
