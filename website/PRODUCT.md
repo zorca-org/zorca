@@ -22,7 +22,7 @@ ZOrca is intended for developers who:
 - work with local and SSH-connected projects;
 - want project and agent-session context restored after restarting or reconnecting;
 - want terminals, files, diffs, staging, commits, and history together; and
-- prefer direct control over agent work to fleet automation.
+- prefer direct control over agent work.
 
 Contributors are a second audience. Public documentation should make the
 product's current scope, limitations, and relationship to upstream Zed clear.
@@ -91,21 +91,30 @@ Current capabilities:
 ZOrca is pre-alpha. Breaking changes are expected. There are no packaged,
 signed releases or automatic updates yet.
 
-Packaged releases, signing, notarisation, Homebrew distribution, automatic
-updates, and additional Linux distribution formats should be documented only
-after they are available.
+Before release, do not present packaged releases, signing, notarization,
+Homebrew distribution, automatic updates, or additional Linux formats as
+available.
+Public copy can identify Homebrew distribution as planned without a date.
 
 The following areas are planned, not current capabilities:
 
-- Deeper monitoring and interaction with running coding agents
-- Workspace-scoped communication between agents
-- A mobile companion for monitoring and interacting with workspaces
+- ZOrca will start a server that manages sessions, terminals, agents, and
+  workspaces through a REST API. The CLI will use the same API. The project
+  will evaluate OpenAPI for client generation.
+- A mobile app will manage sessions, terminals, agents, and workspaces on a Mac
+  or host that the user controls. It will connect over Tailscale or a local
+  network.
+- Cron schedules will start agents with automation prompts. The agents can run
+  on the local machine or an SSH-connected remote host.
 
-Do not present planned work as released or attach dates unless a public release
-plan has been approved and published.
+The project will evaluate a Cloudflare stack for mobile access, remote
+schedules, and API coordination. The final deployment model is not set.
 
-ZOrca does not currently provide fleet orchestration, scheduled automation, or
-browser-based control.
+Do not present planned work as released. If the project has no approved public
+release plan, do not attach dates.
+
+ZOrca does not currently provide fleet orchestration, scheduled automation, a
+mobile app, or a public REST API for session management.
 
 ## Brand Commitments
 

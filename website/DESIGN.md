@@ -66,7 +66,7 @@ status labels, code, and table metadata.
 - Current capabilities: alternating two-column product stories
 - Zed foundation: dark capability inventory
 - Comparison: factual table following current capabilities
-- Coming soon: clearly labelled planned work without dates or progress claims
+- Roadmap: clearly labelled planned work without dates or progress claims
 - Install: commands and current release-status information
 
 At `850px`, two-column sections become single-column, roadmap rows stack, and

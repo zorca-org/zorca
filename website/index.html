@@ -194,7 +194,7 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
   <nav class="nav" aria-label="Primary">
     <a class="brand" href="#top"><img src="zorca-logo-m1-128.png" width="38" height="38" alt="">ZOrca</a>
     <div class="nav-links">
-      <a href="#features">Features</a><a href="#compare">Compare</a><a href="#roadmap">Coming soon</a><a href="#install">Install</a>
+      <a href="#features">Features</a><a href="#compare">Compare</a><a href="#roadmap">Roadmap</a><a href="#install">Install</a>
       <a class="source" href="https://github.com/zorca-org/zorca" aria-label="ZOrca source on GitHub">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .7a11.5 11.5 0 0 0-3.64 22.41c.58.11.79-.25.79-.56v-2.24c-3.22.7-3.9-1.37-3.9-1.37-.53-1.34-1.29-1.7-1.29-1.7-1.05-.72.08-.71.08-.71 1.17.08 1.78 1.2 1.78 1.2 1.04 1.78 2.72 1.27 3.38.97.1-.75.41-1.27.74-1.56-2.57-.29-5.27-1.28-5.27-5.69 0-1.26.45-2.28 1.19-3.09-.12-.29-.52-1.47.11-3.05 0 0 .97-.31 3.16 1.18a10.98 10.98 0 0 1 5.76 0c2.2-1.49 3.16-1.18 3.16-1.18.63 1.58.23 2.76.11 3.05.74.81 1.19 1.83 1.19 3.09 0 4.42-2.71 5.39-5.29 5.68.42.36.78 1.06.78 2.14v3.18c0 .31.21.68.8.56A11.5 11.5 0 0 0 12 .7Z"/></svg><span>Source</span>
       </a>
@@ -202,9 +202,9 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
   </nav>
   <div class="hero-copy">
     <h1>All your agents. All your projects. One native workspace.</h1>
-    <p class="lead">ZOrca is an Agent Development Environment built on Zed. Give every coding agent its own Git worktree, terminal, and diff, then restore its project and session context when you return.</p>
-    <a class="cta" href="#install">Install now</a>
-    <p class="status">Pre-alpha · Available from source · Homebrew coming</p>
+    <p class="lead">ZOrca is an Agent Development Environment that uses Zed as its foundation. Each coding agent gets a Git worktree, terminal, and diff. When you return, ZOrca restores the project and session context.</p>
+    <a class="cta" href="#install">Install ZOrca</a>
+    <p class="status">Pre-alpha · Source builds for macOS and Linux · Homebrew planned</p>
   </div>
   <figure class="hero-shot">
     <img src="zorca-workspace-800.webp" srcset="zorca-workspace-800.webp 800w, zorca-workspace.webp 1600w" sizes="(max-width:850px) calc(100vw - 2rem), 800px" width="1600" height="1041" alt="ZOrca showing project worktrees, an agent terminal, and repository files" fetchpriority="high" onload="this.parentElement.classList.add('loaded')">
@@ -216,17 +216,17 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
     <div class="wrap">
       <h2 class="sr">Current capabilities</h2>
       <article class="feature">
-        <div class="copy"><h3>Resume every project and session.</h3><p>Keep local and SSH-connected repositories in one sidebar. ZOrca saves the project tree, active workspace, and agent terminal sessions, then restores that context when the app or connection returns.</p><ul class="proof"><li>Projects and worktrees return to the sidebar</li><li>Persistent sessions reconnect or can be recreated</li><li>Active workspace and terminal tabs reopen together</li></ul></div>
+        <div class="copy"><h3>Project and session restoration.</h3><p>ZOrca keeps local and SSH-connected repositories in one sidebar. It saves the project tree, active workspace, and agent terminal sessions. When the app or connection returns, ZOrca restores that context.</p><ul class="proof"><li>Projects and worktrees return to the sidebar.</li><li>Persistent sessions reconnect. You can recreate unavailable sessions.</li><li>ZOrca reopens the active workspace and terminal tabs.</li></ul></div>
         <figure class="product-view focus-projects"><div class="frame"><video autoplay muted loop playsinline preload="auto" aria-label="ZOrca switching between restored Claude Code and OpenAI Codex project sessions"><source src="zorca-projects.mp4?v=3" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · persistent projects and sessions</figcaption></figure>
       </article>
 
       <article class="feature">
-        <div class="copy"><h3>Give every agent its own worktree.</h3><p>Agents work in separate Git worktrees instead of colliding in one checkout. Their terminal context and working files stay attributable to one workspace.</p><ul class="proof"><li>Worktree-backed isolation</li><li>Parallel branches without checkout churn</li><li>Project context stays visible</li></ul></div>
+        <div class="copy"><h3>A separate worktree for each agent.</h3><p>ZOrca gives each agent a separate Git worktree. Thus, agents do not change the same checkout. Each workspace keeps the terminal context and working files of its agent.</p><ul class="proof"><li>Each agent uses one worktree.</li><li>Agents can use parallel branches.</li><li>The project context stays visible.</li></ul></div>
         <figure class="product-view focus-worktree"><div class="frame"><video autoplay muted loop playsinline preload="metadata" aria-label="ZOrca opening an isolated storefront worktree and its source context"><source src="zorca-worktree.mp4" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · worktree and terminal context</figcaption></figure>
       </article>
 
       <article class="feature">
-        <div class="copy"><h3>Review terminals and changes together.</h3><p>The Git cockpit follows the active workspace: inspect diffs, stage changes, commit, and browse history without losing the agent terminal that produced them.</p><ul class="proof"><li>Diff and staging controls</li><li>Commit and history browsing</li><li>Agent activity remains in context</li></ul></div>
+        <div class="copy"><h3>Terminal and change review.</h3><p>The Git cockpit follows the active workspace. You can inspect diffs, stage changes, commit, and browse history. The agent terminal stays visible during the review.</p><ul class="proof"><li>The Git cockpit provides diff and staging controls.</li><li>You can commit changes and browse history.</li><li>The agent terminal stays visible.</li></ul></div>
         <figure class="product-view focus-review"><div class="frame"><video autoplay muted loop playsinline preload="metadata" aria-label="ZOrca opening tracked and untracked Payments API changes in the Git cockpit"><source src="zorca-git-review.mp4" type="video/mp4"></video></div><figcaption>Current pre-alpha interface · terminal and Git review context</figcaption></figure>
       </article>
     </div>
@@ -234,38 +234,38 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
 
   <section class="section zed">
     <div class="wrap zed-grid">
-      <div><h2>Zed’s editor foundation, already built in.</h2><p>ZOrca reorganizes Zed around agent workspaces instead of rebuilding the editor underneath them.</p></div>
-      <div class="zed-list"><div>LSP and tree-sitter</div><div>Debugger and multibuffers</div><div>Native Vim keybindings</div><div>Beautiful themes</div><div>Zed Extensions</div><div><code>zed://</code> URLs</div></div>
+      <div><h2>Editor features from Zed.</h2><p>ZOrca reorganizes Zed for agent workspaces. It does not rebuild the editor.</p></div>
+      <div class="zed-list"><div>LSP and tree-sitter</div><div>Debugger and multibuffers</div><div>Native Vim keybindings</div><div>Themes</div><div>Zed Extensions</div><div><code>zed://</code> URLs</div></div>
     </div>
   </section>
 
   <section class="section compare" id="compare">
     <div class="wrap">
-      <div class="intro"><h2>Where ZOrca fits.</h2><p>ZOrca combines Zed’s mature editor with agent-first workspaces. Zed is the polished upstream editor; Orca is the broader ADE today.</p></div>
+      <div class="intro"><h2>Where ZOrca fits.</h2><p>ZOrca combines the Zed editor with agent workspaces. Zed is the upstream editor. Orca provides the broader ADE today.</p></div>
       <p class="scroll-hint" id="comparison-hint">Swipe or use arrow keys to compare all columns.</p>
       <div class="scroll" role="region" aria-label="ZOrca, Zed, and Orca feature comparison" aria-describedby="comparison-hint" tabindex="0"><table><thead><tr><th><span class="sr">Capability</span></th><th class="us-head"><span><img src="zorca-logo-m1-128.png" width="22" height="22" alt="">ZOrca</span></th><th>Zed</th><th>Orca</th></tr></thead><tbody>
         <tr><th>Workspace model</th><td class="us" data-product="ZOrca">Agent workspaces with Git worktrees</td><td data-product="Zed">Project folders</td><td data-product="Orca">Agent workspaces</td></tr>
         <tr><th>Remote projects</th><td class="us" data-product="ZOrca">SSH workspaces</td><td data-product="Zed">SSH projects</td><td data-product="Orca">Remote workspaces</td></tr>
-        <tr><th>Agent terminals</th><td class="us" data-product="ZOrca">As many as needed per project worktree</td><td data-product="Zed">Terminal dock</td><td data-product="Orca">First-class</td></tr>
-        <tr><th>Automation and orchestration</th><td class="us" data-product="ZOrca">No; hands-on control only</td><td data-product="Zed">No</td><td data-product="Orca">Yes</td></tr>
-        <tr><th>Built-in AI</th><td class="us" data-product="ZOrca">None hosted; Copilot optional</td><td data-product="Zed">Zed AI, hosted</td><td data-product="Orca">Bring your own</td></tr>
-        <tr><th>Availability</th><td class="us" data-product="ZOrca">Desktop from source; mobile planned</td><td data-product="Zed">Desktop app</td><td data-product="Orca">Desktop and mobile apps</td></tr>
+        <tr><th>Agent terminals</th><td class="us" data-product="ZOrca">Multiple tabs per project worktree</td><td data-product="Zed">Terminal dock</td><td data-product="Orca">First-class</td></tr>
+        <tr><th>Automation and orchestration</th><td class="us" data-product="ZOrca">No. Hands-on control only.</td><td data-product="Zed">No</td><td data-product="Orca">Yes</td></tr>
+        <tr><th>Built-in AI</th><td class="us" data-product="ZOrca">No hosted AI. Copilot is optional.</td><td data-product="Zed">Hosted Zed AI</td><td data-product="Orca">Bring your own</td></tr>
+        <tr><th>Availability</th><td class="us" data-product="ZOrca">Desktop source builds. Mobile is planned.</td><td data-product="Zed">Desktop app</td><td data-product="Orca">Desktop and mobile apps</td></tr>
       </tbody></table></div>
     </div>
   </section>
 
   <section class="section roadmap" id="roadmap">
     <div class="wrap">
-      <div class="roadmap-head"><h2>Coming soon.</h2><p>These are planned directions, not first-version capabilities. There are no promised dates.</p></div>
-      <div class="roadmap-row"><span class="planned">Planned</span><h3>Agent communication bus</h3><p>Workspace-scoped messaging so agents can exchange context and coordinate work.</p></div>
-      <div class="roadmap-row"><span class="planned">Planned</span><h3>Deeper agent integration</h3><p>Better monitoring and direct interaction with running coding agents.</p></div>
-      <div class="roadmap-row"><span class="planned">Planned</span><h3>Mobile companion</h3><p>Monitor and interact with workspaces away from the desktop after the first desktop version.</p></div>
+      <div class="roadmap-head"><h2>Planned directions.</h2><p>These items are not current capabilities. The project does not promise dates for them. The project will evaluate a Cloudflare stack for mobile access, remote schedules, and API coordination.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>REST API and CLI</h3><p>ZOrca will start a server that manages sessions, terminals, agents, and workspaces through a REST API. The CLI will use the same API. The project will evaluate OpenAPI for client generation.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>Mobile app</h3><p>The mobile app will manage sessions, terminals, agents, and workspaces on a Mac or host that the user controls. It will connect through the REST API over Tailscale or a local network.</p></div>
+      <div class="roadmap-row"><span class="planned">Planned</span><h3>Automations</h3><p>Cron schedules will start agents with automation prompts. The agents can run on the local machine or an SSH-connected remote host.</p></div>
     </div>
   </section>
 
   <section class="section install" id="install">
     <div class="wrap install-grid">
-      <div><h2>Install ZOrca.</h2><p>For now, ZOrca is available as a source build for macOS and Linux. A Homebrew installation is coming.</p><div class="terminal" aria-label="Source installation commands"><span class="dim"># macOS and Linux</span><span>git clone https://github.com/zorca-org/zorca.git</span><span>cd zorca</span><span class="dim"># Linux only</span><span>./script/linux</span><span>./script/download-wasi-sdk</span><span class="dim"># Build and launch</span><span>cargo run -p zed</span></div><a class="more" href="https://github.com/zorca-org/zorca#install">Read the full build instructions</a></div>
+      <div><h2>Install ZOrca.</h2><p>The current release uses source builds for macOS and Linux. The project plans Homebrew support.</p><div class="terminal" aria-label="Source installation commands"><span class="dim"># macOS and Linux</span><span>git clone https://github.com/zorca-org/zorca.git</span><span>cd zorca</span><span class="dim"># Linux only</span><span>./script/linux</span><span>./script/download-wasi-sdk</span><span class="dim"># Build and launch</span><span>cargo run -p zed</span></div><a class="more" href="https://github.com/zorca-org/zorca#install">Read the full build instructions</a></div>
       <div class="facts"><div class="fact"><strong>Pre-alpha</strong>Expect breaking changes.</div><div class="fact"><strong>No packaged release yet</strong>Packaged and signed releases are not currently available.</div><div class="fact"><strong>macOS and Linux</strong>Windows is not supported.</div><div class="fact"><strong>Independent and open source</strong>GPL-3.0-or-later. Not affiliated with Zed Industries or Stably AI.</div></div>
     </div>
   </section>
