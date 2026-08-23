@@ -876,7 +876,7 @@ mod tests {
     }
 
     impl SessionBackend for PromptBackend {
-        fn create(&self, _: &SessionSpec) -> Result<SessionId> {
+        fn create(&self, _: &SessionSpec, _: Option<&str>) -> Result<SessionId> {
             self.record_call();
             anyhow::bail!("unexpected create")
         }
@@ -886,12 +886,12 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _: &SessionId) -> Result<bool> {
+        fn exists(&self, _: &SessionId, _: Option<&str>) -> Result<bool> {
             self.record_call();
             Ok(false)
         }
 
-        fn attach(&self, _: &SessionSpec) -> Result<Attached> {
+        fn attach(&self, _: &SessionSpec, _: Option<&str>) -> Result<Attached> {
             self.record_call();
             anyhow::bail!("unexpected attach")
         }
@@ -901,7 +901,7 @@ mod tests {
             Ok(())
         }
 
-        fn kill(&self, _: &SessionId) -> Result<()> {
+        fn kill(&self, _: &SessionId, _: Option<&str>) -> Result<()> {
             self.record_call();
             Ok(())
         }

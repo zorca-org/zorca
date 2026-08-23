@@ -47,9 +47,9 @@
 
 use crate::{
     AdeWorkspace, AdeWorkspaceRegistry, Attached, BackendWorkspace, DaemonBackend, DaemonEvent,
-    DaemonUpgradeOutcome, SESSION_PREFIX, SessionBackend, SessionId, SessionSpec, StatusDelivery,
-    StatusEvent, WorkspaceEvent, WorkspaceId, WorkspaceLayout, WorkspaceStatus, now_whole_seconds,
-    project_id_from_path,
+    DaemonUpgradeOutcome, IdentifiedDaemonEvent, SESSION_PREFIX, SessionBackend, SessionId,
+    SessionSpec, StatusDelivery, StatusEvent, WorkspaceEvent, WorkspaceId, WorkspaceLayout,
+    WorkspaceStatus, now_whole_seconds, project_id_from_path,
 };
 use ade_session::LayoutDoc;
 use anyhow::{Context as _, Result, bail};
@@ -156,6 +156,13 @@ fn adopted_row(
 enum DaemonKey {
     Instance(String),
     Host(Option<String>),
+}
+
+fn daemon_key(daemon_id: Option<&str>, host: Option<&str>) -> DaemonKey {
+    match daemon_id {
+        Some(daemon_id) => DaemonKey::Instance(daemon_id.to_owned()),
+        None => DaemonKey::Host(host.map(str::to_owned)),
+    }
 }
 
 /// A persisted daemon identity is exclusive. Legacy rows retain the old
@@ -502,7 +509,7 @@ impl WorkspaceLifecycleService {
         };
         let alive = self
             .backend_for(workspace)?
-            .exists(&session)
+            .exists(&session, workspace.daemon_id.as_deref())
             .with_context(|| format!("probing session {session}"))?;
         self.record_probe(workspace, alive).await
     }
@@ -517,7 +524,10 @@ impl WorkspaceLifecycleService {
         let mut workspace = self.get(id)?;
 
         let session = SessionId::from(workspace.daemon_workspace_id());
-        if self.backend_for(&workspace)?.exists(&session)? {
+        if self
+            .backend_for(&workspace)?
+            .exists(&session, workspace.daemon_id.as_deref())?
+        {
             self.adopt_session(&mut workspace, session).await?;
             return Ok(workspace);
         }
@@ -541,6 +551,28 @@ impl WorkspaceLifecycleService {
     ) -> Result<(AdeWorkspace, Attached)> {
         let mut workspace = self.get(id)?;
         let daemon_workspace_id = workspace.daemon_workspace_id();
+        let route_lock = self.daemon_decision_lock(DaemonKey::Host(workspace.remote_host.clone()));
+        let _route_decision = route_lock.lock().await;
+        let backend = self.backend_for(&workspace)?;
+        let daemon_id = match workspace.daemon_id.clone() {
+            Some(daemon_id) => Some(daemon_id),
+            None => backend.list_workspaces_identified()?.daemon_id,
+        };
+        let instance_lock = daemon_id
+            .as_deref()
+            .map(|daemon_id| self.daemon_decision_lock(daemon_key(Some(daemon_id), None)));
+        let _instance_decision = match instance_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if workspace.daemon_id.is_none()
+            && backend.list_workspaces_identified()?.daemon_id != daemon_id
+        {
+            bail!(
+                "the daemon changed while preparing to reset workspace {}",
+                workspace.id
+            );
+        }
         let duplicates = self
             .registry
             .list_workspaces()?
@@ -548,6 +580,7 @@ impl WorkspaceLifecycleService {
             .filter(|candidate| {
                 candidate.id != workspace.id
                     && candidate.remote_host == workspace.remote_host
+                    && candidate.daemon_id == workspace.daemon_id
                     && (candidate.daemon_workspace_id() == daemon_workspace_id
                         || (candidate.project_id == workspace.project_id
                             && candidate.repository_path == workspace.repository_path))
@@ -557,9 +590,13 @@ impl WorkspaceLifecycleService {
         for duplicate in duplicates {
             let duplicate_daemon_id = duplicate.daemon_workspace_id();
             if duplicate_daemon_id != daemon_workspace_id {
-                self.kill_and_delete_workspace(&duplicate)
-                    .await
+                backend
+                    .kill_workspace(&duplicate_daemon_id, daemon_id.as_deref())
                     .with_context(|| format!("removing stale workspace {duplicate_daemon_id}"))?;
+                self.registry
+                    .delete_workspace(duplicate.id.clone())
+                    .await
+                    .with_context(|| format!("deleting duplicate row {}", duplicate.id))?;
             } else {
                 // Two registry rows can point at one daemon record after an
                 // interrupted alias rebind. The selected row owns that record;
@@ -571,8 +608,6 @@ impl WorkspaceLifecycleService {
             }
         }
 
-        let backend = self.backend_for(&workspace)?;
-
         // ponytail: this is the backend's existing list-and-kill operation;
         // add an atomic ResetWorkspace protocol frame if concurrent clients
         // creating sessions during recovery becomes a real problem.
@@ -580,8 +615,10 @@ impl WorkspaceLifecycleService {
             .reset_workspace_sessions(
                 &SessionId::from(daemon_workspace_id.clone()),
                 &workspace.repository_path,
+                daemon_id.as_deref(),
             )
             .with_context(|| format!("killing sessions in workspace {daemon_workspace_id}"))?;
+        workspace.daemon_id = workspace.daemon_id.or(daemon_id);
         self.start_session(&mut workspace).await?;
         let attached = self.attach_command(&workspace)?;
         Ok((workspace, attached))
@@ -648,13 +685,28 @@ impl WorkspaceLifecycleService {
     ///
     /// Only sound after an attach the caller watched succeed. Anything that
     /// merely *hopes* a session exists wants [`Self::probe`].
-    pub async fn record_attached_session(&self, id: &WorkspaceId) -> Result<AdeWorkspace> {
+    pub async fn record_attached_session(
+        &self,
+        id: &WorkspaceId,
+        daemon_id: Option<String>,
+    ) -> Result<AdeWorkspace> {
         let mut workspace = self.get(id)?;
 
         // No backend is asked for: this is the registry writing down what the
         // pane already did, and it is as true of a remote host as a local one.
         let session = SessionId::from(workspace.daemon_workspace_id());
-        self.adopt_session(&mut workspace, session).await?;
+        let daemon_id = workspace.daemon_id.clone().or(daemon_id);
+        self.registry
+            .update_terminal_session_and_daemon_id(
+                workspace.id.clone(),
+                Some(session.to_string()),
+                daemon_id.clone(),
+            )
+            .await?;
+        workspace.terminal_session_id = Some(session.to_string());
+        workspace.daemon_id = daemon_id;
+        self.set_status(&mut workspace, WorkspaceStatus::Running)
+            .await?;
         Ok(workspace)
     }
 
@@ -683,7 +735,11 @@ impl WorkspaceLifecycleService {
         }
 
         self.backend_for(&workspace)?
-            .rename_workspace(&workspace.daemon_workspace_id(), name)
+            .rename_workspace(
+                &workspace.daemon_workspace_id(),
+                name,
+                workspace.daemon_id.as_deref(),
+            )
             .with_context(|| format!("renaming workspace {id}"))?;
 
         self.registry
@@ -706,7 +762,7 @@ impl WorkspaceLifecycleService {
 
         if let Some(session) = workspace.terminal_session_id.clone().map(SessionId::from) {
             let backend = self.backend_for(&workspace)?;
-            if backend.exists(&session)? {
+            if backend.exists(&session, workspace.daemon_id.as_deref())? {
                 backend
                     .detach(&session)
                     .with_context(|| format!("detaching clients from session {session}"))?;
@@ -729,36 +785,68 @@ impl WorkspaceLifecycleService {
     /// is [`AdeWorkspaceRegistry::delete_workspace`], and a killed one reads as
     /// never-created, ready to be recreated under the same name.
     ///
-    /// A backend with no workspace of its own — tmux — says so, and the
-    /// fallback is [`Self::kill_workspace_session`], which takes the sessions
-    /// this workspace is known to have. A daemon that has never heard of the
-    /// workspace lands in the same place, and the fallback is the one that
-    /// reports a failure if it fails too.
     pub async fn kill_workspace(&self, id: &WorkspaceId) -> Result<AdeWorkspace> {
         let mut workspace = self.get(id)?;
+        let route_lock = self.daemon_decision_lock(DaemonKey::Host(workspace.remote_host.clone()));
+        let _route_decision = route_lock.lock().await;
         let backend = self.backend_for(&workspace)?;
-        if let Err(error) = backend.kill_workspace(&workspace.daemon_workspace_id()) {
-            log::warn!(
-                "no workspace-level kill for {}, killing its session instead: {error:#}",
+        let daemon_id = match workspace.daemon_id.clone() {
+            Some(daemon_id) => Some(daemon_id),
+            None => backend.list_workspaces_identified()?.daemon_id,
+        };
+        let instance_lock = daemon_id
+            .as_deref()
+            .map(|daemon_id| self.daemon_decision_lock(daemon_key(Some(daemon_id), None)));
+        let _instance_decision = match instance_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if workspace.daemon_id.is_none()
+            && backend.list_workspaces_identified()?.daemon_id != daemon_id
+        {
+            bail!(
+                "the daemon changed while preparing to kill workspace {}",
                 workspace.id
             );
-            return self.kill_workspace_session(id).await;
         }
+        backend
+            .kill_workspace(&workspace.daemon_workspace_id(), daemon_id.as_deref())
+            .with_context(|| format!("killing daemon workspace {}", workspace.id))?;
         self.record_killed(&mut workspace).await?;
         Ok(workspace)
     }
 
     /// Kills a daemon workspace record before deleting its registry row.
     ///
-    /// This is deliberately stricter than [`Self::kill_workspace`]: its
-    /// session-only fallback cannot prove that the daemon record and layout are
-    /// gone. The row is only deleted after the record kill succeeds, so any
-    /// unsupported operation or connectivity failure remains visible and
-    /// retryable instead of leaving a record that reconciliation can re-adopt.
+    /// The row is only deleted after the record kill succeeds, so an unsupported
+    /// operation or connectivity failure remains visible and retryable instead
+    /// of leaving a daemon record that reconciliation can re-adopt.
     async fn kill_and_delete_workspace(&self, workspace: &AdeWorkspace) -> Result<()> {
+        let route_lock = self.daemon_decision_lock(DaemonKey::Host(workspace.remote_host.clone()));
+        let _route_decision = route_lock.lock().await;
+        let backend = self.backend_for(workspace)?;
+        let daemon_id = match workspace.daemon_id.clone() {
+            Some(daemon_id) => Some(daemon_id),
+            None => backend.list_workspaces_identified()?.daemon_id,
+        };
+        let instance_lock = daemon_id
+            .as_deref()
+            .map(|daemon_id| self.daemon_decision_lock(daemon_key(Some(daemon_id), None)));
+        let _instance_decision = match instance_lock.as_ref() {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        if workspace.daemon_id.is_none()
+            && backend.list_workspaces_identified()?.daemon_id != daemon_id
+        {
+            bail!(
+                "the daemon changed while preparing to delete workspace {}",
+                workspace.id
+            );
+        }
         let daemon_workspace_id = workspace.daemon_workspace_id();
-        self.backend_for(workspace)?
-            .kill_workspace(&daemon_workspace_id)
+        backend
+            .kill_workspace(&daemon_workspace_id, daemon_id.as_deref())
             .with_context(|| format!("killing daemon workspace record {daemon_workspace_id}"))?;
         self.registry
             .delete_workspace(workspace.id.clone())
@@ -770,10 +858,10 @@ impl WorkspaceLifecycleService {
     /// forgets the session name and records the workspace as `stopped`.
     ///
     /// **Destructive and irreversible.** Running agents die with the session
-    /// and their scrollback goes with them. The workspace-level kill is
-    /// [`Self::kill_workspace`], which this is the fallback for; every UI path
-    /// that reaches either must say so in its own label ("Kill workspace", not
-    /// "Close"): closing, switching away, and removing all detach instead. The
+    /// and their scrollback goes with them. The workspace-record kill is
+    /// [`Self::kill_workspace`]; every UI path that reaches either must say so
+    /// in its own label ("Kill workspace", not "Close"): closing, switching
+    /// away, and removing all detach instead. The
     /// session name is cleared because it no longer names anything — a killed
     /// workspace reads as never-created, not as disconnected, since there is
     /// nothing left to reconnect to.
@@ -790,11 +878,11 @@ impl WorkspaceLifecycleService {
             // `SessionBackend::kill` tolerates a missing session too, which
             // covers the gap between this check and the kill.
             if backend
-                .exists(&session)
+                .exists(&session, workspace.daemon_id.as_deref())
                 .with_context(|| format!("checking session {session} before killing it"))?
             {
                 backend
-                    .kill(&session)
+                    .kill(&session, workspace.daemon_id.as_deref())
                     .with_context(|| format!("killing session {session}"))?;
             }
         }
@@ -802,17 +890,18 @@ impl WorkspaceLifecycleService {
         Ok(workspace)
     }
 
-    /// Writes down what a kill left behind: no session, and `stopped`.
+    /// Writes down what a kill left behind: no session owner, and `stopped`.
     ///
     /// Shared by both kills so they cannot drift — the name is cleared because
     /// it names nothing now, and the status is the one a workspace nobody is
     /// attached to has.
     async fn record_killed(&self, workspace: &mut AdeWorkspace) -> Result<()> {
-        if workspace.terminal_session_id.is_some() {
+        if workspace.terminal_session_id.is_some() || workspace.daemon_id.is_some() {
             self.registry
-                .update_terminal_session_id(workspace.id.clone(), None)
+                .update_terminal_session_and_daemon_id(workspace.id.clone(), None, None)
                 .await?;
             workspace.terminal_session_id = None;
+            workspace.daemon_id = None;
         }
         self.set_status(workspace, WorkspaceStatus::Stopped).await
     }
@@ -898,57 +987,71 @@ impl WorkspaceLifecycleService {
         backend: &Arc<dyn SessionBackend>,
         host: Option<&str>,
     ) -> Result<Vec<AdeWorkspace>> {
-        let held = backend
-            .list_workspaces()
-            .with_context(|| format!("listing the workspaces on {}", host_label(host)))?;
-
-        let instance_id = backend.instance_id();
-        let key = match instance_id.clone() {
-            Some(instance_id) => DaemonKey::Instance(instance_id),
-            None => DaemonKey::Host(host.map(str::to_owned)),
-        };
-        let lock = self.daemon_decision_lock(key);
-        let _decision = lock.lock().await;
-
-        // Another alias may have written while this caller was listing.
-        let known = self.registry.list_workspaces()?;
-
-        for workspace in held {
-            // Prefer the row that already owns this identity over a matching
-            // legacy row, or the update can collide with the unique index.
-            let existing = known
-                .iter()
-                .filter(|known| {
-                    is_the_same_daemons_row(known, instance_id.as_deref(), host, &workspace)
-                })
-                .max_by_key(|known| known.daemon_id.is_some());
-            if let Some(existing) = existing {
-                if existing.remote_host.as_deref() != host || existing.daemon_id != instance_id {
-                    self.registry
-                        .update_remote_host_and_daemon_id(
-                            existing.id.clone(),
-                            host.map(str::to_owned),
-                            instance_id.clone(),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "rebinding workspace {} to {}",
-                                workspace.id,
-                                host_label(host)
-                            )
-                        })?;
-                }
+        for _ in 0..3 {
+            let route_lock = self.daemon_decision_lock(DaemonKey::Host(host.map(str::to_owned)));
+            let _route_decision = route_lock.lock().await;
+            let initial = backend
+                .list_workspaces_identified()
+                .with_context(|| format!("listing the workspaces on {}", host_label(host)))?;
+            let instance_lock = initial
+                .daemon_id
+                .as_deref()
+                .map(|daemon_id| self.daemon_decision_lock(daemon_key(Some(daemon_id), host)));
+            let _instance_decision = match instance_lock.as_ref() {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
+            let listing = backend
+                .list_workspaces_identified()
+                .with_context(|| format!("refreshing the workspaces on {}", host_label(host)))?;
+            if listing.daemon_id != initial.daemon_id {
                 continue;
             }
 
-            let row = adopted_row(&workspace, host, instance_id.as_deref());
-            self.registry
-                .create_workspace(row)
-                .await
-                .with_context(|| format!("adopting workspace {}", workspace.id))?;
+            let instance_id = listing.daemon_id;
+            let known = self.registry.list_workspaces()?;
+            for workspace in listing.items {
+                // Prefer the row that already owns this identity over a matching
+                // legacy row, or the update can collide with the unique index.
+                let existing = known
+                    .iter()
+                    .filter(|known| {
+                        is_the_same_daemons_row(known, instance_id.as_deref(), host, &workspace)
+                    })
+                    .max_by_key(|known| known.daemon_id.is_some());
+                if let Some(existing) = existing {
+                    if existing.remote_host.as_deref() != host || existing.daemon_id != instance_id
+                    {
+                        self.registry
+                            .update_remote_host_and_daemon_id(
+                                existing.id.clone(),
+                                host.map(str::to_owned),
+                                instance_id.clone(),
+                            )
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "rebinding workspace {} to {}",
+                                    workspace.id,
+                                    host_label(host)
+                                )
+                            })?;
+                    }
+                    continue;
+                }
+
+                let row = adopted_row(&workspace, host, instance_id.as_deref());
+                self.registry
+                    .create_workspace(row)
+                    .await
+                    .with_context(|| format!("adopting workspace {}", workspace.id))?;
+            }
+            return self.registry.list_workspaces();
         }
-        self.registry.list_workspaces()
+        bail!(
+            "the daemon identity on {} kept changing while listing workspaces",
+            host_label(host)
+        )
     }
 
     /// The argv a terminal pane runs to attach to this workspace.
@@ -961,8 +1064,10 @@ impl WorkspaceLifecycleService {
     /// one more channel on the host's single ssh connection, never an ssh
     /// invocation of its own.
     pub fn attach_command(&self, workspace: &AdeWorkspace) -> Result<Attached> {
-        self.backend_for(workspace)?
-            .attach(&Self::session_spec(workspace))
+        self.backend_for(workspace)?.attach(
+            &Self::session_spec(workspace),
+            workspace.daemon_id.as_deref(),
+        )
     }
 
     /// Adds one more session to the workspace, and hands back its backend id
@@ -975,18 +1080,32 @@ impl WorkspaceLifecycleService {
     /// Nothing here writes the layout: the window that opened the terminal
     /// captures it and pushes it, which is the same path a split or a drag
     /// takes.
-    pub fn create_session_in_workspace(
+    pub async fn create_session_in_workspace(
         &self,
         workspace: &AdeWorkspace,
         working_directory: &Path,
-    ) -> Result<(String, Vec<String>)> {
+    ) -> Result<(String, Vec<String>, Option<String>)> {
         let backend = self.backend_for(workspace)?;
         let spec = Self::session_spec(workspace);
-        let session = backend
-            .create_session_in_workspace(spec.id.as_str(), working_directory)
+        let (session, daemon_id) = backend
+            .create_session_in_workspace_identified(
+                spec.id.as_str(),
+                working_directory,
+                workspace.daemon_id.as_deref(),
+            )
             .with_context(|| format!("creating another session in {}", spec.id))?;
-        let argv = backend.attach_session(&session)?;
-        Ok((session, argv))
+        let daemon_id = workspace.daemon_id.as_deref().or(daemon_id.as_deref());
+        let argv = backend.attach_session(&session, daemon_id)?;
+        if workspace.daemon_id.is_none() && daemon_id.is_some() {
+            self.registry
+                .update_remote_host_and_daemon_id(
+                    workspace.id.clone(),
+                    workspace.remote_host.clone(),
+                    daemon_id.map(str::to_owned),
+                )
+                .await?;
+        }
+        Ok((session, argv, daemon_id.map(str::to_owned)))
     }
 
     /// The argv a terminal pane runs to attach to one session **named by the
@@ -1000,7 +1119,8 @@ impl WorkspaceLifecycleService {
         workspace: &AdeWorkspace,
         session_id: &str,
     ) -> Result<Vec<String>> {
-        self.backend_for(workspace)?.attach_session(session_id)
+        self.backend_for(workspace)?
+            .attach_session(session_id, workspace.daemon_id.as_deref())
     }
 
     /// The workspace's layout as the backend holds it, with the revision that
@@ -1010,8 +1130,31 @@ impl WorkspaceLifecycleService {
     /// of this workspace, or could not be asked — and the caller falls back to
     /// the single-terminal open.
     pub fn open_workspace_layout(&self, workspace: &AdeWorkspace) -> Result<WorkspaceLayout> {
-        self.backend_for(workspace)?
-            .open_workspace(&workspace.daemon_workspace_id())
+        self.backend_for(workspace)?.open_workspace(
+            &workspace.daemon_workspace_id(),
+            workspace.daemon_id.as_deref(),
+        )
+    }
+
+    pub async fn open_workspace_layout_identified(
+        &self,
+        workspace: &mut AdeWorkspace,
+    ) -> Result<WorkspaceLayout> {
+        let (layout, daemon_id) = self.backend_for(workspace)?.open_workspace_identified(
+            &workspace.daemon_workspace_id(),
+            workspace.daemon_id.as_deref(),
+        )?;
+        if workspace.daemon_id.is_none() && daemon_id.is_some() {
+            self.registry
+                .update_remote_host_and_daemon_id(
+                    workspace.id.clone(),
+                    workspace.remote_host.clone(),
+                    daemon_id.clone(),
+                )
+                .await?;
+            workspace.daemon_id = daemon_id;
+        }
+        Ok(layout)
     }
 
     /// Stores a new layout for the workspace at `rev`, which must be one past
@@ -1025,8 +1168,12 @@ impl WorkspaceLifecycleService {
         layout: &LayoutDoc,
         rev: u64,
     ) -> Result<()> {
-        self.backend_for(workspace)?
-            .update_layout(&workspace.daemon_workspace_id(), layout, rev)
+        self.backend_for(workspace)?.update_layout(
+            &workspace.daemon_workspace_id(),
+            layout,
+            rev,
+            workspace.daemon_id.as_deref(),
+        )
     }
 
     /// Kills the one session a closed terminal tab was showing.
@@ -1036,7 +1183,8 @@ impl WorkspaceLifecycleService {
     /// kills nothing, and the workspace-level kill stays
     /// [`Self::kill_workspace_session`].
     pub fn kill_session(&self, workspace: &AdeWorkspace, session_id: &str) -> Result<()> {
-        self.backend_for(workspace)?.kill_session(session_id)
+        self.backend_for(workspace)?
+            .kill_session(session_id, workspace.daemon_id.as_deref())
     }
 
     /// Replace the session daemon on one host, because the operator asked.
@@ -1152,13 +1300,15 @@ impl WorkspaceLifecycleService {
             .collect();
 
         let mut host_errors = self.status_errors();
-        let mut live: HashMap<Option<String>, HashSet<SessionId>> = HashMap::new();
+        // A row cannot be probed against another daemon's listing.
+        let mut live: HashMap<Option<String>, (Option<String>, HashSet<SessionId>)> =
+            HashMap::new();
         for host in hosts {
             let anything_to_probe = workspaces.iter().any(|workspace| {
                 workspace.remote_host == host && workspace.terminal_session_id.is_some()
             });
             if !anything_to_probe {
-                live.insert(host, HashSet::new());
+                live.insert(host, (None, HashSet::new()));
                 continue;
             }
             let backend = match self.backend_for_host(host.as_deref()) {
@@ -1207,11 +1357,18 @@ impl WorkspaceLifecycleService {
                     continue;
                 }
             }
-            match backend.list().context("listing live sessions") {
-                Ok(sessions) => {
+            match backend.list_identified().context("listing live sessions") {
+                Ok(listing) => {
                     live.insert(
                         host,
-                        sessions.into_iter().map(|session| session.id).collect(),
+                        (
+                            listing.daemon_id,
+                            listing
+                                .items
+                                .into_iter()
+                                .map(|session| session.id)
+                                .collect(),
+                        ),
                     );
                 }
                 Err(error) => host_errors.push((host_label(host.as_deref()), format!("{error:#}"))),
@@ -1223,7 +1380,16 @@ impl WorkspaceLifecycleService {
             let state = match workspace.terminal_session_id.clone().map(SessionId::from) {
                 None => SessionState::NeverCreated,
                 Some(session) => match live.get(&workspace.remote_host) {
-                    Some(live) => {
+                    // Another daemon's listing says nothing about this row.
+                    Some((daemon_id, _))
+                        if workspace
+                            .daemon_id
+                            .as_deref()
+                            .is_some_and(|expected| daemon_id.as_deref() != Some(expected)) =>
+                    {
+                        SessionState::Unknown
+                    }
+                    Some((_, live)) => {
                         self.record_probe(&mut workspace, live.contains(&session))
                             .await?
                     }
@@ -1319,10 +1485,12 @@ impl WorkspaceLifecycleService {
         let spec = Self::session_spec(workspace);
 
         let created = self.backend_for(workspace).and_then(|backend| {
-            let session = backend.create(&spec)?;
-            Ok((backend, session))
+            // Unclaimed rows are permissive; persisted identities are fenced.
+            let (session, daemon_id) =
+                backend.create_identified(&spec, workspace.daemon_id.as_deref())?;
+            Ok((session, daemon_id))
         });
-        let (backend, session) = match created {
+        let (session, daemon_id) = match created {
             Ok(pair) => pair,
             Err(error) => {
                 self.set_status(workspace, WorkspaceStatus::Error).await?;
@@ -1330,8 +1498,7 @@ impl WorkspaceLifecycleService {
             }
         };
 
-        // A successful create also completed the identity handshake.
-        let daemon_id = backend.instance_id();
+        let daemon_id = workspace.daemon_id.clone().or(daemon_id);
         self.registry
             .update_remote_host_and_daemon_id(
                 workspace.id.clone(),
@@ -1446,13 +1613,15 @@ impl EventFanout {
     /// receiver is the only unsubscribe there is, and a slot left holding a dead
     /// sender would keep [`Self::is_idle`] answering "somebody is listening"
     /// forever.
-    fn deliver(&self, remote_host: &Option<String>, event: DaemonEvent) -> bool {
+    fn deliver(&self, remote_host: &Option<String>, identified: IdentifiedDaemonEvent) -> bool {
+        let IdentifiedDaemonEvent { daemon_id, event } = identified;
         match event {
             DaemonEvent::Session(event) => send_or_clear(&self.status, event),
             DaemonEvent::Layout(event) => send_or_clear(
                 &self.layout,
                 WorkspaceEvent::Layout {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     event,
                 },
             ),
@@ -1460,6 +1629,7 @@ impl EventFanout {
                 &self.layout,
                 WorkspaceEvent::Reset {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     event,
                 },
             ),
@@ -1467,6 +1637,7 @@ impl EventFanout {
                 &self.layout,
                 WorkspaceEvent::Removed {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     workspace_id,
                 },
             ),
@@ -1523,7 +1694,7 @@ fn pump_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LayoutEvent, SessionChange};
+    use crate::{Identified, LayoutEvent, SessionChange};
     use gpui::AppContext as _;
 
     /// A service whose backend cannot work, for the paths that must not reach
@@ -1723,6 +1894,104 @@ mod tests {
         assert_eq!(listed[0].daemon_id.as_deref(), Some("daemon-1"));
     }
 
+    /// **Every operation on a persisted row names the daemon that row belongs
+    /// to.** Two daemons can hold the same workspace id, so an unfenced kill,
+    /// attach or probe is one that a stranger may answer.
+    #[gpui::test]
+    async fn test_operations_on_a_persisted_row_carry_its_daemon() {
+        let registry =
+            AdeWorkspaceRegistry::open_test_db("test_operations_carry_their_daemon").await;
+        let backend = Arc::new(FakeBackend::new("a-box").identified("daemon-a"));
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("a.example", backend.clone());
+
+        let owned = AdeWorkspace {
+            terminal_session_id: Some("ade-main-2de8b3".to_owned()),
+            daemon_id: Some("daemon-a".to_owned()),
+            remote_host: Some("a.example".to_owned()),
+            ..AdeWorkspace::new("main", "project-a", "/home/user/main")
+        };
+        service
+            .registry()
+            .create_workspace(owned.clone())
+            .await
+            .unwrap();
+
+        let mut probed = owned.clone();
+        service.probe(&mut probed).await.unwrap();
+        service.attach_command(&owned).unwrap();
+        service.kill_workspace(&owned.id).await.unwrap();
+
+        assert_eq!(
+            backend.calls(),
+            vec![
+                "exists:ade-main-2de8b3|daemon-a",
+                "attach:ade-main-2de8b3|daemon-a",
+                "kill_workspace:ade-main-2de8b3|daemon-a",
+            ]
+        );
+
+        // A row from before identities were recorded stays permissive: there is
+        // nothing to fence it to, and refusing it would strand it.
+        let legacy = AdeWorkspace {
+            terminal_session_id: Some("ade-old-000001".to_owned()),
+            remote_host: Some("a.example".to_owned()),
+            ..AdeWorkspace::new("old", "project-b", "/home/user/old")
+        };
+        service
+            .registry()
+            .create_workspace(legacy.clone())
+            .await
+            .unwrap();
+        service.attach_command(&legacy).unwrap();
+        assert!(
+            backend
+                .calls()
+                .contains(&"attach:ade-old-000001".to_owned()),
+            "{:?}",
+            backend.calls()
+        );
+    }
+
+    /// A listing from a daemon a row is not fenced to says nothing about that
+    /// row — not even that its session died.
+    #[gpui::test]
+    async fn test_another_daemons_listing_cannot_probe_a_fenced_row() {
+        let registry =
+            AdeWorkspaceRegistry::open_test_db("test_another_daemons_listing_cannot_probe").await;
+        let replacement = Arc::new(FakeBackend::new("a-box").identified("daemon-b"));
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("a.example", replacement);
+
+        let owned = AdeWorkspace {
+            terminal_session_id: Some("ade-main-2de8b3".to_owned()),
+            daemon_id: Some("daemon-a".to_owned()),
+            remote_host: Some("a.example".to_owned()),
+            status: WorkspaceStatus::Running,
+            ..AdeWorkspace::new("main", "project-a", "/home/user/main")
+        };
+        service
+            .registry()
+            .create_workspace(owned.clone())
+            .await
+            .unwrap();
+
+        let reconciled = service.reconcile_all().await.unwrap();
+        let (row, state) = reconciled
+            .entries
+            .into_iter()
+            .find(|(row, _)| row.id == owned.id)
+            .expect("the row is reconciled, not dropped");
+        assert_eq!(state, SessionState::Unknown);
+        assert_eq!(
+            row.status,
+            WorkspaceStatus::Running,
+            "a stranger's listing must not move the recorded status"
+        );
+    }
+
     #[gpui::test]
     async fn test_a_persisted_daemon_id_identifies_and_owns_its_row() {
         let registry =
@@ -1909,6 +2178,131 @@ mod tests {
         );
         assert_eq!(by_ip.len(), 1);
         assert_eq!(by_ip[0].id, by_name[0].id);
+    }
+
+    #[gpui::test]
+    async fn test_adoption_refreshes_a_listing_after_taking_the_daemon_lock() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_adoption_refreshes_listing").await;
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-stale-000001".to_owned(),
+                    name: "stale".to_owned(),
+                    project_root: "/repos/stale".to_owned(),
+                    created_at: 1,
+                }]),
+        );
+        remote.replace_workspaces_after_next_list(Vec::new());
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("remote", remote.clone());
+
+        assert!(
+            service
+                .ensure_host_workspaces(Some("remote"))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a workspace killed before the locked refresh must not be adopted"
+        );
+        assert_eq!(
+            remote
+                .calls()
+                .iter()
+                .filter(|call| *call == "list_workspaces")
+                .count(),
+            2
+        );
+    }
+
+    #[gpui::test]
+    async fn test_adoption_retries_when_the_listing_changes_daemon() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_adoption_retries_identity").await;
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-b")
+                .listing_identities(vec![Some("daemon-a"), Some("daemon-b"), Some("daemon-b")])
+                .holding(vec![BackendWorkspace {
+                    id: "ade-current-000001".to_owned(),
+                    name: "current".to_owned(),
+                    project_root: "/repos/current".to_owned(),
+                    created_at: 1,
+                }]),
+        );
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("remote", remote.clone());
+
+        let listed = service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].daemon_id.as_deref(), Some("daemon-b"));
+        assert_eq!(
+            remote
+                .calls()
+                .iter()
+                .filter(|call| *call == "list_workspaces")
+                .count(),
+            4
+        );
+    }
+
+    #[gpui::test]
+    async fn test_legacy_kill_and_alias_adoption_share_the_daemon_lock(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_legacy_kill_alias_adoption").await;
+        let daemon_workspace = BackendWorkspace {
+            id: "ade-shared-000001".to_owned(),
+            name: "shared".to_owned(),
+            project_root: "/repos/shared".to_owned(),
+            created_at: 1,
+        };
+        let backend = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![daemon_workspace.clone()]),
+        );
+        let service = Arc::new(
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("old-alias", backend.clone())
+                .with_backend_for_host("new-alias", backend.clone()),
+        );
+        let mut legacy = adopted_row(&daemon_workspace, Some("old-alias"), None);
+        legacy.status = WorkspaceStatus::Running;
+        service
+            .registry()
+            .create_workspace(legacy.clone())
+            .await
+            .unwrap();
+
+        let lock = service.daemon_decision_lock(DaemonKey::Instance("daemon-a".to_owned()));
+        let guard = lock.lock().await;
+        let adoption = {
+            let service = service.clone();
+            cx.background_spawn(
+                async move { service.ensure_host_workspaces(Some("new-alias")).await },
+            )
+        };
+        let kill = {
+            let service = service.clone();
+            let id = legacy.id.clone();
+            cx.background_spawn(async move { service.kill_workspace(&id).await })
+        };
+        cx.run_until_parked();
+        drop(guard);
+        adoption.await.unwrap();
+        kill.await.unwrap();
+
+        let rows = service.registry().list_workspaces().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, legacy.id);
+        assert!(rows[0].terminal_session_id.is_none());
+        assert!(rows[0].daemon_id.is_none());
+        assert!(backend.workspaces.lock().unwrap().is_empty());
     }
 
     /// A workspace the daemon holds and the registry does not becomes a row in
@@ -2147,13 +2541,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.status, WorkspaceStatus::Running);
-        // And each host was asked exactly once per question, not once per
-        // workspace. The host that is down fails on the first of them and is
-        // not asked the second.
+        // Adoption refreshes once under its daemon lock. The host that is down
+        // fails on the first listing and is not asked again.
         assert_eq!(
             local.calls(),
             vec![
                 format!("create:{}", here.tmux_session_name()),
+                "list_workspaces".to_owned(),
                 "list_workspaces".to_owned(),
                 "list".to_owned()
             ]
@@ -2236,12 +2630,14 @@ mod tests {
         );
         let WorkspaceEvent::Layout {
             remote_host,
+            daemon_id,
             event: layout,
         } = smol::block_on(layouts.recv()).unwrap()
         else {
             panic!("a pushed layout must arrive as one");
         };
         assert_eq!(remote_host, None);
+        assert_eq!(daemon_id, None);
         assert_eq!(layout.workspace_id, "ade-here-000001");
         assert_eq!(layout.rev, 7);
 
@@ -2252,12 +2648,14 @@ mod tests {
         });
         let WorkspaceEvent::Reset {
             remote_host,
+            daemon_id,
             event: reset,
         } = smol::block_on(layouts.recv()).unwrap()
         else {
             panic!("an incarnation replacement must remain distinct from a kill");
         };
         assert_eq!(remote_host, None);
+        assert_eq!(daemon_id, None);
         assert_eq!(reset.workspace_id, "ade-here-000001");
         assert_eq!(reset.rev, 1);
 
@@ -2268,6 +2666,7 @@ mod tests {
             smol::block_on(layouts.recv()).unwrap(),
             WorkspaceEvent::Removed {
                 remote_host: None,
+                daemon_id: None,
                 workspace_id: "ade-here-000001".to_owned()
             }
         );
@@ -2300,10 +2699,12 @@ mod tests {
             vec![
                 WorkspaceEvent::Removed {
                     remote_host: None,
+                    daemon_id: None,
                     workspace_id: "same-id".to_owned(),
                 },
                 WorkspaceEvent::Removed {
                     remote_host: Some("h1".to_owned()),
+                    daemon_id: None,
                     workspace_id: "same-id".to_owned(),
                 },
             ]
@@ -2396,10 +2797,45 @@ mod tests {
         );
     }
 
-    /// A backend with no workspace of its own — tmux — still has to be
-    /// killable from the one control that says "Kill".
     #[gpui::test]
-    async fn test_a_backend_without_workspaces_falls_back_to_killing_the_session() {
+    async fn test_killed_workspace_can_be_recreated_on_a_new_daemon() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_kill_then_recreate_on_b").await;
+        let daemon_a = Arc::new(FakeBackend::new("a").identified("daemon-a"));
+        let service = WorkspaceLifecycleService::with_backend(registry, daemon_a.clone());
+        let workspace = service
+            .create_workspace("main", "project-a", "/repos/zed", None, None)
+            .await
+            .unwrap();
+
+        let killed = service.kill_workspace(&workspace.id).await.unwrap();
+        assert!(killed.terminal_session_id.is_none());
+        assert!(killed.daemon_id.is_none());
+
+        let daemon_b = Arc::new(FakeBackend::new("b").identified("daemon-b"));
+        service
+            .backends
+            .lock()
+            .unwrap()
+            .insert(None, daemon_b.clone());
+        let recreated = service.recreate_session(&workspace.id).await.unwrap();
+        assert_eq!(recreated.daemon_id.as_deref(), Some("daemon-b"));
+        assert!(recreated.terminal_session_id.is_some());
+        assert!(
+            daemon_a
+                .calls()
+                .iter()
+                .any(|call| call.contains("kill_workspace:") && call.ends_with("|daemon-a"))
+        );
+        assert!(
+            daemon_b
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("create:"))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_workspace_kill_refusal_never_falls_back_to_the_session() {
         let registry = AdeWorkspaceRegistry::open_test_db("test_kill_falls_back").await;
         let backend = Arc::new(FakeBackend::new("local").without_workspace_kill());
         let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
@@ -2410,15 +2846,62 @@ mod tests {
             .unwrap();
         let session = workspace.tmux_session_name();
 
-        let killed = service.kill_workspace(&workspace.id).await.unwrap();
+        service
+            .kill_workspace(&workspace.id)
+            .await
+            .expect_err("a workspace-record refusal must remain visible");
 
         assert!(
-            backend.calls().contains(&format!("kill:{session}")),
-            "the fallback must take the session: {:?}",
+            !backend.calls().contains(&format!("kill:{session}")),
+            "a workspace refusal must not become a session kill: {:?}",
             backend.calls()
         );
-        assert_eq!(killed.status, WorkspaceStatus::Stopped);
-        assert!(killed.terminal_session_id.is_none());
+        assert_eq!(
+            service
+                .registry()
+                .get_workspace(workspace.id.clone())
+                .unwrap(),
+            Some(workspace)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_an_identified_workspace_kill_never_falls_back_after_refusal() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_identified_kill_refusal").await;
+        let backend = Arc::new(
+            FakeBackend::new("local")
+                .identified("daemon-a")
+                .without_workspace_kill(),
+        );
+        let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
+        let workspace = service
+            .create_workspace("main", "project-a", "/repos/zed", None, None)
+            .await
+            .unwrap();
+        let session = workspace.daemon_workspace_id();
+
+        service
+            .kill_workspace(&workspace.id)
+            .await
+            .expect_err("an identified daemon refusal must propagate");
+
+        assert!(
+            backend
+                .calls()
+                .contains(&format!("kill_workspace:{session}|daemon-a"))
+        );
+        assert!(
+            !backend
+                .calls()
+                .contains(&format!("kill:{session}|daemon-a"))
+        );
+        assert_eq!(
+            service
+                .registry()
+                .get_workspace(workspace.id.clone())
+                .unwrap(),
+            Some(workspace)
+        );
     }
 
     #[gpui::test]
@@ -2560,6 +3043,43 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_reset_waits_for_the_daemon_ownership_lock(cx: &mut gpui::TestAppContext) {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_reset_waits_for_ownership").await;
+        let backend = Arc::new(FakeBackend::new("local").identified("daemon-a"));
+        let service = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            backend.clone(),
+        ));
+        let workspace = service
+            .create_workspace("main", "project-a", "/repos/zed", None, None)
+            .await
+            .unwrap();
+        let lock = service.daemon_decision_lock(DaemonKey::Instance("daemon-a".to_owned()));
+        let guard = lock.lock().await;
+        let reset = {
+            let service = service.clone();
+            let id = workspace.id.clone();
+            cx.background_spawn(async move { service.reset_workspace_sessions(&id).await })
+        };
+        cx.run_until_parked();
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("reset:"))
+        );
+
+        drop(guard);
+        reset.await.unwrap();
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("reset:"))
+        );
+    }
+
+    #[gpui::test]
     async fn test_resetting_workspace_sessions_preserves_another_project_at_the_same_path() {
         let registry = AdeWorkspaceRegistry::open_test_db(
             "test_reset_workspace_sessions_preserves_other_project",
@@ -2599,6 +3119,43 @@ mod tests {
             Some(other_project),
             "resetting one project must not delete another project's registry row"
         );
+    }
+
+    #[gpui::test]
+    async fn test_reset_preserves_the_same_workspace_id_on_another_daemon() {
+        let registry =
+            AdeWorkspaceRegistry::open_test_db("test_reset_preserves_other_daemon").await;
+        let backend = Arc::new(FakeBackend::new("local").identified("daemon-a"));
+        let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
+        let session_id = "ade-main-000001".to_owned();
+        let target = AdeWorkspace {
+            terminal_session_id: Some(session_id.clone()),
+            daemon_id: Some("daemon-a".to_owned()),
+            ..AdeWorkspace::new("main", "project-a", "/repos/shared")
+        };
+        let other = AdeWorkspace {
+            terminal_session_id: Some(session_id),
+            daemon_id: Some("daemon-b".to_owned()),
+            ..AdeWorkspace::new("main-copy", "project-a", "/repos/shared")
+        };
+        service
+            .registry()
+            .create_workspace(target.clone())
+            .await
+            .unwrap();
+        service
+            .registry()
+            .create_workspace(other.clone())
+            .await
+            .unwrap();
+
+        service.reset_workspace_sessions(&target.id).await.unwrap();
+
+        assert_eq!(
+            service.registry().get_workspace(other.id.clone()).unwrap(),
+            Some(other)
+        );
+        assert!(!backend.calls().iter().any(|call| call.contains("daemon-b")));
     }
 
     #[gpui::test]
@@ -3012,8 +3569,10 @@ mod tests {
         /// What this backend holds that the registry may not know about, i.e.
         /// what adoption has to find.
         workspaces: Mutex<Vec<BackendWorkspace>>,
+        workspaces_after_next_list: Mutex<Option<Vec<BackendWorkspace>>>,
+        listing_instance_ids: Mutex<Vec<Option<String>>>,
         calls: Mutex<Vec<String>>,
-        status: Mutex<Option<Sender<DaemonEvent>>>,
+        status: Mutex<Option<Sender<IdentifiedDaemonEvent>>>,
         /// Whether this backend's host is behind the client, as a hash
         /// comparison would have found — and who asked to be told when that
         /// moves. The two halves of what the sidebar's upgrade arrow reads.
@@ -3032,6 +3591,8 @@ mod tests {
                 sessions: Mutex::new(Vec::new()),
                 sessions_after_next_list: Mutex::new(Vec::new()),
                 workspaces: Mutex::new(Vec::new()),
+                workspaces_after_next_list: Mutex::new(None),
+                listing_instance_ids: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
                 status: Mutex::new(None),
                 stale: Mutex::new(false),
@@ -3075,6 +3636,18 @@ mod tests {
             self.workspaces.lock().unwrap().push(workspace);
         }
 
+        fn replace_workspaces_after_next_list(&self, workspaces: Vec<BackendWorkspace>) {
+            *self.workspaces_after_next_list.lock().unwrap() = Some(workspaces);
+        }
+
+        fn listing_identities(self, identities: Vec<Option<&str>>) -> Self {
+            *self.listing_instance_ids.lock().unwrap() = identities
+                .into_iter()
+                .map(|identity| identity.map(str::to_owned))
+                .collect();
+            self
+        }
+
         fn failing(label: &str, message: &str) -> Self {
             Self {
                 failure: Some(message.to_owned()),
@@ -3114,31 +3687,43 @@ mod tests {
         /// Pushes an event to whoever subscribed, standing in for a daemon.
         fn push(&self, event: StatusEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::Session(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::Session(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         /// The layout half of [`Self::push`], for the fanout's own test.
         fn push_layout(&self, event: LayoutEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::Layout(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::Layout(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         fn push_workspace_reset(&self, event: LayoutEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::WorkspaceReset(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::WorkspaceReset(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         /// A workspace another client killed, as the daemon announces it.
         fn push_workspace_removed(&self, workspace_id: &str) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::WorkspaceRemoved {
-                    workspace_id: workspace_id.to_owned(),
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::WorkspaceRemoved {
+                        workspace_id: workspace_id.to_owned(),
+                    },
                 }))
                 .expect("the merged stream is listening");
             }
@@ -3153,9 +3738,15 @@ mod tests {
         }
     }
 
+    /// How a recorded call spells the identity it was fenced to. Nothing for
+    /// the permissive case, so the calls a legacy row makes read as before.
+    fn fence(expected: Option<&str>) -> String {
+        expected.map(|id| format!("|{id}")).unwrap_or_default()
+    }
+
     impl SessionBackend for FakeBackend {
-        fn create(&self, spec: &SessionSpec) -> Result<SessionId> {
-            self.record(format!("create:{}", spec.id))?;
+        fn create(&self, spec: &SessionSpec, expected: Option<&str>) -> Result<SessionId> {
+            self.record(format!("create:{}{}", spec.id, fence(expected)))?;
             self.sessions.lock().unwrap().push(spec.id.clone());
             Ok(spec.id.clone())
         }
@@ -3180,18 +3771,37 @@ mod tests {
 
         fn list_workspaces(&self) -> Result<Vec<BackendWorkspace>> {
             self.record("list_workspaces")?;
-            Ok(self.workspaces.lock().unwrap().clone())
+            let mut workspaces = self.workspaces.lock().unwrap();
+            let listed = workspaces.clone();
+            if let Some(next) = self.workspaces_after_next_list.lock().unwrap().take() {
+                *workspaces = next;
+            }
+            Ok(listed)
         }
 
-        fn exists(&self, id: &SessionId) -> Result<bool> {
-            self.record(format!("exists:{id}"))?;
+        fn list_workspaces_identified(&self) -> Result<Identified<BackendWorkspace>> {
+            let items = self.list_workspaces()?;
+            let daemon_id = {
+                let mut identities = self.listing_instance_ids.lock().unwrap();
+                if identities.is_empty() {
+                    self.instance_id.clone()
+                } else {
+                    identities.remove(0)
+                }
+            };
+            Ok(Identified { daemon_id, items })
+        }
+
+        fn exists(&self, id: &SessionId, expected: Option<&str>) -> Result<bool> {
+            self.record(format!("exists:{id}{}", fence(expected)))?;
             Ok(self.sessions.lock().unwrap().contains(id))
         }
 
-        fn attach(&self, spec: &SessionSpec) -> Result<Attached> {
-            self.record(format!("attach:{}", spec.id))?;
+        fn attach(&self, spec: &SessionSpec, expected: Option<&str>) -> Result<Attached> {
+            self.record(format!("attach:{}{}", spec.id, fence(expected)))?;
             Ok(Attached {
                 session_id: spec.id.to_string(),
+                daemon_id: self.instance_id.clone(),
                 argv: vec![format!("{}-attach", self.label), spec.id.to_string()],
             })
         }
@@ -3200,8 +3810,8 @@ mod tests {
             self.record(format!("detach:{id}"))
         }
 
-        fn kill(&self, id: &SessionId) -> Result<()> {
-            self.record(format!("kill:{id}"))?;
+        fn kill(&self, id: &SessionId, expected: Option<&str>) -> Result<()> {
+            self.record(format!("kill:{id}{}", fence(expected)))?;
             self.sessions
                 .lock()
                 .unwrap()
@@ -3209,13 +3819,22 @@ mod tests {
             Ok(())
         }
 
-        fn reset_workspace_sessions(&self, id: &SessionId, directory: &Path) -> Result<()> {
-            self.record(format!("reset:{id}:{}", directory.display()))?;
-            self.kill(id)
+        fn reset_workspace_sessions(
+            &self,
+            id: &SessionId,
+            directory: &Path,
+            expected: Option<&str>,
+        ) -> Result<()> {
+            self.record(format!(
+                "reset:{id}:{}{}",
+                directory.display(),
+                fence(expected)
+            ))?;
+            self.kill(id, expected)
         }
 
-        fn kill_workspace(&self, workspace_id: &str) -> Result<()> {
-            self.record(format!("kill_workspace:{workspace_id}"))?;
+        fn kill_workspace(&self, workspace_id: &str, expected: Option<&str>) -> Result<()> {
+            self.record(format!("kill_workspace:{workspace_id}{}", fence(expected)))?;
             if !self.workspace_kill {
                 bail!("this session backend has no workspaces of its own to kill");
             }
@@ -3234,7 +3853,7 @@ mod tests {
             StatusDelivery::Push
         }
 
-        fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
+        fn subscribe_events(&self) -> Result<Receiver<IdentifiedDaemonEvent>> {
             self.calls.lock().unwrap().push("subscribe".to_owned());
             let (sender, receiver) = smol::channel::unbounded();
             *self.status.lock().unwrap() = Some(sender);
@@ -3359,7 +3978,7 @@ mod tests {
         // down what that produced — no backend is consulted, which is why the
         // failing backend never comes up.
         let recorded = service
-            .record_attached_session(&workspace.id)
+            .record_attached_session(&workspace.id, Some("daemon-a".to_owned()))
             .await
             .unwrap();
         assert_eq!(
@@ -3367,6 +3986,7 @@ mod tests {
             Some(workspace.tmux_session_name().as_str())
         );
         assert_eq!(recorded.status, WorkspaceStatus::Running);
+        assert_eq!(recorded.daemon_id.as_deref(), Some("daemon-a"));
 
         // And it is the stored row that moved, not just the returned copy.
         let stored = service
@@ -3379,10 +3999,11 @@ mod tests {
             Some(workspace.tmux_session_name().as_str())
         );
         assert_eq!(stored.status, WorkspaceStatus::Running);
+        assert_eq!(stored.daemon_id.as_deref(), Some("daemon-a"));
 
         // Idempotent: a second attach to the same session changes nothing.
         let again = service
-            .record_attached_session(&workspace.id)
+            .record_attached_session(&workspace.id, None)
             .await
             .unwrap();
         assert_eq!(again, stored);

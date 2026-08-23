@@ -375,6 +375,7 @@ mod tests {
             &workspace,
             Attached {
                 session_id: "ade-vector-db-spike-012345".into(),
+                daemon_id: None,
                 argv: vec![
                     "tmux".into(),
                     "new-session".into(),
@@ -434,6 +435,7 @@ mod tests {
             &workspace,
             Attached {
                 session_id: "session-uuid".into(),
+                daemon_id: None,
                 argv: vec![
                     "/opt/ade/ade-daemon".into(),
                     "attach".into(),
@@ -462,6 +464,7 @@ mod tests {
             &workspace,
             Attached {
                 session_id: "s1".into(),
+                daemon_id: None,
                 argv: Vec::new(),
             },
         )
@@ -474,6 +477,7 @@ mod tests {
         let workspace = AdeWorkspace::new("main", "project-a", "/repos/zed");
         let attached = |session_id: &str| Attached {
             session_id: session_id.to_owned(),
+            daemon_id: None,
             argv: vec!["tmux".to_owned()],
         };
         assert_ne!(

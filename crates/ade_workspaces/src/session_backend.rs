@@ -124,6 +124,8 @@ pub struct Attached {
     /// [`SessionBackend::attach_session`] takes. tmux does not mint ids, so
     /// there it is the seam id itself.
     pub session_id: String,
+    /// The exact daemon handshake that selected or created this session.
+    pub daemon_id: Option<String>,
     pub argv: Vec<String>,
 }
 
@@ -292,6 +294,13 @@ pub enum DaemonEvent {
     },
 }
 
+/// One pushed event paired with the daemon connection that produced it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentifiedDaemonEvent {
+    pub daemon_id: Option<String>,
+    pub event: DaemonEvent,
+}
+
 /// One workspace-level thing that happened, as the layers above the seam see
 /// it: the merged layout stream carries removals too.
 ///
@@ -304,16 +313,27 @@ pub enum DaemonEvent {
 pub enum WorkspaceEvent {
     Layout {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         event: LayoutEvent,
     },
     Reset {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         event: LayoutEvent,
     },
     Removed {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         workspace_id: String,
     },
+}
+
+/// A listing paired with the identity of the connection that produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identified<T> {
+    /// `None` for an unnamed or identityless backend.
+    pub daemon_id: Option<String>,
+    pub items: Vec<T>,
 }
 
 /// Persistence, attach, and status for one host's sessions. Nothing else — no
@@ -322,6 +342,9 @@ pub enum WorkspaceEvent {
 /// The layout methods are the exception that proves it: the backend *stores* a
 /// layout document and hands it back, and never interprets one. Translating it
 /// into panes is [`crate::layout`]'s job, on this side of the seam.
+///
+/// `expected_daemon_id` fences persisted-row operations. `None` remains
+/// permissive for legacy and unclaimed rows.
 pub trait SessionBackend: Send + Sync {
     /// Creates the session detached, so its processes exist before and after
     /// any client is attached. Fails if it already exists.
@@ -329,7 +352,18 @@ pub trait SessionBackend: Send + Sync {
     /// Returns the id the session ended up with. tmux does not mint ids — the
     /// caller derives the name and gets it back — but the daemon does, so the
     /// created id comes from here rather than being assumed.
-    fn create(&self, spec: &SessionSpec) -> Result<SessionId>;
+    fn create(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<SessionId>;
+
+    /// [`SessionBackend::create`] with the identity of the connection that
+    /// created the session.
+    fn create_identified(
+        &self,
+        spec: &SessionSpec,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(SessionId, Option<String>)> {
+        let session = self.create(spec, expected_daemon_id)?;
+        Ok((session, self.instance_id()))
+    }
 
     /// Creates one **more** session inside a workspace that already exists, and
     /// answers with the backend's own id for it.
@@ -344,14 +378,37 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// The id is the backend's, not the seam's, because that is what a layout
     /// names and what [`SessionBackend::attach_session`] takes.
-    fn create_session_in_workspace(&self, _workspace_id: &str, _cwd: &Path) -> Result<String> {
+    fn create_session_in_workspace(
+        &self,
+        _workspace_id: &str,
+        _cwd: &Path,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<String> {
         bail!("this session backend holds one session per workspace")
+    }
+
+    fn create_session_in_workspace_identified(
+        &self,
+        workspace_id: &str,
+        cwd: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(String, Option<String>)> {
+        let session = self.create_session_in_workspace(workspace_id, cwd, expected_daemon_id)?;
+        Ok((session, self.instance_id()))
     }
 
     /// Every live session this app owns. Sessions belonging to anything else
     /// are not listed, and a backend that is not running yet reports no
     /// sessions rather than an error.
     fn list(&self) -> Result<Vec<SessionInfo>>;
+
+    /// [`SessionBackend::list`] paired with its producing identity.
+    fn list_identified(&self) -> Result<Identified<SessionInfo>> {
+        Ok(Identified {
+            daemon_id: self.instance_id(),
+            items: self.list()?,
+        })
+    }
 
     /// Every workspace this backend holds, whether or not the caller has ever
     /// heard of one.
@@ -369,11 +426,19 @@ pub trait SessionBackend: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// [`SessionBackend::list_workspaces`] paired with its producing identity.
+    fn list_workspaces_identified(&self) -> Result<Identified<BackendWorkspace>> {
+        Ok(Identified {
+            daemon_id: self.instance_id(),
+            items: self.list_workspaces()?,
+        })
+    }
+
     /// Whether one session is alive: [`SessionBackend::list`] narrowed to a
     /// single id, for the probe of a single workspace.
     ///
     /// Never creates anything — the answer is a report, not a repair.
-    fn exists(&self, id: &SessionId) -> Result<bool>;
+    fn exists(&self, id: &SessionId, expected_daemon_id: Option<&str>) -> Result<bool>;
 
     /// The argv a client runs to get onto this session, creating it first if it
     /// is gone (see the module docs on why this is an argv and takes a spec).
@@ -384,7 +449,7 @@ pub trait SessionBackend: Send + Sync {
     /// The session it landed on comes back with the argv ([`Attached`]): the
     /// caller cannot know which session a create made, and without it the tab
     /// it opens is not something a layout can name.
-    fn attach(&self, spec: &SessionSpec) -> Result<Attached>;
+    fn attach(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<Attached>;
 
     /// Drops every client attached to the session. The session and everything
     /// running in it keep going: this is what closing means, per the invariant
@@ -399,15 +464,20 @@ pub trait SessionBackend: Send + Sync {
     /// Destructive and irreversible; only ever reached from a control that says
     /// so. Killing a session that is already gone succeeds, since that is the
     /// state the caller asked for.
-    fn kill(&self, id: &SessionId) -> Result<()>;
+    fn kill(&self, id: &SessionId, expected_daemon_id: Option<&str>) -> Result<()>;
 
     /// Kills a workspace's sessions before immediately recreating them.
     ///
     /// The directory lets remote backends clean up terminal process groups
     /// left behind by an older daemon. Other backends need no recovery beyond
     /// their ordinary kill.
-    fn reset_workspace_sessions(&self, id: &SessionId, _directory: &Path) -> Result<()> {
-        self.kill(id)
+    fn reset_workspace_sessions(
+        &self,
+        id: &SessionId,
+        _directory: &Path,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        self.kill(id, expected_daemon_id)
     }
 
     /// How this backend expects status to be obtained. See [`StatusDelivery`].
@@ -424,7 +494,7 @@ pub trait SessionBackend: Send + Sync {
     /// Each call opens its own stream — one connection's worth — so callers fan
     /// one subscription out rather than taking several. Dropping every receiver
     /// is the only unsubscribe there is.
-    fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
+    fn subscribe_events(&self) -> Result<Receiver<IdentifiedDaemonEvent>> {
         bail!("this session backend reports status by polling, not by pushing")
     }
 
@@ -435,7 +505,11 @@ pub trait SessionBackend: Send + Sync {
     /// same call: this one never creates. A layout names sessions the backend
     /// minted, and rendering one must not conjure a shell for a tab whose
     /// session has died — the daemon prunes those from the document instead.
-    fn attach_session(&self, _session_id: &str) -> Result<Vec<String>> {
+    fn attach_session(
+        &self,
+        _session_id: &str,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<Vec<String>> {
         bail!("this session backend has no sessions of its own to attach to")
     }
 
@@ -443,8 +517,21 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Errors — including "no such workspace" — mean the caller has nothing to
     /// render and should fall back to whatever it did before layouts existed.
-    fn open_workspace(&self, _workspace_id: &str) -> Result<WorkspaceLayout> {
+    fn open_workspace(
+        &self,
+        _workspace_id: &str,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<WorkspaceLayout> {
         bail!("this session backend does not store workspace layouts")
+    }
+
+    fn open_workspace_identified(
+        &self,
+        workspace_id: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(WorkspaceLayout, Option<String>)> {
+        let layout = self.open_workspace(workspace_id, expected_daemon_id)?;
+        Ok((layout, self.instance_id()))
     }
 
     /// Stores a new layout, which must be at `rev` — the revision the caller
@@ -452,7 +539,13 @@ pub trait SessionBackend: Send + Sync {
     ///
     /// Last writer wins, guarded by that revision: a stale one is refused, and
     /// the caller's answer is to re-fetch and re-render rather than to retry.
-    fn update_layout(&self, _workspace_id: &str, _layout: &LayoutDoc, _rev: u64) -> Result<()> {
+    fn update_layout(
+        &self,
+        _workspace_id: &str,
+        _layout: &LayoutDoc,
+        _rev: u64,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         bail!("this session backend does not store workspace layouts")
     }
 
@@ -461,7 +554,7 @@ pub trait SessionBackend: Send + Sync {
     /// [`SessionBackend::kill`] takes every session of a *workspace*; this
     /// takes the one a closed tab was showing. Destructive either way — only
     /// ever reached from a control that says so.
-    fn kill_session(&self, _session_id: &str) -> Result<()> {
+    fn kill_session(&self, _session_id: &str, _expected_daemon_id: Option<&str>) -> Result<()> {
         bail!("this session backend has no sessions of its own to kill")
     }
 
@@ -475,7 +568,12 @@ pub trait SessionBackend: Send + Sync {
     /// A backend with no workspace of its own says so here, exactly like
     /// [`SessionBackend::kill_workspace`] — there is no local fallback, because
     /// there is nothing to fall back *to*.
-    fn rename_workspace(&self, _workspace_id: &str, _name: &str) -> Result<()> {
+    fn rename_workspace(
+        &self,
+        _workspace_id: &str,
+        _name: &str,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
         bail!("this session backend has no workspaces of its own to rename")
     }
 
@@ -489,8 +587,8 @@ pub trait SessionBackend: Send + Sync {
     /// goes on writing layouts into a workspace that is gone.
     ///
     /// A backend without a workspace of its own says so here rather than
-    /// pretending — the layer above falls back to taking the sessions.
-    fn kill_workspace(&self, _workspace_id: &str) -> Result<()> {
+    /// pretending that deleting sessions also deleted a workspace record.
+    fn kill_workspace(&self, _workspace_id: &str, _expected_daemon_id: Option<&str>) -> Result<()> {
         bail!("this session backend has no workspaces of its own to kill")
     }
 

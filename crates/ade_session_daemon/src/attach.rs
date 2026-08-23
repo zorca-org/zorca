@@ -218,6 +218,12 @@ pub struct AttachConfig {
     /// daemon needs it to honour a focus naming this view; without one the
     /// client is simply never the focus owner.
     pub view_id: Option<String>,
+    /// Which daemon instance this attach is for, from `--expected-daemon-id`.
+    /// An address outlives the daemon behind it — a socket path is rebound, a
+    /// forwarded port is reused — so a session id alone can land in a *second*
+    /// daemon's terminal. `None` fences nothing, which is what every caller
+    /// that predates the flag gets.
+    pub expected_daemon_id: Option<String>,
 }
 
 impl AttachConfig {
@@ -226,6 +232,7 @@ impl AttachConfig {
             address: DaemonAddress::Socket(socket_path.into()),
             session_id: session_id.into(),
             view_id: None,
+            expected_daemon_id: None,
         }
     }
 
@@ -235,11 +242,17 @@ impl AttachConfig {
             address: DaemonAddress::Tcp(address.into()),
             session_id: session_id.into(),
             view_id: None,
+            expected_daemon_id: None,
         }
     }
 
     pub fn with_view_id(mut self, view_id: Option<String>) -> Self {
         self.view_id = view_id;
+        self
+    }
+
+    pub fn with_expected_daemon_id(mut self, expected_daemon_id: Option<String>) -> Self {
+        self.expected_daemon_id = expected_daemon_id;
         self
     }
 }
@@ -332,6 +345,27 @@ impl AttachFailure {
     }
 }
 
+/// Whether the daemon that just answered is the one this attach was for.
+///
+/// The check belongs to the handshake and not to the attach: a mismatch means
+/// every later frame — the `Resize` included — would land in a stranger's
+/// terminal, so nothing may be sent after it. Absent is a mismatch too; a
+/// daemon that reports no identity cannot be shown to be the expected one.
+fn identity_matches(expected: &str, actual: Option<&str>) -> Result<()> {
+    match actual {
+        Some(actual) if actual == expected => Ok(()),
+        Some(actual) => Err(anyhow!(
+            "expected daemon {}, but daemon {} answered; refusing to attach",
+            bounded(expected),
+            bounded(actual)
+        )),
+        None => Err(anyhow!(
+            "expected daemon {}, but the daemon reports no instance id; refusing to attach",
+            bounded(expected)
+        )),
+    }
+}
+
 /// The halves, plus **the generation this connection negotiated** — not the
 /// one some earlier connection did. Attach is its own connection and
 /// renegotiates on every reconnect, so what gates a frame here is what came
@@ -360,6 +394,11 @@ where
         let mut connection = Connection::new(Duplex::new(reader, writer));
         let error = match connection.handshake(Hello::current()).await {
             Ok(ack) => {
+                if let Some(expected) = &config.expected_daemon_id
+                    && let Err(error) = identity_matches(expected, ack.instance_id.as_deref())
+                {
+                    return Err(AttachFailure::Fatal(error));
+                }
                 let (reader, writer) = connection.into_inner().into_halves();
                 return Ok((reader, writer, ack.generation));
             }
@@ -1198,19 +1237,25 @@ mod tests {
     }
 }
 
-/// What the attach client puts on the wire is gated on the generation **this**
-/// connection negotiated, including after a reconnect. Over a loopback TCP pair
-/// rather than a socket pair, so the same test runs on both platforms.
+/// What the attach client puts on the wire is decided by **this** connection's
+/// handshake, including after a reconnect: the generation gates the frames, and
+/// the instance id decides whether there is anything to send at all. Over a
+/// loopback TCP pair rather than a socket pair, so the same tests run on both
+/// platforms.
 #[cfg(test)]
-mod generation_tests {
+mod handshake_tests {
     use ade_session::proto::HelloAck;
     use smol::net::{TcpListener, TcpStream};
 
     use super::*;
 
-    /// A daemon that selects `generation`, then answers the attach with an
-    /// empty replay. Returns the `view_id` the client actually sent.
-    async fn scripted_daemon(stream: TcpStream, generation: u32) -> Option<String> {
+    /// A daemon that reports `generation` and `instance_id`, then records every
+    /// frame through the attach. A refused client returns an empty list.
+    async fn scripted_daemon(
+        stream: TcpStream,
+        generation: u32,
+        instance_id: Option<String>,
+    ) -> Vec<Frame> {
         let mut daemon = Connection::new(stream);
         let request_id = match daemon.recv().await.expect("hello") {
             Frame::Hello(hello) => hello.request_id,
@@ -1228,47 +1273,56 @@ mod generation_tests {
                 degraded: false,
                 binary_hash: None,
                 upgrade_ready: None,
-                instance_id: None,
+                instance_id,
                 request_id,
             }))
             .await
             .expect("hello_ack");
+        let mut received = Vec::new();
         loop {
-            // A `resize` may precede the attach when the test's stdout is a
-            // real console; anything else here is not this test's subject.
-            match daemon.recv().await.expect("a frame from the client") {
-                Frame::Attach {
-                    session_id,
-                    view_id,
-                    ..
-                } => {
+            match daemon.recv().await {
+                Ok(frame) => {
+                    received.push(frame.clone());
+                    let Frame::Attach { session_id, .. } = &frame else {
+                        continue;
+                    };
                     daemon
                         .send(&Frame::Replay {
-                            session_id,
+                            session_id: session_id.clone(),
                             bytes: Vec::new(),
                             truncated: false,
                         })
                         .await
                         .expect("replay");
-                    return view_id;
+                    return received;
                 }
-                _ => continue,
+                // The client refused this daemon and closed the connection.
+                Err(_) => return received,
             }
         }
     }
 
-    /// One connect-and-attach against a daemon serving `generation`.
-    fn view_id_sent_at(generation: u32, reconnecting: bool) -> Option<String> {
+    /// One connect-and-attach against a scripted daemon: what the client did,
+    /// and the `Attach` the daemon saw.
+    fn attach_against(
+        config: AttachConfig,
+        generation: u32,
+        instance_id: Option<&str>,
+        reconnecting: bool,
+    ) -> (std::result::Result<(), AttachFailure>, Vec<Frame>) {
+        let instance_id = instance_id.map(str::to_owned);
         smol::block_on(async move {
             let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
             let address = listener.local_addr().expect("the bound port").to_string();
             let serving = smol::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
-                scripted_daemon(stream, generation).await
+                scripted_daemon(stream, generation, instance_id).await
             });
 
-            let config =
-                AttachConfig::tcp(address.clone(), "s-1").with_view_id(Some("view-1".to_owned()));
+            let config = AttachConfig {
+                address: DaemonAddress::Tcp(address.clone()),
+                ..config
+            };
             let connect = || {
                 let address = address.clone();
                 async move {
@@ -1277,11 +1331,48 @@ mod generation_tests {
                 }
             };
             let mut stdout = Unblock::new(std::io::stdout());
-            connect_and_attach(&config, &connect, &mut stdout, reconnecting)
+            let attached = connect_and_attach(&config, &connect, &mut stdout, reconnecting)
                 .await
-                .expect("the attach was answered");
-            serving.await
+                .map(|_| ());
+            (attached, serving.await)
         })
+    }
+
+    /// One connect-and-attach against a daemon serving `generation`.
+    fn view_id_sent_at(generation: u32, reconnecting: bool) -> Option<String> {
+        let config = AttachConfig::tcp("unused", "s-1").with_view_id(Some("view-1".to_owned()));
+        let (attached, frames) = attach_against(config, generation, None, reconnecting);
+        attached.expect("the attach was answered");
+        frames
+            .into_iter()
+            .find_map(|frame| match frame {
+                Frame::Attach { view_id, .. } => Some(view_id),
+                _ => None,
+            })
+            .expect("the client attached")
+    }
+
+    /// The identity tests all run at the current generation; the fence is
+    /// about *which* daemon answered, not about what it can decode.
+    fn fenced(
+        expected: Option<&str>,
+        actual: Option<&str>,
+        reconnecting: bool,
+    ) -> (std::result::Result<(), AttachFailure>, bool) {
+        let config =
+            AttachConfig::tcp("unused", "s-1").with_expected_daemon_id(expected.map(str::to_owned));
+        let (attached, frames) = attach_against(config, 3, actual, reconnecting);
+        (attached, frames.is_empty())
+    }
+
+    /// A refused identity must be fatal and not a transport blip: retrying it
+    /// would spin against a daemon that can never be the right one. Answers
+    /// with the message, so one call makes both assertions.
+    fn fatal_message(failure: AttachFailure) -> String {
+        match failure {
+            AttachFailure::Fatal(error) => format!("{error:#}"),
+            other => panic!("an identity mismatch must be fatal, not {other:?}"),
+        }
     }
 
     /// `--view-id` is accepted whatever the daemon turns out to be — the caller
@@ -1308,5 +1399,103 @@ mod generation_tests {
     fn a_reconnect_re_derives_the_gate_from_its_own_handshake() {
         assert_eq!(view_id_sent_at(LEGACY_GENERATION, true), None);
         assert_eq!(view_id_sent_at(3, true), Some("view-1".to_owned()));
+    }
+
+    #[test]
+    fn the_expected_daemon_is_attached_to() {
+        let (attached, sent_nothing) = fenced(Some("daemon-a"), Some("daemon-a"), false);
+        attached.expect("the daemon is the one this terminal is for");
+        assert!(!sent_nothing, "the attach never reached the daemon");
+    }
+
+    /// The address outlived the daemon: same socket or port, second instance.
+    /// Nothing may go out on it — not even the `Resize` that precedes Attach.
+    #[test]
+    fn another_daemon_is_refused_before_a_single_frame_is_sent() {
+        let (attached, sent_nothing) = fenced(Some("daemon-a"), Some("daemon-b"), false);
+        let error = fatal_message(attached.expect_err("a stranger's daemon"));
+        assert!(
+            error.contains("daemon-a") && error.contains("daemon-b"),
+            "the error names neither the expected daemon nor the one that answered: {error}"
+        );
+        assert!(sent_nothing, "a frame reached the wrong daemon");
+    }
+
+    /// A daemon too old to report an identity cannot be shown to be the right
+    /// one, and "cannot be shown" is refused rather than assumed.
+    #[test]
+    fn a_daemon_with_no_identity_is_refused() {
+        let (attached, sent_nothing) = fenced(Some("daemon-a"), None, false);
+        let error = fatal_message(attached.expect_err("an unidentified daemon"));
+        assert!(
+            error.contains("daemon-a") && error.contains("no instance id"),
+            "the error does not say what is missing: {error}"
+        );
+        assert!(sent_nothing, "a frame reached an unidentified daemon");
+    }
+
+    /// The reconnect handshakes again, so the fence is checked again: daemon A
+    /// was replaced by daemon B under a live attach, and this reconnect ends
+    /// the terminal instead of resuming in a session that is not the one.
+    #[test]
+    fn a_reconnect_to_a_replaced_daemon_is_refused() {
+        let (attached, sent_nothing) = fenced(Some("daemon-a"), Some("daemon-a"), false);
+        attached.expect("the initial daemon matches");
+        assert!(!sent_nothing, "the initial attach never reached daemon A");
+
+        let (attached, sent_nothing) = fenced(Some("daemon-a"), Some("daemon-b"), true);
+        assert!(
+            fatal_message(attached.expect_err("the daemon was replaced")).contains("daemon-b"),
+            "the reconnect did not name the daemon that answered"
+        );
+        assert!(sent_nothing, "the reconnect sent a frame to daemon B");
+    }
+
+    #[test]
+    fn the_live_attach_loop_refuses_a_replaced_daemon() {
+        let (result, first, second) = smol::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("the bound port").to_string();
+            let serving = smol::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("daemon A");
+                let first = scripted_daemon(stream, 3, Some("daemon-a".to_owned())).await;
+                let (stream, _) = listener.accept().await.expect("daemon B");
+                let second = scripted_daemon(stream, 3, Some("daemon-b".to_owned())).await;
+                (first, second)
+            });
+            let config = AttachConfig::tcp(address.clone(), "s-1")
+                .with_expected_daemon_id(Some("daemon-a".to_owned()));
+            let connect = || {
+                let address = address.clone();
+                async move {
+                    let stream = TcpStream::connect(&address).await?;
+                    Ok((stream.clone(), stream))
+                }
+            };
+            let result = attached(config, connect).await;
+            let (first, second) = serving.await;
+            (result, first, second)
+        });
+
+        let error = result.expect_err("daemon B must end the live attach");
+        assert!(format!("{error:#}").contains("daemon-b"));
+        assert!(
+            first
+                .iter()
+                .any(|frame| matches!(frame, Frame::Attach { .. })),
+            "the initial attach never reached daemon A"
+        );
+        assert!(second.is_empty(), "the reconnect sent a frame to daemon B");
+    }
+
+    /// No flag, no fence: a caller that never asked to be fenced attaches to
+    /// whatever answers, identity or not.
+    #[test]
+    fn without_the_flag_any_daemon_is_attached_to() {
+        for actual in [Some("daemon-b"), None] {
+            let (attached, sent_nothing) = fenced(None, actual, false);
+            attached.expect("no expected id means no fence");
+            assert!(!sent_nothing, "the attach never reached the daemon");
+        }
     }
 }

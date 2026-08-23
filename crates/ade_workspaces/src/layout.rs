@@ -270,11 +270,13 @@ fn open_new_session_terminal_at(
                 // Blocking: creating the session and resolving its argv are two
                 // round trips to the backend.
                 async move {
-                    lifecycle.create_session_in_workspace(&ade_workspace, &working_directory)
+                    lifecycle
+                        .create_session_in_workspace(&ade_workspace, &working_directory)
+                        .await
                 }
             })
             .await;
-        let (session_id, argv) = match created {
+        let (session_id, argv, daemon_id) = match created {
             Ok(created) => created,
             Err(error) => {
                 log::error!(
@@ -290,6 +292,11 @@ fn open_new_session_terminal_at(
                 return Err(error);
             }
         };
+        let mut ade_workspace = ade_workspace;
+        ade_workspace.daemon_id = ade_workspace.daemon_id.or(daemon_id);
+        sync.update(cx, |sync, _| {
+            sync.ade_workspace.daemon_id = ade_workspace.daemon_id.clone()
+        })?;
 
         // A remote workspace's checkout is a path on *its* host: the attach
         // client is local, and the session's cwd was set where it runs.
@@ -1247,6 +1254,12 @@ impl LayoutSync {
         self.ade_workspace.daemon_workspace_id()
     }
 
+    fn is_for(&self, workspace: &AdeWorkspace) -> bool {
+        self.daemon_workspace_id() == workspace.daemon_workspace_id()
+            && self.ade_workspace.remote_host == workspace.remote_host
+            && self.ade_workspace.daemon_id == workspace.daemon_id
+    }
+
     /// Re-arms the debounce. Called on every mutation; only the last one in a
     /// burst reaches [`Self::push`].
     fn schedule(&mut self, cx: &mut Context<Self>) {
@@ -1664,20 +1677,44 @@ impl AdeLayouts {
 
     fn handle_event(event: WorkspaceEvent, cx: &mut App) {
         match event {
-            WorkspaceEvent::Layout { remote_host, event } => {
-                for sync in Self::syncs_for_host(remote_host.as_deref(), cx) {
+            WorkspaceEvent::Layout {
+                remote_host,
+                daemon_id,
+                event,
+            } => {
+                for sync in Self::syncs_for_event(
+                    remote_host.as_deref(),
+                    daemon_id.as_deref(),
+                    &event.workspace_id,
+                    cx,
+                ) {
                     sync.update(cx, |sync, cx| sync.on_layout_event(&event, cx));
                 }
             }
-            WorkspaceEvent::Reset { remote_host, event } => {
-                for sync in Self::syncs_for_host(remote_host.as_deref(), cx) {
+            WorkspaceEvent::Reset {
+                remote_host,
+                daemon_id,
+                event,
+            } => {
+                for sync in Self::syncs_for_event(
+                    remote_host.as_deref(),
+                    daemon_id.as_deref(),
+                    &event.workspace_id,
+                    cx,
+                ) {
                     sync.update(cx, |sync, cx| sync.on_workspace_reset(&event, cx));
                 }
             }
             WorkspaceEvent::Removed {
                 remote_host,
+                daemon_id,
                 workspace_id,
-            } => Self::forget(remote_host.as_deref(), &workspace_id, cx),
+            } => Self::forget(
+                remote_host.as_deref(),
+                daemon_id.as_deref(),
+                &workspace_id,
+                cx,
+            ),
         }
     }
 
@@ -1695,9 +1732,7 @@ impl AdeLayouts {
         ade_workspace: &AdeWorkspace,
         cx: &App,
     ) -> bool {
-        Self::sync_for(zed_workspace, cx).is_some_and(|sync| {
-            sync.read(cx).daemon_workspace_id() == ade_workspace.daemon_workspace_id()
-        })
+        Self::sync_for(zed_workspace, cx).is_some_and(|sync| sync.read(cx).is_for(ade_workspace))
     }
 
     pub(crate) fn forget_window(zed_workspace: EntityId, cx: &mut App) {
@@ -1724,7 +1759,7 @@ impl AdeLayouts {
         let Some(sync) = Self::sync_for(zed_workspace, cx) else {
             return false;
         };
-        if sync.read(cx).daemon_workspace_id() != ade_workspace.daemon_workspace_id() {
+        if !sync.read(cx).is_for(ade_workspace) {
             return false;
         }
         let event = LayoutEvent {
@@ -1748,10 +1783,24 @@ impl AdeLayouts {
             .collect()
     }
 
-    fn syncs_for_host(remote_host: Option<&str>, cx: &mut App) -> Vec<Entity<LayoutSync>> {
+    fn syncs_for_event(
+        remote_host: Option<&str>,
+        daemon_id: Option<&str>,
+        workspace_id: &str,
+        cx: &mut App,
+    ) -> Vec<Entity<LayoutSync>> {
         Self::syncs(cx)
             .into_iter()
-            .filter(|sync| sync.read(cx).ade_workspace.remote_host.as_deref() == remote_host)
+            .filter(|sync| {
+                let sync = sync.read(cx);
+                sync.ade_workspace.remote_host.as_deref() == remote_host
+                    && sync.daemon_workspace_id() == workspace_id
+                    && sync
+                        .ade_workspace
+                        .daemon_id
+                        .as_deref()
+                        .is_none_or(|expected| daemon_id == Some(expected))
+            })
             .collect()
     }
 
@@ -1763,7 +1812,12 @@ impl AdeLayouts {
     /// The terminals in it are already dead — their sessions went with the
     /// workspace, so each attach client exited — and syncing must stop because
     /// a push from here would recreate the record the kill deleted.
-    fn forget(remote_host: Option<&str>, workspace_id: &str, cx: &mut App) {
+    fn forget(
+        remote_host: Option<&str>,
+        daemon_id: Option<&str>,
+        workspace_id: &str,
+        cx: &mut App,
+    ) {
         let doomed = cx
             .default_global::<Self>()
             .syncs
@@ -1775,6 +1829,11 @@ impl AdeLayouts {
                 let sync = sync.read(cx);
                 sync.ade_workspace.remote_host.as_deref() == remote_host
                     && sync.daemon_workspace_id() == workspace_id
+                    && sync
+                        .ade_workspace
+                        .daemon_id
+                        .as_deref()
+                        .is_none_or(|expected| daemon_id == Some(expected))
             })
             .map(|(id, sync)| {
                 let sync = sync.read(cx);
@@ -2147,7 +2206,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::{
-        DaemonEvent, GlobalLifecycleService, SessionBackend, SessionId as SeamSessionId,
+        GlobalLifecycleService, IdentifiedDaemonEvent, SessionBackend, SessionId as SeamSessionId,
         SessionInfo, SessionSpec, StatusDelivery, WorkspaceLayout,
     };
     use anyhow::{Context as _, bail};
@@ -2218,7 +2277,11 @@ mod tests {
     }
 
     impl SessionBackend for UnreachableBackend {
-        fn create(&self, spec: &SessionSpec) -> anyhow::Result<SeamSessionId> {
+        fn create(
+            &self,
+            spec: &SessionSpec,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<SeamSessionId> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2230,6 +2293,7 @@ mod tests {
             &self,
             workspace_id: &str,
             cwd: &std::path::Path,
+            _expected: Option<&str>,
         ) -> anyhow::Result<String> {
             self.created_working_directories
                 .lock()
@@ -2246,11 +2310,15 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SeamSessionId) -> anyhow::Result<bool> {
+        fn exists(&self, _id: &SeamSessionId, _expected: Option<&str>) -> anyhow::Result<bool> {
             Ok(false)
         }
 
-        fn attach(&self, spec: &SessionSpec) -> anyhow::Result<crate::Attached> {
+        fn attach(
+            &self,
+            spec: &SessionSpec,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<crate::Attached> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2258,7 +2326,11 @@ mod tests {
             bail!("no route to the host");
         }
 
-        fn attach_session(&self, session_id: &str) -> anyhow::Result<Vec<String>> {
+        fn attach_session(
+            &self,
+            session_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<Vec<String>> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2270,12 +2342,12 @@ mod tests {
             Ok(())
         }
 
-        fn kill(&self, id: &SeamSessionId) -> anyhow::Result<()> {
+        fn kill(&self, id: &SeamSessionId, _expected: Option<&str>) -> anyhow::Result<()> {
             self.calls.lock().unwrap().push(format!("kill:{id}"));
             Ok(())
         }
 
-        fn kill_session(&self, session_id: &str) -> anyhow::Result<()> {
+        fn kill_session(&self, session_id: &str, _expected: Option<&str>) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2283,7 +2355,11 @@ mod tests {
             Ok(())
         }
 
-        fn kill_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        fn kill_workspace(
+            &self,
+            workspace_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .unwrap()
@@ -2295,7 +2371,11 @@ mod tests {
             StatusDelivery::Push
         }
 
-        fn open_workspace(&self, workspace_id: &str) -> anyhow::Result<WorkspaceLayout> {
+        fn open_workspace(
+            &self,
+            workspace_id: &str,
+            _expected: Option<&str>,
+        ) -> anyhow::Result<WorkspaceLayout> {
             self.layouts
                 .lock()
                 .unwrap()
@@ -2312,6 +2392,7 @@ mod tests {
             workspace_id: &str,
             layout: &LayoutDoc,
             rev: u64,
+            _expected: Option<&str>,
         ) -> anyhow::Result<()> {
             self.calls
                 .lock()
@@ -2342,7 +2423,9 @@ mod tests {
         /// from the forwarding thread, so what a broadcast *does* is asserted by
         /// calling [`AdeLayouts::forget`] directly, and that a removal reaches
         /// the stream at all is `lifecycle`'s own fanout test.
-        fn subscribe_events(&self) -> anyhow::Result<smol::channel::Receiver<DaemonEvent>> {
+        fn subscribe_events(
+            &self,
+        ) -> anyhow::Result<smol::channel::Receiver<IdentifiedDaemonEvent>> {
             let (_sender, receiver) = smol::channel::unbounded();
             Ok(receiver)
         }
@@ -3756,7 +3839,8 @@ mod tests {
     /// later push can write panes back into a record the daemon has deleted.
     #[gpui::test(iterations = 10)]
     async fn test_a_killed_workspace_stops_this_windows_sync(cx: &mut TestAppContext) {
-        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let (workspace, mut ade_workspace, mut cx) = test_window(cx).await;
+        ade_workspace.daemon_id = Some("daemon-a".to_owned());
         let backend = install_lifecycle("test_a_killed_workspace_stops_the_sync", &mut cx).await;
         let bind = cx.update(|window, cx| {
             window.spawn(cx, {
@@ -3793,7 +3877,7 @@ mod tests {
         assert!(workspace.read_with(&mut cx, |workspace, _| workspace.ade_owns_layout()));
 
         // Another workspace's death is not this one's business.
-        cx.update(|_, cx| AdeLayouts::forget(None, "ade-somebody-else-000001", cx));
+        cx.update(|_, cx| AdeLayouts::forget(None, None, "ade-somebody-else-000001", cx));
         cx.update(|_, cx| assert_eq!(cx.default_global::<AdeLayouts>().syncs.len(), 1));
 
         // Session and workspace ids are host-scoped. The same id dying on a
@@ -3802,6 +3886,7 @@ mod tests {
             AdeLayouts::handle_event(
                 WorkspaceEvent::Removed {
                     remote_host: Some("h1".to_owned()),
+                    daemon_id: Some("daemon-a".to_owned()),
                     workspace_id: ade_workspace.daemon_workspace_id(),
                 },
                 cx,
@@ -3813,7 +3898,24 @@ mod tests {
             "another host's removal must not release this window"
         );
 
-        cx.update(|_, cx| AdeLayouts::forget(None, &ade_workspace.daemon_workspace_id(), cx));
+        cx.update(|_, cx| {
+            AdeLayouts::forget(
+                None,
+                Some("daemon-b"),
+                &ade_workspace.daemon_workspace_id(),
+                cx,
+            )
+        });
+        cx.update(|_, cx| assert_eq!(cx.default_global::<AdeLayouts>().syncs.len(), 1));
+
+        cx.update(|_, cx| {
+            AdeLayouts::forget(
+                None,
+                Some("daemon-a"),
+                &ade_workspace.daemon_workspace_id(),
+                cx,
+            )
+        });
         cx.run_until_parked();
         cx.update(|_, cx| {
             assert!(
@@ -3844,7 +3946,8 @@ mod tests {
     async fn test_daemon_incarnation_reset_keeps_the_center_session_manager(
         cx: &mut TestAppContext,
     ) {
-        let (workspace, ade_workspace, mut cx) = test_action_window(cx).await;
+        let (workspace, mut ade_workspace, mut cx) = test_action_window(cx).await;
+        ade_workspace.daemon_id = Some("daemon-a".to_owned());
         let backend = install_lifecycle("test_daemon_reset_keeps_center_sessions", &mut cx).await;
         let initial = LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true));
         render(&workspace, &ade_workspace, initial.clone(), &mut cx).await;
@@ -3864,6 +3967,23 @@ mod tests {
             AdeLayouts::handle_event(
                 WorkspaceEvent::Reset {
                     remote_host: None,
+                    daemon_id: Some("daemon-b".to_owned()),
+                    event: LayoutEvent {
+                        workspace_id: ade_workspace.daemon_workspace_id(),
+                        layout: reset.clone(),
+                        rev: 1,
+                    },
+                },
+                cx,
+            )
+        });
+        assert_eq!(original_sync.read_with(&mut cx, |sync, _| sync.rev()), 9);
+
+        cx.update(|_, cx| {
+            AdeLayouts::handle_event(
+                WorkspaceEvent::Reset {
+                    remote_host: None,
+                    daemon_id: Some("daemon-a".to_owned()),
                     event: LayoutEvent {
                         workspace_id: ade_workspace.daemon_workspace_id(),
                         layout: reset.clone(),
