@@ -881,7 +881,16 @@ async fn pump_resize(
     let Some(signals) = tty::winch_signals() else {
         return;
     };
-    if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+    let mut last = terminal_size();
+    if !send_size(
+        &outbound,
+        &session_id,
+        view_id.as_deref(),
+        &can_focus,
+        false,
+    )
+    .await
+    {
         return;
     }
     let mut signals = Unblock::new(signals);
@@ -891,7 +900,21 @@ async fn pump_resize(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+        let size = terminal_size();
+        if size == last {
+            continue;
+        }
+        let claim = last.is_some_and(|size| !is_zed_bootstrap_size(size));
+        last = size;
+        if !send_size(
+            &outbound,
+            &session_id,
+            view_id.as_deref(),
+            &can_focus,
+            claim,
+        )
+        .await
+        {
             break;
         }
     }
@@ -915,7 +938,15 @@ async fn pump_resize(
     can_focus: Arc<AtomicBool>,
 ) {
     let mut last = terminal_size();
-    if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+    if !send_size(
+        &outbound,
+        &session_id,
+        view_id.as_deref(),
+        &can_focus,
+        false,
+    )
+    .await
+    {
         return;
     }
     loop {
@@ -924,8 +955,17 @@ async fn pump_resize(
         if size == last {
             continue;
         }
+        let claim = last.is_some_and(|size| !is_zed_bootstrap_size(size));
         last = size;
-        if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+        if !send_size(
+            &outbound,
+            &session_id,
+            view_id.as_deref(),
+            &can_focus,
+            claim,
+        )
+        .await
+        {
             break;
         }
     }
@@ -938,6 +978,7 @@ async fn send_size(
     session_id: &SessionId,
     view_id: Option<&str>,
     can_focus: &AtomicBool,
+    claim: bool,
 ) -> bool {
     let Some((cols, rows)) = terminal_size() else {
         return true;
@@ -945,7 +986,7 @@ async fn send_size(
     if is_zed_bootstrap_size((cols, rows)) {
         return true;
     }
-    if !claim_focus(outbound, session_id, view_id, can_focus).await {
+    if claim && !claim_focus(outbound, session_id, view_id, can_focus).await {
         return false;
     }
     outbound
