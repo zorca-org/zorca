@@ -4480,7 +4480,7 @@ mod pre_cut_fallback_tests {
     #[test]
     #[cfg(unix)]
     fn stale_daemon_recovery_refuses_the_wrong_or_missing_daemon() {
-        use std::{fs, process::Command};
+        use std::fs;
 
         let worktree = tempfile::TempDir::new().expect("temporary worktree");
         let state = tempfile::TempDir::new().expect("temporary daemon state");
@@ -4494,10 +4494,12 @@ mod pre_cut_fallback_tests {
                 expected_daemon_id.map(|expected| (state_dir, expected)),
             )
             .expect("recovery script");
-            Command::new("sh")
-                .args(["-c", &script])
-                .output()
-                .expect("running recovery script")
+            smol::block_on(
+                smol::process::Command::new("sh")
+                    .args(["-c", &script])
+                    .output(),
+            )
+            .expect("running recovery script")
         };
 
         assert!(run(Some("daemon-a")).status.success());
