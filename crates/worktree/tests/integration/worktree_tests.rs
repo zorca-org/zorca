@@ -1417,6 +1417,46 @@ async fn test_root_rescan_reconciles_stale_state(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_manual_rescan_reconciles_stale_state(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "tmp": {} })).await;
+
+    let tree = Worktree::local(
+        Path::new("/root"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+
+    fs.pause_events();
+    fs.insert_file(Path::new("/root/tmp/new.txt"), Vec::new())
+        .await;
+    fs.clear_buffered_events();
+
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("tmp/new.txt")).is_none());
+    });
+
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().rescan())
+        .recv()
+        .await;
+
+    tree.read_with(cx, |tree, _| {
+        assert!(tree.entry_for_path(rel_path("tmp/new.txt")).is_some());
+    });
+    fs.unpause_events_and_flush();
+}
+
+#[gpui::test]
 async fn test_root_rescan_does_not_miss_event_before_readding_root_watcher(
     cx: &mut TestAppContext,
 ) {

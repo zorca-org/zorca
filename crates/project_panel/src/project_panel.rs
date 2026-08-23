@@ -1429,6 +1429,20 @@ impl ProjectPanel {
         }
     }
 
+    fn refresh_worktree(
+        &mut self,
+        worktree_id: WorktreeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(worktree) = self.project.read(cx).worktree_for_id(worktree_id, cx) else {
+            return;
+        };
+        worktree
+            .update(cx, |worktree, cx| worktree.rescan(cx))
+            .detach_and_notify_err(self.workspace.clone(), window, cx);
+    }
+
     fn all_worktree_roots(&self, cx: &App) -> Vec<(WorktreeId, ProjectEntryId)> {
         self.project
             .read(cx)
@@ -5637,6 +5651,7 @@ impl ProjectPanel {
         let canonical_path = details.canonical_path.clone();
         let path_style = self.project.read(cx).path_style(cx);
         let path = details.path.clone();
+        let is_root = path.is_empty();
 
         let depth = details.depth;
         let worktree_id = details.worktree_id;
@@ -6077,7 +6092,8 @@ impl ProjectPanel {
                     })
                     .selectable(false)
                     .when(
-                        canonical_path.is_some()
+                        is_root
+                            || canonical_path.is_some()
                             || diagnostic_count.is_some()
                             || git_indicator.is_some(),
                         |this| {
@@ -6137,6 +6153,27 @@ impl ProjectPanel {
                                         this.child(git_indicator)
                                     })
                                     .when_some(symlink_element, |this, el| this.child(el))
+                                    .when(is_root, |this| {
+                                        this.child(
+                                            IconButton::new(
+                                                format!(
+                                                    "refresh-worktree-{}-{}",
+                                                    entry_id.to_proto(),
+                                                    is_sticky
+                                                ),
+                                                IconName::RotateCw,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .aria_label("Refresh Files")
+                                            .tooltip(Tooltip::text("Refresh Files"))
+                                            .on_click(
+                                                cx.listener(move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.refresh_worktree(worktree_id, window, cx);
+                                                }),
+                                            ),
+                                        )
+                                    })
                                     .into_any_element(),
                             )
                         },

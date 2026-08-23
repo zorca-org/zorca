@@ -154,6 +154,7 @@ pub struct PathPrefixScanRequest {
 
 struct ScanRequest {
     relative_paths: Vec<Arc<RelPath>>,
+    recursive: bool,
     done: SmallVec<[barrier::Sender; 1]>,
 }
 
@@ -1122,6 +1123,36 @@ impl Worktree {
         }
     }
 
+    pub fn rescan(&mut self, cx: &Context<Worktree>) -> Task<Result<()>> {
+        match self {
+            Worktree::Local(this) => {
+                let mut rescan = this.rescan();
+                cx.background_spawn(async move {
+                    rescan.recv().await;
+                    Ok(())
+                })
+            }
+            Worktree::Remote(this) => {
+                let response = this.client.request(proto::RescanWorktree {
+                    project_id: this.project_id,
+                    worktree_id: this.snapshot.id().to_proto(),
+                });
+                cx.spawn(async move |this, cx| {
+                    let response = response.await?;
+                    let wait_for_snapshot = this.update(cx, |this, _| {
+                        anyhow::Ok(
+                            this.as_remote_mut()
+                                .context("cannot receive a remote worktree rescan")?
+                                .wait_for_snapshot(response.worktree_scan_id as usize),
+                        )
+                    })??;
+                    wait_for_snapshot.await?;
+                    Ok(())
+                })
+            }
+        }
+    }
+
     pub async fn handle_create_entry(
         this: Entity<Self>,
         request: proto::CreateProjectEntry,
@@ -1250,6 +1281,24 @@ impl Worktree {
             .await?;
         let scan_id = this.read_with(&cx, |this, _| this.scan_id());
         Ok(proto::ExpandAllForProjectEntryResponse {
+            worktree_scan_id: scan_id as u64,
+        })
+    }
+
+    pub async fn handle_rescan(
+        this: Entity<Self>,
+        mut cx: AsyncApp,
+    ) -> Result<proto::RescanWorktreeResponse> {
+        let mut rescan = this.update(&mut cx, |this, _| {
+            anyhow::Ok(
+                this.as_local()
+                    .context("cannot rescan a remote worktree")?
+                    .rescan(),
+            )
+        })?;
+        rescan.recv().await;
+        let scan_id = this.read_with(&cx, |this, _| this.scan_id());
+        Ok(proto::RescanWorktreeResponse {
             worktree_scan_id: scan_id as u64,
         })
     }
@@ -2137,9 +2186,22 @@ impl LocalWorktree {
         self.scan_requests_tx
             .try_send(ScanRequest {
                 relative_paths: paths,
+                recursive: false,
                 done: smallvec![tx],
             })
             .ok();
+        rx
+    }
+
+    pub fn rescan(&self) -> barrier::Receiver {
+        let (tx, rx) = barrier::channel();
+        if let Err(error) = self.scan_requests_tx.try_send(ScanRequest {
+            relative_paths: vec![RelPath::empty_arc()],
+            recursive: true,
+            done: smallvec![tx],
+        }) {
+            log::error!("failed to request worktree rescan: {error}");
+        }
         rx
     }
 
@@ -4631,14 +4693,21 @@ impl BackgroundScanner {
             }
         }
 
+        let (scan_job_tx, scan_job_rx) = async_channel::unbounded();
         self.reload_entries_for_paths(
             &root_path,
             &root_canonical_path,
             &request.relative_paths,
             abs_paths,
-            None,
+            request.recursive.then_some(scan_job_tx),
         )
         .await;
+
+        if request.recursive {
+            while let Ok(job) = scan_job_rx.recv().await {
+                self.scan_dir(&job).await.log_err();
+            }
+        }
 
         self.send_status_update(scanning, request.done, &[]).await
     }
@@ -6153,6 +6222,7 @@ impl BackgroundScanner {
         let mut request = self.scan_requests_rx.recv().await?;
         while let Ok(next_request) = self.scan_requests_rx.try_recv() {
             request.relative_paths.extend(next_request.relative_paths);
+            request.recursive |= next_request.recursive;
             request.done.extend(next_request.done);
         }
         Ok(request)
