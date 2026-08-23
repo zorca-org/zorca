@@ -68,7 +68,7 @@ pub fn open_workspace_session(
                 let lifecycle = lifecycle.clone();
                 let id = id.clone();
                 async move {
-                    let (workspace, state) = lifecycle.open_workspace(&id).await?;
+                    let (mut workspace, state) = lifecycle.open_workspace(&id).await?;
                     // **The daemon is the restore path.** A workspace whose
                     // session is alive has an arrangement stored beside it, and
                     // opening means building that and attaching to what it
@@ -76,16 +76,21 @@ pub fn open_workspace_session(
                     // when there is no stored layout to build does the
                     // single-terminal attach-or-create below run, which is what
                     // a workspace being opened for the first time is.
-                    let stored = matches!(state, SessionState::Alive)
-                        .then(|| lifecycle.open_workspace_layout(&workspace))
-                        .transpose()
-                        .unwrap_or_else(|error| {
+                    let stored = if matches!(state, SessionState::Alive) {
+                        lifecycle
+                            .open_workspace_layout_identified(&mut workspace)
+                            .await
+                            .map(Some)
+                            .unwrap_or_else(|error| {
                             log::warn!(
                                 "no stored layout for workspace {}, opening a terminal instead: {error:#}",
                                 workspace.id
                             );
                             None
-                        });
+                            })
+                    } else {
+                        None
+                    };
                     let attached = match (&stored, state) {
                         (Some(_), _) => None,
                         // `Unknown` cannot come out of a probe — only a
@@ -138,8 +143,16 @@ pub fn open_workspace_session(
                             let daemon_id = attached.daemon_id.clone();
                             let record_attach = state == SessionState::NeverCreated
                                 || (workspace.daemon_id.is_none() && daemon_id.is_some());
-                            let opened =
-                                attach_terminal(&zed_workspace, &workspace, attached, cx).await;
+                            let mut attached_workspace = workspace.clone();
+                            attached_workspace.daemon_id =
+                                attached_workspace.daemon_id.or(daemon_id.clone());
+                            let opened = attach_terminal(
+                                &zed_workspace,
+                                &attached_workspace,
+                                attached,
+                                cx,
+                            )
+                            .await;
                             match (opened, record_attach) {
                                 // The successful pane owns the exact session and
                                 // daemon identity this row can now record.
@@ -742,8 +755,9 @@ mod tests {
 
     #[gpui::test(iterations = 10)]
     async fn failed_retry_preserves_the_same_workspace_sync(cx: &mut TestAppContext) {
-        let (workspace, ade_workspace, mut window) =
+        let (workspace, mut ade_workspace, mut window) =
             test_window("failed_retry_preserves_same_sync", cx).await;
+        ade_workspace.daemon_id = Some("daemon-a".to_owned());
         window.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {
                 workspace.set_ade_owns_layout(window, cx)
@@ -768,6 +782,24 @@ mod tests {
                 AdeLayouts::is_showing(workspace.entity_id(), &ade_workspace, cx)
             })
         );
+        let mut replacement = ade_workspace.clone();
+        replacement.daemon_id = Some("daemon-b".to_owned());
+        assert!(
+            !window.update(|_, cx| {
+                AdeLayouts::is_showing(workspace.entity_id(), &replacement, cx)
+            })
+        );
+        assert!(!window.update(|_, cx| {
+            AdeLayouts::catch_up_if_showing(
+                workspace.entity_id(),
+                &replacement,
+                &WorkspaceLayout {
+                    layout: ade_session::LayoutDoc::default(),
+                    rev: 2,
+                },
+                cx,
+            )
+        }));
     }
 
     #[gpui::test(iterations = 10)]

@@ -270,11 +270,13 @@ fn open_new_session_terminal_at(
                 // Blocking: creating the session and resolving its argv are two
                 // round trips to the backend.
                 async move {
-                    lifecycle.create_session_in_workspace(&ade_workspace, &working_directory)
+                    lifecycle
+                        .create_session_in_workspace(&ade_workspace, &working_directory)
+                        .await
                 }
             })
             .await;
-        let (session_id, argv) = match created {
+        let (session_id, argv, daemon_id) = match created {
             Ok(created) => created,
             Err(error) => {
                 log::error!(
@@ -290,6 +292,11 @@ fn open_new_session_terminal_at(
                 return Err(error);
             }
         };
+        let mut ade_workspace = ade_workspace;
+        ade_workspace.daemon_id = ade_workspace.daemon_id.or(daemon_id);
+        sync.update(cx, |sync, _| {
+            sync.ade_workspace.daemon_id = ade_workspace.daemon_id.clone()
+        })?;
 
         // A remote workspace's checkout is a path on *its* host: the attach
         // client is local, and the session's cwd was set where it runs.
@@ -1247,6 +1254,12 @@ impl LayoutSync {
         self.ade_workspace.daemon_workspace_id()
     }
 
+    fn is_for(&self, workspace: &AdeWorkspace) -> bool {
+        self.daemon_workspace_id() == workspace.daemon_workspace_id()
+            && self.ade_workspace.remote_host == workspace.remote_host
+            && self.ade_workspace.daemon_id == workspace.daemon_id
+    }
+
     /// Re-arms the debounce. Called on every mutation; only the last one in a
     /// burst reaches [`Self::push`].
     fn schedule(&mut self, cx: &mut Context<Self>) {
@@ -1719,9 +1732,7 @@ impl AdeLayouts {
         ade_workspace: &AdeWorkspace,
         cx: &App,
     ) -> bool {
-        Self::sync_for(zed_workspace, cx).is_some_and(|sync| {
-            sync.read(cx).daemon_workspace_id() == ade_workspace.daemon_workspace_id()
-        })
+        Self::sync_for(zed_workspace, cx).is_some_and(|sync| sync.read(cx).is_for(ade_workspace))
     }
 
     pub(crate) fn forget_window(zed_workspace: EntityId, cx: &mut App) {
@@ -1748,7 +1759,7 @@ impl AdeLayouts {
         let Some(sync) = Self::sync_for(zed_workspace, cx) else {
             return false;
         };
-        if sync.read(cx).daemon_workspace_id() != ade_workspace.daemon_workspace_id() {
+        if !sync.read(cx).is_for(ade_workspace) {
             return false;
         }
         let event = LayoutEvent {

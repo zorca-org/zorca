@@ -525,6 +525,15 @@ pub trait SessionBackend: Send + Sync {
         bail!("this session backend does not store workspace layouts")
     }
 
+    fn open_workspace_identified(
+        &self,
+        workspace_id: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(WorkspaceLayout, Option<String>)> {
+        let layout = self.open_workspace(workspace_id, expected_daemon_id)?;
+        Ok((layout, self.instance_id()))
+    }
+
     /// Stores a new layout, which must be at `rev` — the revision the caller
     /// last saw, plus one.
     ///
@@ -578,7 +587,7 @@ pub trait SessionBackend: Send + Sync {
     /// goes on writing layouts into a workspace that is gone.
     ///
     /// A backend without a workspace of its own says so here rather than
-    /// pretending — the layer above falls back to taking the sessions.
+    /// pretending that deleting sessions also deleted a workspace record.
     fn kill_workspace(&self, _workspace_id: &str, _expected_daemon_id: Option<&str>) -> Result<()> {
         bail!("this session backend has no workspaces of its own to kill")
     }

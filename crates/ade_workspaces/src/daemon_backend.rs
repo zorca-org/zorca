@@ -943,9 +943,19 @@ impl SessionBackend for DaemonBackend {
         workspace_id: &str,
         expected_daemon_id: Option<&str>,
     ) -> Result<WorkspaceLayout> {
+        Ok(self
+            .open_workspace_identified(workspace_id, expected_daemon_id)?
+            .0)
+    }
+
+    fn open_workspace_identified(
+        &self,
+        workspace_id: &str,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<(WorkspaceLayout, Option<String>)> {
         let request_id = self.request_id();
-        let workspace = self
-            .request(
+        let (workspace, daemon_id) = self
+            .request_seen(
                 expected_daemon_id,
                 request_id,
                 Frame::OpenWorkspace {
@@ -962,10 +972,13 @@ impl SessionBackend for DaemonBackend {
                 },
             )
             .with_context(|| format!("opening workspace {workspace_id}"))?;
-        Ok(WorkspaceLayout {
-            layout: workspace.layout,
-            rev: workspace.layout_rev,
-        })
+        Ok((
+            WorkspaceLayout {
+                layout: workspace.layout,
+                rev: workspace.layout_rev,
+            },
+            daemon_id,
+        ))
     }
 
     fn update_layout(
@@ -1110,7 +1123,14 @@ impl SessionBackend for DaemonBackend {
     ) -> Result<()> {
         let daemon_id = self.kill_workspace_sessions_seen(id, expected_daemon_id)?;
         if let Transport::Forwarded(link) = &self.endpoint.transport {
-            link.recover_stale_daemon_processes(directory, daemon_id.as_deref())?;
+            match daemon_id.as_deref() {
+                Some(daemon_id) => {
+                    link.recover_stale_daemon_processes(directory, Some(daemon_id))?
+                }
+                None => log::warn!(
+                    "skipping out-of-band terminal cleanup because the remote daemon has no identity"
+                ),
+            }
         }
         Ok(())
     }
