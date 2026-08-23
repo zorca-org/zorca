@@ -55,9 +55,9 @@
 //! still in the daemon's own listing, and [`Self::kill`] takes it with the rest.
 
 use crate::{
-    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, Identified, LayoutEvent,
-    SessionBackend, SessionChange, SessionId, SessionInfo, SessionSpec, StatusDelivery,
-    StatusEvent, WorkspaceLayout, WorkspaceStatus,
+    Attached, BackendWorkspace, DaemonEvent, DaemonFreshnessObserver, Identified,
+    IdentifiedDaemonEvent, LayoutEvent, SessionBackend, SessionChange, SessionId, SessionInfo,
+    SessionSpec, StatusDelivery, StatusEvent, WorkspaceLayout, WorkspaceStatus,
 };
 use ade_session::{
     EnsureOutcome, LOOPBACK_ADDRESS, LayoutDoc, LocalEndpoint, PRE_CUT_DIAGNOSIS, ReadFrameError,
@@ -1090,7 +1090,7 @@ impl SessionBackend for DaemonBackend {
         StatusDelivery::Push
     }
 
-    fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
+    fn subscribe_events(&self) -> Result<Receiver<IdentifiedDaemonEvent>> {
         let (sender, receiver) = smol::channel::unbounded();
         let endpoint = self.endpoint.clone();
         // A plain thread, not a task: it owns a connection of its own and
@@ -1117,11 +1117,12 @@ impl SessionBackend for DaemonBackend {
 /// that worked resets the schedule; the first failure and every *change* of
 /// failure is a warning, while the repeats stay at debug so a permanent one
 /// does not bury the log it is trying to be visible in.
-fn stream_status(endpoint: Endpoint, sender: Sender<DaemonEvent>) {
+fn stream_status(endpoint: Endpoint, sender: Sender<IdentifiedDaemonEvent>) {
     let mut delay = FIRST_RESUBSCRIBE_DELAY;
     let mut last_failure: Option<String> = None;
     let mut known_workspaces = HashMap::new();
     let mut has_workspace_snapshot = false;
+    let mut previous_daemon_id = None;
 
     while !sender.is_closed() {
         let mut subscribed = false;
@@ -1131,6 +1132,7 @@ fn stream_status(endpoint: Endpoint, sender: Sender<DaemonEvent>) {
             &mut subscribed,
             &mut known_workspaces,
             &mut has_workspace_snapshot,
+            &mut previous_daemon_id,
         ));
 
         if subscribed {
@@ -1192,12 +1194,16 @@ fn next_resubscribe_delay(delay: Duration) -> Duration {
 /// an error off the connection.
 async fn stream_status_once(
     endpoint: &Endpoint,
-    sender: &Sender<DaemonEvent>,
+    sender: &Sender<IdentifiedDaemonEvent>,
     subscribed: &mut bool,
     known_workspaces: &mut HashMap<String, KnownWorkspace>,
     has_workspace_snapshot: &mut bool,
+    previous_daemon_id: &mut Option<Option<String>>,
 ) -> Result<()> {
-    let mut connection = endpoint.connect().await?.connection;
+    let Control {
+        mut connection,
+        instance_id,
+    } = endpoint.connect().await?;
 
     // **Subscribe first, list second.** The daemon's events name its own
     // session ids while this crate's callers name workspaces, and the listing
@@ -1243,9 +1249,24 @@ async fn stream_status_once(
     // too. Reconcile the workspace snapshot before replaying changes queued
     // behind it: this repairs layouts and removals missed while disconnected.
     *subscribed = true;
+    if previous_daemon_id
+        .as_ref()
+        .is_some_and(|previous| previous != &instance_id)
+    {
+        known_workspaces.clear();
+        *has_workspace_snapshot = false;
+    }
+    *previous_daemon_id = Some(instance_id.clone());
     let first_workspace_snapshot = !*has_workspace_snapshot;
     for event in workspace_snapshot_events(workspaces.unwrap_or_default(), known_workspaces) {
-        if sender.send(event).await.is_err() {
+        if sender
+            .send(IdentifiedDaemonEvent {
+                daemon_id: instance_id.clone(),
+                event,
+            })
+            .await
+            .is_err()
+        {
             return Ok(());
         }
     }
@@ -1254,7 +1275,13 @@ async fn stream_status_once(
     for frame in pending {
         if let Some(event) = status_event(frame, &mut join) {
             if accept_workspace_event(&event, known_workspaces, first_workspace_snapshot)
-                && sender.send(event).await.is_err()
+                && sender
+                    .send(IdentifiedDaemonEvent {
+                        daemon_id: instance_id.clone(),
+                        event,
+                    })
+                    .await
+                    .is_err()
             {
                 return Ok(());
             }
@@ -1264,7 +1291,13 @@ async fn stream_status_once(
         let frame = connection.recv_decodable().await?;
         if let Some(event) = status_event(frame, &mut join) {
             if accept_workspace_event(&event, known_workspaces, true)
-                && sender.send(event).await.is_err()
+                && sender
+                    .send(IdentifiedDaemonEvent {
+                        daemon_id: instance_id.clone(),
+                        event,
+                    })
+                    .await
+                    .is_err()
             {
                 // Nobody is listening any more: that is the unsubscribe.
                 return Ok(());
@@ -3265,6 +3298,7 @@ mod control_connection {
         /// Answer the three requests a status subscription opens with, then
         /// close so the next script is its reconnect.
         SubscriptionSnapshot {
+            instance_id: Option<String>,
             sessions: Vec<proto::SessionInfo>,
             workspaces: Vec<proto::WorkspaceInfo>,
             pending: Vec<Frame>,
@@ -3449,13 +3483,16 @@ mod control_connection {
                         let mut daemon = ade_session::Connection::new(stream);
                         let _hello = daemon.recv().await;
                         if let Script::SubscriptionSnapshot {
+                            instance_id,
                             sessions,
                             workspaces,
                             pending,
                         } = &script
                         {
+                            let mut hello_ack = ack();
+                            hello_ack.instance_id = instance_id.clone();
                             daemon
-                                .send(&Frame::HelloAck(ack()))
+                                .send(&Frame::HelloAck(hello_ack))
                                 .await
                                 .expect("sending the ack");
                             assert!(matches!(
@@ -4119,6 +4156,7 @@ mod control_connection {
 
         let backend = scripted_daemon(vec![
             Script::SubscriptionSnapshot {
+                instance_id: None,
                 sessions: Vec::new(),
                 workspaces: Vec::new(),
                 pending: vec![Frame::WorkspaceRemoved {
@@ -4128,6 +4166,7 @@ mod control_connection {
                 }],
             },
             Script::SubscriptionSnapshot {
+                instance_id: None,
                 sessions: Vec::new(),
                 workspaces: vec![
                     workspace("removed", 1, "/old"),
@@ -4138,6 +4177,7 @@ mod control_connection {
                 pending: Vec::new(),
             },
             Script::SubscriptionSnapshot {
+                instance_id: None,
                 sessions: Vec::new(),
                 workspaces: vec![
                     workspace("changed", 2, "/after"),
@@ -4163,6 +4203,7 @@ mod control_connection {
         let (sender, receiver) = smol::channel::unbounded();
         let mut known = HashMap::new();
         let mut has_snapshot = false;
+        let mut previous_daemon_id = None;
 
         for _ in 0..3 {
             let mut subscribed = false;
@@ -4172,12 +4213,15 @@ mod control_connection {
                 &mut subscribed,
                 &mut known,
                 &mut has_snapshot,
+                &mut previous_daemon_id,
             ))
             .expect_err("the scripted connection closes after its snapshot");
             assert!(subscribed);
         }
 
-        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .map(|identified| identified.event)
+            .collect();
         assert!(events.contains(&DaemonEvent::WorkspaceRemoved {
             workspace_id: "removed".to_owned(),
         }));
@@ -4247,6 +4291,56 @@ mod control_connection {
                 .collect::<HashMap<_, _>>(),
             HashMap::from([("changed", 2), ("recreated", 1), ("repaired", 3)])
         );
+
+        let backend = scripted_daemon(vec![
+            Script::SubscriptionSnapshot {
+                instance_id: Some("daemon-a".to_owned()),
+                sessions: Vec::new(),
+                workspaces: vec![workspace("same", 9, "/a"), workspace("a-only", 1, "/a")],
+                pending: Vec::new(),
+            },
+            Script::SubscriptionSnapshot {
+                instance_id: Some("daemon-b".to_owned()),
+                sessions: Vec::new(),
+                workspaces: vec![workspace("same", 1, "/b")],
+                pending: Vec::new(),
+            },
+        ]);
+        let (sender, receiver) = smol::channel::unbounded();
+        let mut known = HashMap::new();
+        let mut has_snapshot = false;
+        let mut previous_daemon_id = None;
+        for _ in 0..2 {
+            let mut subscribed = false;
+            smol::block_on(stream_status_once(
+                &backend.endpoint,
+                &sender,
+                &mut subscribed,
+                &mut known,
+                &mut has_snapshot,
+                &mut previous_daemon_id,
+            ))
+            .expect_err("the scripted connection closes after its snapshot");
+        }
+        let events: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+        assert!(events.iter().any(|identified| {
+            identified.daemon_id.as_deref() == Some("daemon-b")
+                && matches!(
+                    &identified.event,
+                    DaemonEvent::Layout(LayoutEvent {
+                        workspace_id,
+                        rev: 1,
+                        ..
+                    }) if workspace_id == "same"
+                )
+        }));
+        assert!(!events.iter().any(|identified| {
+            identified.daemon_id.as_deref() == Some("daemon-b")
+                && matches!(
+                    &identified.event,
+                    DaemonEvent::WorkspaceReset(_) | DaemonEvent::WorkspaceRemoved { .. }
+                )
+        }));
     }
 
     /// A busy pre-cut daemon cannot be used by this client and cannot be
@@ -4845,7 +4939,7 @@ mod tests {
 
         let event = smol::block_on(async {
             loop {
-                if let DaemonEvent::Layout(event) = events.recv().await.unwrap() {
+                if let DaemonEvent::Layout(event) = events.recv().await.unwrap().event {
                     return event;
                 }
             }
@@ -4883,7 +4977,8 @@ mod tests {
         // And every other client is told, by workspace rather than by session.
         let removed = smol::block_on(async {
             loop {
-                if let DaemonEvent::WorkspaceRemoved { workspace_id } = events.recv().await.unwrap()
+                if let DaemonEvent::WorkspaceRemoved { workspace_id } =
+                    events.recv().await.unwrap().event
                 {
                     return workspace_id;
                 }
@@ -5015,10 +5110,13 @@ mod tests {
     }
 
     /// The next session event, ignoring layouts.
-    async fn next_session(events: &Receiver<DaemonEvent>) -> StatusEvent {
+    async fn next_session(events: &Receiver<IdentifiedDaemonEvent>) -> StatusEvent {
         loop {
-            if let DaemonEvent::Session(event) =
-                events.recv().await.expect("the status stream stays open")
+            if let DaemonEvent::Session(event) = events
+                .recv()
+                .await
+                .expect("the status stream stays open")
+                .event
             {
                 return event;
             }
@@ -5026,7 +5124,7 @@ mod tests {
     }
 
     /// The next event about `id`, ignoring whatever else the daemon is saying.
-    async fn next_for(events: &Receiver<DaemonEvent>, id: &SessionId) -> StatusEvent {
+    async fn next_for(events: &Receiver<IdentifiedDaemonEvent>, id: &SessionId) -> StatusEvent {
         loop {
             let event = next_session(events).await;
             if &event.id == id {

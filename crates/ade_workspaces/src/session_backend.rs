@@ -292,6 +292,13 @@ pub enum DaemonEvent {
     },
 }
 
+/// One pushed event paired with the daemon connection that produced it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IdentifiedDaemonEvent {
+    pub daemon_id: Option<String>,
+    pub event: DaemonEvent,
+}
+
 /// One workspace-level thing that happened, as the layers above the seam see
 /// it: the merged layout stream carries removals too.
 ///
@@ -304,14 +311,17 @@ pub enum DaemonEvent {
 pub enum WorkspaceEvent {
     Layout {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         event: LayoutEvent,
     },
     Reset {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         event: LayoutEvent,
     },
     Removed {
         remote_host: Option<String>,
+        daemon_id: Option<String>,
         workspace_id: String,
     },
 }
@@ -472,7 +482,7 @@ pub trait SessionBackend: Send + Sync {
     /// Each call opens its own stream — one connection's worth — so callers fan
     /// one subscription out rather than taking several. Dropping every receiver
     /// is the only unsubscribe there is.
-    fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
+    fn subscribe_events(&self) -> Result<Receiver<IdentifiedDaemonEvent>> {
         bail!("this session backend reports status by polling, not by pushing")
     }
 

@@ -47,9 +47,9 @@
 
 use crate::{
     AdeWorkspace, AdeWorkspaceRegistry, Attached, BackendWorkspace, DaemonBackend, DaemonEvent,
-    DaemonUpgradeOutcome, SESSION_PREFIX, SessionBackend, SessionId, SessionSpec, StatusDelivery,
-    StatusEvent, WorkspaceEvent, WorkspaceId, WorkspaceLayout, WorkspaceStatus, now_whole_seconds,
-    project_id_from_path,
+    DaemonUpgradeOutcome, IdentifiedDaemonEvent, SESSION_PREFIX, SessionBackend, SessionId,
+    SessionSpec, StatusDelivery, StatusEvent, WorkspaceEvent, WorkspaceId, WorkspaceLayout,
+    WorkspaceStatus, now_whole_seconds, project_id_from_path,
 };
 use ade_session::LayoutDoc;
 use anyhow::{Context as _, Result, bail};
@@ -1496,13 +1496,15 @@ impl EventFanout {
     /// receiver is the only unsubscribe there is, and a slot left holding a dead
     /// sender would keep [`Self::is_idle`] answering "somebody is listening"
     /// forever.
-    fn deliver(&self, remote_host: &Option<String>, event: DaemonEvent) -> bool {
+    fn deliver(&self, remote_host: &Option<String>, identified: IdentifiedDaemonEvent) -> bool {
+        let IdentifiedDaemonEvent { daemon_id, event } = identified;
         match event {
             DaemonEvent::Session(event) => send_or_clear(&self.status, event),
             DaemonEvent::Layout(event) => send_or_clear(
                 &self.layout,
                 WorkspaceEvent::Layout {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     event,
                 },
             ),
@@ -1510,6 +1512,7 @@ impl EventFanout {
                 &self.layout,
                 WorkspaceEvent::Reset {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     event,
                 },
             ),
@@ -1517,6 +1520,7 @@ impl EventFanout {
                 &self.layout,
                 WorkspaceEvent::Removed {
                     remote_host: remote_host.clone(),
+                    daemon_id,
                     workspace_id,
                 },
             ),
@@ -2384,12 +2388,14 @@ mod tests {
         );
         let WorkspaceEvent::Layout {
             remote_host,
+            daemon_id,
             event: layout,
         } = smol::block_on(layouts.recv()).unwrap()
         else {
             panic!("a pushed layout must arrive as one");
         };
         assert_eq!(remote_host, None);
+        assert_eq!(daemon_id, None);
         assert_eq!(layout.workspace_id, "ade-here-000001");
         assert_eq!(layout.rev, 7);
 
@@ -2400,12 +2406,14 @@ mod tests {
         });
         let WorkspaceEvent::Reset {
             remote_host,
+            daemon_id,
             event: reset,
         } = smol::block_on(layouts.recv()).unwrap()
         else {
             panic!("an incarnation replacement must remain distinct from a kill");
         };
         assert_eq!(remote_host, None);
+        assert_eq!(daemon_id, None);
         assert_eq!(reset.workspace_id, "ade-here-000001");
         assert_eq!(reset.rev, 1);
 
@@ -2416,6 +2424,7 @@ mod tests {
             smol::block_on(layouts.recv()).unwrap(),
             WorkspaceEvent::Removed {
                 remote_host: None,
+                daemon_id: None,
                 workspace_id: "ade-here-000001".to_owned()
             }
         );
@@ -2448,10 +2457,12 @@ mod tests {
             vec![
                 WorkspaceEvent::Removed {
                     remote_host: None,
+                    daemon_id: None,
                     workspace_id: "same-id".to_owned(),
                 },
                 WorkspaceEvent::Removed {
                     remote_host: Some("h1".to_owned()),
+                    daemon_id: None,
                     workspace_id: "same-id".to_owned(),
                 },
             ]
@@ -3237,7 +3248,7 @@ mod tests {
         /// what adoption has to find.
         workspaces: Mutex<Vec<BackendWorkspace>>,
         calls: Mutex<Vec<String>>,
-        status: Mutex<Option<Sender<DaemonEvent>>>,
+        status: Mutex<Option<Sender<IdentifiedDaemonEvent>>>,
         /// Whether this backend's host is behind the client, as a hash
         /// comparison would have found — and who asked to be told when that
         /// moves. The two halves of what the sidebar's upgrade arrow reads.
@@ -3338,31 +3349,43 @@ mod tests {
         /// Pushes an event to whoever subscribed, standing in for a daemon.
         fn push(&self, event: StatusEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::Session(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::Session(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         /// The layout half of [`Self::push`], for the fanout's own test.
         fn push_layout(&self, event: LayoutEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::Layout(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::Layout(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         fn push_workspace_reset(&self, event: LayoutEvent) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::WorkspaceReset(event)))
-                    .expect("the merged stream is listening");
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::WorkspaceReset(event),
+                }))
+                .expect("the merged stream is listening");
             }
         }
 
         /// A workspace another client killed, as the daemon announces it.
         fn push_workspace_removed(&self, workspace_id: &str) {
             if let Some(sender) = self.status.lock().unwrap().as_ref() {
-                smol::block_on(sender.send(DaemonEvent::WorkspaceRemoved {
-                    workspace_id: workspace_id.to_owned(),
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::WorkspaceRemoved {
+                        workspace_id: workspace_id.to_owned(),
+                    },
                 }))
                 .expect("the merged stream is listening");
             }
@@ -3473,7 +3496,7 @@ mod tests {
             StatusDelivery::Push
         }
 
-        fn subscribe_events(&self) -> Result<Receiver<DaemonEvent>> {
+        fn subscribe_events(&self) -> Result<Receiver<IdentifiedDaemonEvent>> {
             self.calls.lock().unwrap().push("subscribe".to_owned());
             let (sender, receiver) = smol::channel::unbounded();
             *self.status.lock().unwrap() = Some(sender);

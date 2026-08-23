@@ -462,8 +462,8 @@ async fn install_sync(
 mod tests {
     use super::*;
     use crate::{
-        DaemonEvent, GlobalLifecycleService, SessionBackend, SessionId, SessionInfo, SessionSpec,
-        StatusDelivery, WorkspaceLifecycleService,
+        GlobalLifecycleService, IdentifiedDaemonEvent, SessionBackend, SessionId, SessionInfo,
+        SessionSpec, StatusDelivery, WorkspaceLifecycleService,
     };
     use anyhow::bail;
     use gpui::{TestAppContext, VisualTestContext};
@@ -500,7 +500,7 @@ mod tests {
             StatusDelivery::Push
         }
 
-        fn subscribe_events(&self) -> Result<smol::channel::Receiver<DaemonEvent>> {
+        fn subscribe_events(&self) -> Result<smol::channel::Receiver<IdentifiedDaemonEvent>> {
             let (_sender, receiver) = smol::channel::unbounded();
             Ok(receiver)
         }
