@@ -26,11 +26,11 @@
 //! - **The terminal is restored however it ends.** `RawMode` restores what it
 //!   saved from `Drop`, which covers the error paths and a panic alike.
 //!
-//! One connection, one writer: [`Frame::Write`] and [`Frame::Resize`] are
-//! queued on a channel and written by a single task, because two tasks writing
-//! frames to one stream could interleave a length prefix with somebody else's
-//! payload. The connect hands back the two halves already separated — on a
-//! socket, two clones of one fd.
+//! One connection, one writer: input, focus and resize frames are queued on a
+//! channel and written by a single task, because two tasks writing one stream
+//! could interleave a length prefix with somebody else's payload. The connect
+//! hands back the two halves already separated — on a socket, two clones of one
+//! fd.
 //!
 //! Everything above is platform-neutral, and so is the code for it. Only the
 //! local terminal is not: a Unix tty is termios plus SIGWINCH ([`tty`]), a
@@ -43,8 +43,12 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ade_session::client::{Connection, PRE_CUT_DIAGNOSIS, is_handshake_eof};
 use ade_session::framing::{ReadFrameError, bounded, rejection_frame};
@@ -87,6 +91,33 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// A replay describes a fresh terminal, so re-establish that baseline first.
 const RESET_TERMINAL: &[u8] = b"\x1bc";
+
+/// Zed opens task terminals at this bootstrap size before their pane is laid
+/// out. It is not a real viewer request and must not shrink a shared session.
+const ZED_BOOTSTRAP_SIZE: (u16, u16) = (100, 6);
+
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+fn fresh_view_id() -> String {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
+    format!("attach-{}-{time}-{sequence}", std::process::id())
+}
+
+fn is_zed_bootstrap_size(size: (u16, u16)) -> bool {
+    is_zed_bootstrap_size_for(size, std::env::var_os("ZED_TERM").is_some())
+}
+
+fn is_zed_bootstrap_size_for(size: (u16, u16), zed_term: bool) -> bool {
+    zed_term && size == ZED_BOOTSTRAP_SIZE
+}
+
+fn initial_terminal_size() -> Option<(u16, u16)> {
+    terminal_size().filter(|size| !is_zed_bootstrap_size(*size))
+}
 
 /// The two halves of a connection, back together as the one duplex stream
 /// [`Connection::handshake`] needs. A join, not an adapter: reads go to the
@@ -434,18 +465,33 @@ where
     C: Fn() -> F,
     F: Future<Output = Result<(R, W)>>,
 {
+    let mut config = config;
+    config.view_id.get_or_insert_with(fresh_view_id);
     let mut stdout = Unblock::new(std::io::stdout());
-    let (mut daemon, mut writer) = connect_and_attach(&config, &connect, &mut stdout, false)
-        .await
-        .map_err(|error| error.into_initial_error(&config.session_id))?;
+    let (mut daemon, mut writer, can_focus) =
+        connect_and_attach(&config, &connect, &mut stdout, false)
+            .await
+            .map_err(|error| error.into_initial_error(&config.session_id))?;
 
     // From here the terminal belongs to the session.
     let raw = RawMode::enable();
     let (outbound, queued) = smol::channel::bounded::<QueuedFrame>(OUTBOUND_QUEUE_FRAMES);
-    let input = smol::spawn(pump_input(outbound.clone(), config.session_id.clone()));
-    let resize = raw
-        .is_some()
-        .then(|| smol::spawn(pump_resize(outbound.clone(), config.session_id.clone())));
+    let can_focus = Arc::new(AtomicBool::new(can_focus));
+    let view_id = config.view_id.clone();
+    let input = smol::spawn(pump_input(
+        outbound.clone(),
+        config.session_id.clone(),
+        view_id.clone(),
+        can_focus.clone(),
+    ));
+    let resize = raw.is_some().then(|| {
+        smol::spawn(pump_resize(
+            outbound.clone(),
+            config.session_id.clone(),
+            view_id,
+            can_focus.clone(),
+        ))
+    });
 
     let mut generation = 0;
     let mut pending = None;
@@ -458,12 +504,13 @@ where
                 &outbound,
                 generation,
             ),
-            pump_writer(&mut writer, &queued, &mut pending, generation),
+            pump_writer(&mut writer, &queued, &mut pending, generation, &can_focus),
         )
         .await;
         match result {
             PumpResult::Ended(ending) => break Ok(ending),
             PumpResult::Reconnect => {
+                can_focus.store(false, Ordering::SeqCst);
                 generation = generation.wrapping_add(1);
                 if matches!(pending, Some(QueuedFrame::Connection { .. })) {
                     pending = None;
@@ -471,7 +518,10 @@ where
                 loop {
                     match connect_and_attach(&config, &connect, &mut stdout, true).await {
                         Ok(connection) => {
-                            (daemon, writer) = connection;
+                            let (new_daemon, new_writer, supported) = connection;
+                            daemon = new_daemon;
+                            writer = new_writer;
+                            can_focus.store(supported, Ordering::SeqCst);
                             break;
                         }
                         Err(AttachFailure::Transport(error)) => {
@@ -511,7 +561,7 @@ async fn connect_and_attach<R, W, C, F>(
     connect: &C,
     stdout: &mut Unblock<std::io::Stdout>,
     reconnecting: bool,
-) -> std::result::Result<(Connection<R>, Connection<W>), AttachFailure>
+) -> std::result::Result<(Connection<R>, Connection<W>, bool), AttachFailure>
 where
     R: AsyncRead + AsyncWrite + Unpin,
     W: AsyncRead + AsyncWrite + Unpin,
@@ -521,7 +571,7 @@ where
     let (reader, writer, generation) = handshaken(config, connect, !reconnecting).await?;
     let mut daemon = Connection::new(reader);
     let mut writer = Connection::new(writer);
-    if let Some((cols, rows)) = terminal_size() {
+    if let Some((cols, rows)) = initial_terminal_size() {
         writer
             .send(&Frame::Resize {
                 session_id: config.session_id.clone(),
@@ -555,7 +605,7 @@ where
         reconnecting,
     )
     .await?;
-    Ok((daemon, writer))
+    Ok((daemon, writer, generation > LEGACY_GENERATION))
 }
 
 /// Wait for the attach to be answered, writing the replayed scrollback out.
@@ -659,6 +709,10 @@ impl QueuedFrame {
             Self::Persistent(_) => false,
         }
     }
+
+    fn requires_focus_capability(&self) -> bool {
+        matches!(self.frame(), Frame::FocusSession { .. })
+    }
 }
 
 enum PumpResult {
@@ -755,6 +809,7 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
     queued: &Receiver<QueuedFrame>,
     pending: &mut Option<QueuedFrame>,
     generation: u64,
+    can_focus: &AtomicBool,
 ) -> PumpResult {
     loop {
         if pending.is_none() {
@@ -763,6 +818,9 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
         if pending
             .as_ref()
             .is_some_and(|frame| frame.is_stale(generation))
+            || pending.as_ref().is_some_and(|frame| {
+                frame.requires_focus_capability() && !can_focus.load(Ordering::SeqCst)
+            })
         {
             *pending = None;
             continue;
@@ -785,7 +843,12 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Local keystrokes → [`Frame::Write`]. Ends on EOF, which leaves the client
 /// running: a closed stdin is not a closed session.
-async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
+async fn pump_input(
+    outbound: Sender<QueuedFrame>,
+    session_id: SessionId,
+    view_id: Option<String>,
+    can_focus: Arc<AtomicBool>,
+) {
     let mut stdin = Unblock::new(std::io::stdin());
     let mut buffer = vec![0u8; INPUT_CHUNK_BYTES];
     loop {
@@ -793,6 +856,9 @@ async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
+        if !claim_focus(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+            break;
+        }
         let frame = Frame::Write {
             session_id: session_id.clone(),
             bytes: buffer[..read].to_vec(),
@@ -803,12 +869,21 @@ async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     }
 }
 
-/// SIGWINCH → [`Frame::Resize`]. The initial size is sent before Attach.
+/// SIGWINCH → [`Frame::Resize`]. Re-send the mounted size after Attach so a
+/// layout completed between process spawn and this pump cannot be missed.
 #[cfg(unix)]
-async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
+async fn pump_resize(
+    outbound: Sender<QueuedFrame>,
+    session_id: SessionId,
+    view_id: Option<String>,
+    can_focus: Arc<AtomicBool>,
+) {
     let Some(signals) = tty::winch_signals() else {
         return;
     };
+    if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+        return;
+    }
     let mut signals = Unblock::new(signals);
     let mut buffer = [0u8; 64];
     loop {
@@ -816,14 +891,14 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        if !send_size(&outbound, &session_id).await {
+        if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
             break;
         }
     }
 }
 
 /// A changed console size → [`Frame::Resize`]. Windows has no SIGWINCH, so the
-/// size is polled instead; the initial size is sent before Attach.
+/// size is polled instead. Re-send the mounted size after Attach too.
 ///
 /// Only *changes* are sent. A `Resize` costs the daemon a `TIOCSWINSZ` and the
 /// session a SIGWINCH, so resending the same size five times a second would
@@ -833,8 +908,16 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
 /// same reason the pump is a task: dropping the task has to end the polling.
 /// (`smol::Timer` is disallowed workspace-wide, hence the blocking sleep.)
 #[cfg(windows)]
-async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
+async fn pump_resize(
+    outbound: Sender<QueuedFrame>,
+    session_id: SessionId,
+    view_id: Option<String>,
+    can_focus: Arc<AtomicBool>,
+) {
     let mut last = terminal_size();
+    if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+        return;
+    }
     loop {
         smol::unblock(|| std::thread::sleep(RESIZE_POLL)).await;
         let size = terminal_size();
@@ -842,7 +925,7 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
             continue;
         }
         last = size;
-        if !send_size(&outbound, &session_id).await {
+        if !send_size(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
             break;
         }
     }
@@ -850,15 +933,48 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
 
 /// Queue the terminal's current size. `false` means the queue is closed and the
 /// caller should stop.
-async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bool {
+async fn send_size(
+    outbound: &Sender<QueuedFrame>,
+    session_id: &SessionId,
+    view_id: Option<&str>,
+    can_focus: &AtomicBool,
+) -> bool {
     let Some((cols, rows)) = terminal_size() else {
         return true;
     };
+    if is_zed_bootstrap_size((cols, rows)) {
+        return true;
+    }
+    if !claim_focus(outbound, session_id, view_id, can_focus).await {
+        return false;
+    }
     outbound
         .send(QueuedFrame::Persistent(Frame::Resize {
             session_id: session_id.clone(),
             cols,
             rows,
+        }))
+        .await
+        .is_ok()
+}
+
+async fn claim_focus(
+    outbound: &Sender<QueuedFrame>,
+    session_id: &SessionId,
+    view_id: Option<&str>,
+    can_focus: &AtomicBool,
+) -> bool {
+    if !can_focus.load(Ordering::SeqCst) {
+        return true;
+    }
+    let Some(view_id) = view_id else {
+        return true;
+    };
+    outbound
+        .send(QueuedFrame::Persistent(Frame::FocusSession {
+            session_id: session_id.clone(),
+            view_id: view_id.to_owned(),
+            hover: false,
         }))
         .await
         .is_ok()
@@ -1248,6 +1364,41 @@ mod handshake_tests {
     use smol::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    #[test]
+    fn only_zeds_bootstrap_size_is_filtered() {
+        assert!(is_zed_bootstrap_size_for((100, 6), true));
+        assert!(!is_zed_bootstrap_size_for((100, 6), false));
+        assert!(!is_zed_bootstrap_size_for((100, 7), true));
+    }
+
+    #[test]
+    fn a_capable_view_claims_focus() {
+        smol::block_on(async {
+            let (outbound, queued) = smol::channel::bounded(1);
+            assert!(
+                claim_focus(
+                    &outbound,
+                    &SessionId::new("s-1"),
+                    Some("view-1"),
+                    &AtomicBool::new(true),
+                )
+                .await
+            );
+            match queued.recv().await.expect("the focus claim") {
+                QueuedFrame::Persistent(Frame::FocusSession {
+                    session_id,
+                    view_id,
+                    hover,
+                }) => {
+                    assert_eq!(session_id, SessionId::new("s-1"));
+                    assert_eq!(view_id, "view-1");
+                    assert!(!hover);
+                }
+                other => panic!("expected a focus claim, got {:?}", other.frame()),
+            }
+        });
+    }
 
     /// A daemon that reports `generation` and `instance_id`, then records every
     /// frame through the attach. A refused client returns an empty list.
