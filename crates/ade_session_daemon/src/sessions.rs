@@ -2349,7 +2349,7 @@ impl SessionTable {
     /// Same lock discipline as [`Self::resize`], and for the same reason: the
     /// decision is made under the table lock, the pty call is made after it.
     pub async fn focus(&self, id: &SessionId, view_id: &str, hover: bool) -> TableResult<()> {
-        let effective = {
+        let (effective, repaint) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2367,11 +2367,13 @@ impl SessionTable {
             }
             let already = session.focused_view.as_deref() == Some(view_id);
             session.focused_view = Some(view_id.to_owned());
-            let view_ask = session
+            let owner = session
                 .view_ids
                 .iter()
                 .find(|(_, id)| id == view_id)
-                .and_then(|(owner, _)| session.sizes.iter().find(|(who, _)| who == owner))
+                .map(|(owner, _)| *owner);
+            let view_ask = owner
+                .and_then(|owner| session.sizes.iter().find(|(who, _)| *who == owner))
                 .map(|(_, size)| *size);
             let effective = session.effective_size();
             // Repeated claims from the size owner stay quiet; anything that
@@ -2389,9 +2391,15 @@ impl SessionTable {
             if effective == (session.cols, session.rows) {
                 return Ok(());
             }
-            effective
+            (effective, owner.map(|owner| (session.hub.clone(), owner)))
         };
-        self.apply_size(id, effective.0, effective.1).await
+        self.apply_size(id, effective.0, effective.1).await?;
+        if let Some((hub, owner)) = repaint {
+            hub.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .repaint(id, owner);
+        }
+        Ok(())
     }
 
     /// Resize the screen, then the pty, and remember the new size.

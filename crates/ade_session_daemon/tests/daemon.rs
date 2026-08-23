@@ -3081,6 +3081,77 @@ fn a_focus_claim_resolved_by_attach_repaints_at_the_focused_ask() {
     });
 }
 
+/// A view that takes focus after both clients attached receives the corrected
+/// screen immediately, without waiting for another local resize.
+#[test]
+fn a_focus_change_repaints_the_new_owner() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut sibling = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut sibling, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut sibling,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+        sibling
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending the sibling size");
+        let _ = list(&mut sibling).await;
+
+        let mut viewer = client(server.socket_path()).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sending the viewer size");
+        viewer
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-tall".to_owned()),
+                request_id: Some(32),
+            })
+            .await
+            .expect("sending Attach");
+        match recv(&mut viewer, "Replay").await {
+            Frame::Replay { bytes, .. } => assert!(
+                !contains(&bytes, b"\x1b[12;1H"),
+                "the unfocused viewer starts at the sibling's size: {bytes:?}"
+            ),
+            other => panic!("expected Replay, got {other:?}"),
+        }
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-tall".to_owned(),
+                hover: false,
+            })
+            .await
+            .expect("sending FocusSession");
+        match recv(&mut viewer, "the focused repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                assert!(contains(&bytes, b"\x1b[12;1H"), "{bytes:?}");
+            }
+            other => panic!("expected focused repaint, got {other:?}"),
+        }
+    });
+}
+
 /// A full-screen app is replayed as the alternate screen, and leaving it puts
 /// the primary screen back.
 ///
