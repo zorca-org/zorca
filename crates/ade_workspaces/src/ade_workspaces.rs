@@ -25,7 +25,8 @@ mod workspace_sidebar;
 mod workspace_view;
 
 pub use attach::{
-    can_reset_workspace_sessions, kill_and_recreate_workspace_sessions, open_workspace_session,
+    can_reset_workspace_sessions, kill_and_recreate_workspace_sessions, kill_workspace_sessions,
+    open_workspace_session,
 };
 pub use connect::{destination_for, open_connection_workspace};
 pub use create_workspace_modal::{OnWorkspaceCreated, open_create_workspace_modal};
@@ -71,6 +72,7 @@ pub fn init(cx: &mut App) {
     // and the first one registered is the one that answers. See [`layout::init`].
     layout::init(cx);
     workspace_sidebar::init(cx);
+    workspace_view::init(cx);
     AdeWorkspaceStore::global(cx);
     cx.on_app_quit(|cx| {
         if let Some(service) = cx.try_global::<GlobalLifecycleService>() {
@@ -239,9 +241,16 @@ impl Column for WorkspaceStatus {
 pub struct AdeWorkspace {
     pub id: WorkspaceId,
     pub name: String,
-    /// Grouping key for the sidebar; workspaces of one project share it.
+    /// Human-readable project group label.
     pub project_id: String,
+    /// Canonical main-worktree paths identifying the project group.
+    ///
+    /// `None` is a row created before project identity was persisted. Those
+    /// rows use their repository path until a live project backfills them.
+    pub project_identity: Option<String>,
     pub repository_path: PathBuf,
+    /// Monotonic revision of the project identity, label, and root.
+    pub project_scope_rev: u64,
     /// `None` for a workspace not tied to a branch yet.
     pub branch: Option<String>,
     /// `None` means the workspace is local.
@@ -271,7 +280,9 @@ impl AdeWorkspace {
             id: WorkspaceId::new(),
             name: name.into(),
             project_id: project_id.into(),
+            project_identity: None,
             repository_path: repository_path.into(),
+            project_scope_rev: 0,
             branch: None,
             remote_host: None,
             remote_workspace_path: None,
@@ -285,6 +296,12 @@ impl AdeWorkspace {
 
     pub fn is_remote(&self) -> bool {
         self.remote_host.is_some()
+    }
+
+    pub fn project_identity(&self) -> String {
+        self.project_identity
+            .clone()
+            .unwrap_or_else(|| self.repository_path.to_string_lossy().into_owned())
     }
 
     /// The tmux session name this workspace's terminal should use.
@@ -355,6 +372,20 @@ pub fn project_id_from_path(repository_path: &std::path::Path) -> String {
         .unwrap_or_else(|| repository_path.to_string_lossy().into_owned())
 }
 
+pub fn project_id_from_identity(project_identity: &str) -> String {
+    let paths = project_identity
+        .split('\n')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return project_identity.to_owned();
+    }
+    project::ProjectGroupKey::new(None, util::path_list::PathList::new(&paths))
+        .display_name(&Default::default())
+        .to_string()
+}
+
 /// Timestamps are persisted as whole unix seconds, so truncate on the way in;
 /// otherwise a workspace would not compare equal to its own round-trip.
 pub(crate) fn now_whole_seconds() -> OffsetDateTime {
@@ -364,7 +395,7 @@ pub(crate) fn now_whole_seconds() -> OffsetDateTime {
 
 /// Column order shared by the registry's `SELECT`/`INSERT` statements and by
 /// the [`Bind`]/[`Column`] impls below.
-const COLUMN_COUNT: usize = 12;
+const COLUMN_COUNT: usize = 14;
 
 impl StaticColumnCount for AdeWorkspace {
     fn column_count() -> usize {
@@ -377,7 +408,9 @@ impl Bind for AdeWorkspace {
         let next_index = statement.bind(&self.id, start_index)?;
         let next_index = statement.bind(&self.name, next_index)?;
         let next_index = statement.bind(&self.project_id, next_index)?;
+        let next_index = statement.bind(&self.project_identity, next_index)?;
         let next_index = statement.bind(&self.repository_path, next_index)?;
+        let next_index = statement.bind(&self.project_scope_rev, next_index)?;
         let next_index = statement.bind(&self.branch, next_index)?;
         let next_index = statement.bind(&self.remote_host, next_index)?;
         let next_index = statement.bind(&self.remote_workspace_path, next_index)?;
@@ -394,7 +427,9 @@ impl Column for AdeWorkspace {
         let (id, next_index) = WorkspaceId::column(statement, start_index)?;
         let (name, next_index) = String::column(statement, next_index)?;
         let (project_id, next_index) = String::column(statement, next_index)?;
+        let (project_identity, next_index) = Option::<String>::column(statement, next_index)?;
         let (repository_path, next_index) = PathBuf::column(statement, next_index)?;
+        let (project_scope_rev, next_index) = u64::column(statement, next_index)?;
         let (branch, next_index) = Option::<String>::column(statement, next_index)?;
         let (remote_host, next_index) = Option::<String>::column(statement, next_index)?;
         let (remote_workspace_path, next_index) = Option::<PathBuf>::column(statement, next_index)?;
@@ -408,7 +443,9 @@ impl Column for AdeWorkspace {
             id,
             name,
             project_id,
+            project_identity,
             repository_path,
+            project_scope_rev,
             branch,
             remote_host,
             remote_workspace_path,
@@ -483,6 +520,18 @@ mod tests {
         assert_eq!(project_id_from_path(Path::new("/")), "/");
         assert_eq!(project_id_from_path(Path::new("")), "");
         assert_eq!(project_id_from_path(Path::new("..")), "..");
+    }
+
+    #[test]
+    fn test_project_id_from_canonical_identity() {
+        assert_eq!(
+            project_id_from_identity("/home/user/Code/viral-studio"),
+            "viral-studio"
+        );
+        assert_eq!(
+            project_id_from_identity("/repos/alpha\n/repos/beta"),
+            "alpha, beta"
+        );
     }
 
     #[test]

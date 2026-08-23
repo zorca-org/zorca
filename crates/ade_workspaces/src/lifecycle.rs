@@ -49,7 +49,7 @@ use crate::{
     AdeWorkspace, AdeWorkspaceRegistry, Attached, BackendWorkspace, DaemonBackend, DaemonEvent,
     DaemonUpgradeOutcome, IdentifiedDaemonEvent, SESSION_PREFIX, SessionBackend, SessionId,
     SessionSpec, StatusDelivery, StatusEvent, WorkspaceEvent, WorkspaceId, WorkspaceLayout,
-    WorkspaceStatus, now_whole_seconds, project_id_from_path,
+    WorkspaceStatus, now_whole_seconds, project_id_from_identity, project_id_from_path,
 };
 use ade_session::LayoutDoc;
 use anyhow::{Context as _, Result, bail};
@@ -119,13 +119,25 @@ impl WorkspaceEntry {
     }
 
     /// The sidebar's grouping key. A discovery has no stored one, so it is
-    /// derived from the root exactly as a row's was when it was written.
+    /// derived from the root only for legacy daemon records.
     pub fn project_id(&self) -> String {
         match self {
             Self::Persisted(workspace, _) => workspace.project_id.clone(),
-            Self::Discovered { workspace, .. } => {
-                project_id_from_path(Path::new(&workspace.project_root))
-            }
+            Self::Discovered { workspace, .. } => workspace
+                .project_id
+                .clone()
+                .unwrap_or_else(|| project_id_from_path(Path::new(&workspace.project_root))),
+        }
+    }
+
+    /// Stable project-group identity, separate from the human label.
+    pub fn project_identity(&self) -> String {
+        match self {
+            Self::Persisted(workspace, _) => workspace.project_identity(),
+            Self::Discovered { workspace, .. } => workspace
+                .project_identity
+                .clone()
+                .unwrap_or_else(|| workspace.project_root.clone()),
         }
     }
 
@@ -203,6 +215,12 @@ fn host_label(host: Option<&str>) -> String {
     host.unwrap_or("local").to_owned()
 }
 
+fn next_project_scope_rev(revision: u64) -> Result<u64> {
+    revision
+        .checked_add(1)
+        .context("project scope revision overflowed")
+}
+
 /// The registry row for a daemon record this client has just opened. Written
 /// only by [`WorkspaceLifecycleService::confirm_discovered`]; a listing on its
 /// own never reaches here.
@@ -226,7 +244,10 @@ fn row_for_record(
     opened_at: OffsetDateTime,
 ) -> AdeWorkspace {
     let repository_path = PathBuf::from(&workspace.project_root);
-    let project_id = project_id_from_path(&repository_path);
+    let project_id = workspace
+        .project_id
+        .clone()
+        .unwrap_or_else(|| project_id_from_path(&repository_path));
     // Whole seconds, like everything else the registry stores; a backend that
     // reports a time no calendar has is given this client's clock rather than
     // failing the record over a timestamp.
@@ -238,7 +259,9 @@ fn row_for_record(
         id: WorkspaceId::new(),
         name: display_name_for(&workspace.name, &project_id),
         project_id,
+        project_identity: workspace.project_identity.clone(),
         repository_path,
+        project_scope_rev: workspace.project_scope_rev,
         branch: None,
         remote_host: host.map(str::to_owned),
         remote_workspace_path: None,
@@ -390,6 +413,10 @@ pub struct WorkspaceLifecycleService {
     /// clears it, because that is the one event that means the connections it
     /// was read over are gone.
     discoveries: Mutex<HashMap<DaemonKey, Vec<BackendWorkspace>>>,
+    /// Canonical overlays whose daemon write failed transiently. The overlay
+    /// stays useful locally, but the write is retried on the next listing.
+    scope_update_retries: Mutex<HashSet<(DaemonKey, String, String)>>,
+    history_backfilled: AsyncMutex<bool>,
 }
 
 impl WorkspaceLifecycleService {
@@ -416,6 +443,8 @@ impl WorkspaceLifecycleService {
                 status_errors: Mutex::new(HashMap::new()),
                 daemon_decision_locks: Mutex::new(HashMap::new()),
                 discoveries: Mutex::new(HashMap::new()),
+                scope_update_retries: Mutex::new(HashSet::new()),
+                history_backfilled: AsyncMutex::new(false),
             }
         }
     }
@@ -433,6 +462,8 @@ impl WorkspaceLifecycleService {
             status_errors: Mutex::new(HashMap::new()),
             daemon_decision_locks: Mutex::new(HashMap::new()),
             discoveries: Mutex::new(HashMap::new()),
+            scope_update_retries: Mutex::new(HashSet::new()),
+            history_backfilled: AsyncMutex::new(false),
         }
     }
 
@@ -473,6 +504,10 @@ impl WorkspaceLifecycleService {
         // A snapshot outlives a failed listing, but not the connection it was
         // read over: nothing is claimed about a host whose backend is gone.
         self.discoveries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        self.scope_update_retries
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
@@ -536,8 +571,8 @@ impl WorkspaceLifecycleService {
         Ok(receiver)
     }
 
-    /// Workspace removals that can change the transient discovery list even
-    /// when the removed workspace had no live session to emit a status event.
+    /// Workspace inventory or metadata changes that may not have a live
+    /// session to emit a status event.
     pub(crate) fn subscribe_workspace_changes(&self) -> Result<Receiver<()>> {
         let (sender, receiver) = smol::channel::unbounded();
         self.events
@@ -614,6 +649,41 @@ impl WorkspaceLifecycleService {
     /// `remote_host` is `None` for this machine; otherwise `repository_path` is
     /// read as a path **on that host**, which is why nothing here touches the
     /// local filesystem to check it.
+    pub async fn create_workspace_from_repository(
+        &self,
+        name: impl Into<String>,
+        repository_path: impl Into<PathBuf>,
+        branch: Option<String>,
+        remote_host: Option<String>,
+    ) -> Result<AdeWorkspace> {
+        let requested_path = repository_path.into();
+        let (repository_path, project_identity_path) = self
+            .backend_for_host(remote_host.as_deref())?
+            .resolve_repository(&requested_path)
+            .with_context(|| {
+                format!(
+                    "resolving project directory {} on {}",
+                    requested_path.display(),
+                    host_label(remote_host.as_deref())
+                )
+            })?;
+        let project_identity = util::path_list::PathList::new(&[project_identity_path])
+            .serialize()
+            .paths;
+        let project_id = project_id_from_identity(&project_identity);
+        self.create_workspace_scoped(
+            name,
+            project_id,
+            Some(project_identity),
+            repository_path,
+            branch,
+            remote_host,
+        )
+        .await
+    }
+
+    /// Test helper for synthetic repository paths that do not exist on a host.
+    #[cfg(test)]
     pub async fn create_workspace(
         &self,
         name: impl Into<String>,
@@ -622,7 +692,30 @@ impl WorkspaceLifecycleService {
         branch: Option<String>,
         remote_host: Option<String>,
     ) -> Result<AdeWorkspace> {
+        let repository_path = repository_path.into();
+        let project_identity = repository_path.to_string_lossy().into_owned();
+        self.create_workspace_scoped(
+            name,
+            project_id,
+            Some(project_identity),
+            repository_path,
+            branch,
+            remote_host,
+        )
+        .await
+    }
+
+    pub async fn create_workspace_scoped(
+        &self,
+        name: impl Into<String>,
+        project_id: impl Into<String>,
+        project_identity: Option<String>,
+        repository_path: impl Into<PathBuf>,
+        branch: Option<String>,
+        remote_host: Option<String>,
+    ) -> Result<AdeWorkspace> {
         let mut workspace = AdeWorkspace::new(name, project_id, repository_path);
+        workspace.project_identity = project_identity;
         workspace.branch = branch;
         workspace.remote_host = remote_host;
 
@@ -633,6 +726,237 @@ impl WorkspaceLifecycleService {
 
         self.start_session(&mut workspace).await?;
         Ok(workspace)
+    }
+
+    pub async fn update_workspace_project_scope(
+        &self,
+        id: &WorkspaceId,
+        project_id: &str,
+        project_identity: &str,
+    ) -> Result<AdeWorkspace> {
+        let workspace = self.get(id)?;
+        if workspace.project_id == project_id
+            && workspace.project_identity.as_deref() == Some(project_identity)
+        {
+            return Ok(workspace);
+        }
+
+        let project_scope_rev = next_project_scope_rev(workspace.project_scope_rev)?;
+        let backend = match self.backend_for(&workspace) {
+            Ok(backend) => Some(backend),
+            Err(error) => {
+                log::warn!(
+                    "could not prepare the backend before updating project scope for {id}; keeping the authoritative local scope: {error:#}"
+                );
+                None
+            }
+        };
+        let daemon_workspace_id = workspace.daemon_workspace_id();
+        let daemon_holds_workspace = backend.as_ref().is_some_and(|backend| {
+            match backend.list_workspaces_identified() {
+                Ok(listing) => listing
+                    .items
+                    .iter()
+                    .any(|record| record.id == daemon_workspace_id),
+                Err(error) => {
+                    log::warn!(
+                        "could not list daemon workspaces before updating project scope for {id}; keeping the authoritative local scope: {error:#}"
+                    );
+                    false
+                }
+            }
+        });
+        let mut project_scope_rev = project_scope_rev;
+        if daemon_holds_workspace && let Some(backend) = backend.as_ref() {
+            let updated = backend.update_workspace_project_scope(
+                &daemon_workspace_id,
+                project_id,
+                project_identity,
+                None,
+                Some(project_scope_rev),
+                workspace.daemon_id.as_deref(),
+            );
+            match updated {
+                Ok(Some(daemon_revision)) => project_scope_rev = daemon_revision,
+                Ok(None) => log::debug!(
+                    "daemon does not persist project identity yet; keeping it in the local registry"
+                ),
+                Err(error) => log::warn!(
+                    "could not persist project identity for workspace {id}; keeping the authoritative local scope: {error:#}"
+                ),
+            }
+        }
+
+        loop {
+            let (applied, stored) = self
+                .registry
+                .update_project_scope(
+                    id.clone(),
+                    project_scope_rev,
+                    project_id.to_owned(),
+                    project_identity.to_owned(),
+                )
+                .await
+                .context("recording the workspace project identity")?;
+            if applied
+                || (stored.project_id == project_id
+                    && stored.project_identity.as_deref() == Some(project_identity))
+            {
+                return Ok(stored);
+            }
+            project_scope_rev = next_project_scope_rev(stored.project_scope_rev)?;
+        }
+    }
+
+    pub async fn update_workspace_repository_scope(
+        &self,
+        id: &WorkspaceId,
+        repository_path: PathBuf,
+        project_id: &str,
+        project_identity: &str,
+    ) -> Result<AdeWorkspace> {
+        let selected = self.get(id)?;
+        let old_repository_path = selected.repository_path.clone();
+        let remote_host = selected.remote_host.clone();
+        let mut matching = self
+            .registry
+            .list_workspaces()?
+            .into_iter()
+            .filter(|workspace| {
+                workspace.remote_host == remote_host
+                    && workspace.repository_path == old_repository_path
+            })
+            .collect::<Vec<_>>();
+        let backend = match self.backend_for(&selected) {
+            Ok(backend) => Some(backend),
+            Err(error) => {
+                log::warn!(
+                    "could not prepare the backend before moving repository scope for {id}; updating the authoritative local rows: {error:#}"
+                );
+                None
+            }
+        };
+        let held = match backend
+            .as_ref()
+            .map(|backend| backend.list_workspaces_identified())
+        {
+            Some(Ok(listing)) => listing
+                .items
+                .into_iter()
+                .map(|workspace| workspace.id)
+                .collect::<HashSet<_>>(),
+            Some(Err(error)) => {
+                log::warn!(
+                    "could not list daemon workspaces before moving repository scope for {id}; updating the authoritative local rows: {error:#}"
+                );
+                HashSet::new()
+            }
+            None => HashSet::new(),
+        };
+        let project_root = repository_path.to_string_lossy().into_owned();
+        for workspace in &mut matching {
+            if workspace.repository_path == repository_path
+                && workspace.project_id == project_id
+                && workspace.project_identity.as_deref() == Some(project_identity)
+            {
+                continue;
+            }
+            let mut project_scope_rev = next_project_scope_rev(workspace.project_scope_rev)?;
+            let daemon_workspace_id = workspace.daemon_workspace_id();
+            if held.contains(&daemon_workspace_id)
+                && let Some(backend) = backend.as_ref()
+            {
+                match backend.update_workspace_project_scope(
+                    &daemon_workspace_id,
+                    project_id,
+                    project_identity,
+                    Some(&project_root),
+                    Some(project_scope_rev),
+                    workspace.daemon_id.as_deref(),
+                ) {
+                    Ok(Some(daemon_rev)) => project_scope_rev = daemon_rev,
+                    Ok(None) => log::debug!(
+                        "daemon does not persist repository identity yet; keeping it in the local registry"
+                    ),
+                    Err(error) => log::warn!(
+                        "could not persist repository identity for workspace {}; keeping the authoritative local scope: {error:#}",
+                        workspace.id
+                    ),
+                }
+            }
+            loop {
+                let (applied, stored) = self
+                    .registry
+                    .update_repository_scope(
+                        workspace.id.clone(),
+                        repository_path.clone(),
+                        project_scope_rev,
+                        project_id.to_owned(),
+                        project_identity.to_owned(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "recording repository identity for workspace {}",
+                            workspace.id
+                        )
+                    })?;
+                if applied
+                    || (stored.repository_path == repository_path
+                        && stored.project_id == project_id
+                        && stored.project_identity.as_deref() == Some(project_identity))
+                {
+                    *workspace = stored;
+                    break;
+                }
+                project_scope_rev = next_project_scope_rev(stored.project_scope_rev)?;
+            }
+        }
+        matching
+            .into_iter()
+            .find(|workspace| &workspace.id == id)
+            .context("the selected workspace disappeared while moving its repository scope")
+    }
+
+    pub async fn update_discovered_workspace_project_scope(
+        &self,
+        remote_host: Option<&str>,
+        workspace_id: &str,
+        project_id: &str,
+        project_identity: &str,
+    ) -> Result<Option<bool>> {
+        let backend = self.backend_for_host(remote_host)?;
+        let listing = backend.list_workspaces_identified()?;
+        let Some(workspace) = listing
+            .items
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            return Ok(None);
+        };
+        if workspace.project_id.as_deref() == Some(project_id)
+            && workspace.project_identity.as_deref() == Some(project_identity)
+        {
+            return Ok(Some(true));
+        }
+        let local_scope_rev = next_project_scope_rev(workspace.project_scope_rev)?;
+        let updated = backend
+            .update_workspace_project_scope(
+                workspace_id,
+                project_id,
+                project_identity,
+                Some(&workspace.project_root),
+                Some(local_scope_rev),
+                listing.daemon_id.as_deref(),
+            )
+            .context("updating a discovered workspace's project identity")?;
+        if updated.is_none() {
+            let confirmed = self.confirm_discovered(remote_host, workspace_id).await?;
+            self.update_workspace_project_scope(&confirmed.id, project_id, project_identity)
+                .await
+                .context("recording a discovered workspace's project identity locally")?;
+        }
+        Ok(Some(updated.is_some()))
     }
 
     /// Marks the workspace as opened now and reports the state of its session.
@@ -977,7 +1301,7 @@ impl WorkspaceLifecycleService {
         backend
             .kill_workspace(&workspace.daemon_workspace_id(), daemon_id.as_deref())
             .with_context(|| format!("killing daemon workspace {}", workspace.id))?;
-        self.record_killed(&mut workspace).await?;
+        self.record_workspace_killed(&mut workspace).await?;
         Ok(workspace)
     }
 
@@ -1019,17 +1343,14 @@ impl WorkspaceLifecycleService {
             .with_context(|| format!("deleting workspace {} from the registry", workspace.id))
     }
 
-    /// Kills the workspace's session and everything running in it, then
-    /// forgets the session name and records the workspace as `stopped`.
+    /// Kills the workspace's sessions and everything running in them, while
+    /// keeping the daemon workspace identity and recording it as `stopped`.
     ///
     /// **Destructive and irreversible.** Running agents die with the session
     /// and their scrollback goes with them. The workspace-record kill is
-    /// [`Self::kill_workspace`]; every UI path that reaches either must say so
-    /// in its own label ("Kill workspace", not "Close"): closing, switching
-    /// away, and removing all detach instead. The
-    /// session name is cleared because it no longer names anything — a killed
-    /// workspace reads as never-created, not as disconnected, since there is
-    /// nothing left to reconnect to.
+    /// [`Self::kill_workspace`]. `terminal_session_id` is also the stable daemon
+    /// workspace id, so it stays recorded even while no session is alive; that
+    /// lets a later recreate target the same retained record and layout.
     pub async fn kill_workspace_session(&self, id: &WorkspaceId) -> Result<AdeWorkspace> {
         let mut workspace = self.get(id)?;
 
@@ -1037,8 +1358,8 @@ impl WorkspaceLifecycleService {
             let backend = self.backend_for(&workspace)?;
             // A session that is already gone needs no killing: the outcome the
             // caller asked for is the state the world is in, and the rest of
-            // the method — forgetting the name, recording `stopped` — is still
-            // owed. Same probe-first shape as `stop_workspace`.
+            // the method — recording `stopped` — is still owed. Same
+            // probe-first shape as `stop_workspace`.
             //
             // `SessionBackend::kill` tolerates a missing session too, which
             // covers the gap between this check and the kill.
@@ -1051,16 +1372,14 @@ impl WorkspaceLifecycleService {
                     .with_context(|| format!("killing session {session}"))?;
             }
         }
-        self.record_killed(&mut workspace).await?;
+        self.set_status(&mut workspace, WorkspaceStatus::Stopped)
+            .await?;
         Ok(workspace)
     }
 
-    /// Writes down what a kill left behind: no session owner, and `stopped`.
-    ///
-    /// Shared by both kills so they cannot drift — the name is cleared because
-    /// it names nothing now, and the status is the one a workspace nobody is
-    /// attached to has.
-    async fn record_killed(&self, workspace: &mut AdeWorkspace) -> Result<()> {
+    /// Writes down what deleting a daemon workspace left behind: no daemon
+    /// identity or session owner, and `stopped`.
+    async fn record_workspace_killed(&self, workspace: &mut AdeWorkspace) -> Result<()> {
         if workspace.terminal_session_id.is_some() || workspace.daemon_id.is_some() {
             self.registry
                 .update_terminal_session_and_daemon_id(workspace.id.clone(), None, None)
@@ -1076,6 +1395,7 @@ impl WorkspaceLifecycleService {
     /// opens showing what is actually running rather than what was running when
     /// the app last closed.
     pub async fn reconcile_all(&self) -> Result<Reconciled> {
+        self.ensure_history_backfill().await?;
         let workspaces = self.registry.list_workspaces()?;
         self.reconcile(workspaces, true).await
     }
@@ -1086,6 +1406,7 @@ impl WorkspaceLifecycleService {
     /// one from its root, so a narrowed pass that reported them would be
     /// putting other projects' workspaces on screen.
     pub async fn reconcile_project(&self, project_id: impl Into<String>) -> Result<Reconciled> {
+        self.ensure_history_backfill().await?;
         let workspaces = self
             .registry
             .list_workspaces_for_project(project_id.into())?;
@@ -1104,9 +1425,10 @@ impl WorkspaceLifecycleService {
     /// one. The registry is a cache; asking it what a host has is asking the
     /// wrong party.
     ///
-    /// **Nothing here is persisted.** A record this client has never opened
-    /// comes back as [`WorkspaceEntry::Discovered`] and stays that way until
-    /// [`Self::confirm_discovered`]; a listing is not usage.
+    /// **No registry row is created here.** A record this client has never
+    /// opened comes back as [`WorkspaceEntry::Discovered`] and stays that way
+    /// until [`Self::confirm_discovered`]; a listing is not usage. Canonical
+    /// Git scope may be copied onto the daemon record when supported.
     ///
     /// Ensuring is the side effect of the listing rather than a step of its
     /// own: the first request over a host's backend deploys and starts the
@@ -1161,6 +1483,7 @@ impl WorkspaceLifecycleService {
         host: Option<&str>,
         wire_id: &str,
     ) -> Result<AdeWorkspace> {
+        self.ensure_history_backfill().await?;
         let backend = self.backend_for_host(host)?;
         for _ in 0..3 {
             let route_lock = self.daemon_decision_lock(DaemonKey::Host(host.map(str::to_owned)));
@@ -1188,9 +1511,20 @@ impl WorkspaceLifecycleService {
                 continue;
             }
 
-            let daemon = daemon_key(listing.daemon_id.as_deref(), host);
-            self.remember_discoveries(&daemon, &listing.items);
-            let Some(record) = listing.items.iter().find(|record| record.id == wire_id) else {
+            let daemon_id = listing.daemon_id;
+            let daemon = daemon_key(daemon_id.as_deref(), host);
+            let mut held = listing.items;
+            let known = self.registry.list_workspaces()?;
+            self.enrich_workspace_project_scopes(
+                &backend,
+                &daemon,
+                daemon_id.as_deref(),
+                host,
+                &known,
+                &mut held,
+            )?;
+            self.remember_discoveries(&daemon, &held);
+            let Some(record) = held.iter().find(|record| record.id == wire_id) else {
                 self.forget_discovery(&daemon, wire_id);
                 return Err(WorkspaceGone {
                     remote_host: host.map(str::to_owned),
@@ -1273,6 +1607,237 @@ impl WorkspaceLifecycleService {
             .unwrap_or_default()
     }
 
+    fn scope_update_key(
+        daemon: &DaemonKey,
+        workspace: &BackendWorkspace,
+    ) -> (DaemonKey, String, String) {
+        (
+            daemon.clone(),
+            workspace.id.clone(),
+            workspace.project_root.clone(),
+        )
+    }
+
+    fn scope_update_needs_retry(&self, daemon: &DaemonKey, workspace: &BackendWorkspace) -> bool {
+        self.scope_update_retries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&Self::scope_update_key(daemon, workspace))
+    }
+
+    fn persist_discovery_scope(
+        &self,
+        backend: &Arc<dyn SessionBackend>,
+        daemon: &DaemonKey,
+        daemon_id: Option<&str>,
+        workspace: &BackendWorkspace,
+        project_id: &str,
+        project_identity: &str,
+        project_root: &str,
+        minimum_scope_rev: u64,
+    ) -> Option<u64> {
+        let retry_key = Self::scope_update_key(daemon, workspace);
+        match backend.update_workspace_project_scope(
+            &workspace.id,
+            project_id,
+            project_identity,
+            Some(project_root),
+            Some(minimum_scope_rev),
+            daemon_id,
+        ) {
+            Ok(updated) => {
+                self.scope_update_retries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&retry_key);
+                if updated.is_none() {
+                    log::debug!(
+                        "daemon does not persist project identity yet; keeping the discovery scope"
+                    );
+                }
+                updated
+            }
+            Err(error) => {
+                self.scope_update_retries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(retry_key);
+                log::warn!(
+                    "could not persist the project identity of daemon workspace {}: {error:#}",
+                    workspace.id
+                );
+                None
+            }
+        }
+    }
+
+    fn enrich_workspace_project_scopes(
+        &self,
+        backend: &Arc<dyn SessionBackend>,
+        daemon: &DaemonKey,
+        daemon_id: Option<&str>,
+        host: Option<&str>,
+        known: &[AdeWorkspace],
+        workspaces: &mut [BackendWorkspace],
+    ) -> Result<()> {
+        let cached = self.remembered_discoveries(daemon);
+        for workspace in workspaces {
+            if let Some(existing) = known
+                .iter()
+                .filter(|known| is_the_same_daemons_row(known, daemon_id, host, workspace))
+                .filter(|known| known.project_identity.is_some())
+                .max_by_key(|known| known.daemon_id.is_some())
+            {
+                let Some(project_identity) = existing.project_identity.clone() else {
+                    continue;
+                };
+                let scope_matches = workspace.project_id.as_deref()
+                    == Some(existing.project_id.as_str())
+                    && workspace.project_identity.as_deref() == Some(project_identity.as_str())
+                    && Path::new(&workspace.project_root) == existing.repository_path;
+                let local_scope_wins = workspace.project_identity.is_none()
+                    || workspace.project_scope_rev < existing.project_scope_rev
+                    || (workspace.project_scope_rev == existing.project_scope_rev
+                        && !scope_matches);
+                if local_scope_wins {
+                    let project_root = existing.repository_path.to_string_lossy().into_owned();
+                    let cached_revision = cached.iter().find(|cached| {
+                        cached.id == workspace.id
+                            && cached.project_root == project_root
+                            && cached.project_id.as_deref() == Some(existing.project_id.as_str())
+                            && cached.project_identity.as_deref() == Some(project_identity.as_str())
+                            && cached.project_scope_rev >= existing.project_scope_rev
+                    });
+                    let project_scope_rev = if cached_revision.is_some()
+                        && !self.scope_update_needs_retry(daemon, workspace)
+                    {
+                        cached_revision.map(|cached| cached.project_scope_rev)
+                    } else {
+                        self.persist_discovery_scope(
+                            backend,
+                            daemon,
+                            daemon_id,
+                            workspace,
+                            &existing.project_id,
+                            &project_identity,
+                            &project_root,
+                            existing.project_scope_rev,
+                        )
+                    }
+                    .unwrap_or(existing.project_scope_rev);
+                    workspace.project_id = Some(existing.project_id.clone());
+                    workspace.project_identity = Some(project_identity);
+                    workspace.project_root = project_root;
+                    workspace.project_scope_rev = project_scope_rev;
+                    continue;
+                }
+            }
+
+            if let Some(project_identity) = workspace.project_identity.clone() {
+                if workspace.project_id.is_none() {
+                    let project_id = project_id_from_identity(&project_identity);
+                    let fallback_revision = next_project_scope_rev(workspace.project_scope_rev)?;
+                    let project_root = workspace.project_root.clone();
+                    let minimum_scope_rev = fallback_revision;
+                    workspace.project_id = Some(project_id.clone());
+                    workspace.project_scope_rev = self
+                        .persist_discovery_scope(
+                            backend,
+                            daemon,
+                            daemon_id,
+                            workspace,
+                            &project_id,
+                            &project_identity,
+                            &project_root,
+                            minimum_scope_rev,
+                        )
+                        .unwrap_or(fallback_revision);
+                    continue;
+                }
+                self.scope_update_retries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(&Self::scope_update_key(daemon, workspace));
+                continue;
+            }
+
+            if let Some(cached) = cached.iter().find(|cached| {
+                cached.id == workspace.id && cached.project_root == workspace.project_root
+            }) && cached.project_identity.is_some()
+            {
+                let project_identity = cached.project_identity.clone().unwrap_or_default();
+                let project_id = cached
+                    .project_id
+                    .clone()
+                    .unwrap_or_else(|| project_id_from_identity(&project_identity));
+                workspace.project_id = Some(project_id.clone());
+                workspace.project_identity = Some(project_identity.clone());
+                workspace.project_scope_rev = cached.project_scope_rev;
+                if self.scope_update_needs_retry(daemon, workspace) {
+                    let project_root = workspace.project_root.clone();
+                    let minimum_scope_rev = workspace.project_scope_rev;
+                    if let Some(project_scope_rev) = self.persist_discovery_scope(
+                        backend,
+                        daemon,
+                        daemon_id,
+                        workspace,
+                        &project_id,
+                        &project_identity,
+                        &project_root,
+                        minimum_scope_rev,
+                    ) {
+                        workspace.project_scope_rev = project_scope_rev;
+                    }
+                }
+                continue;
+            }
+
+            let project_identity_path = match backend
+                .resolve_repository(Path::new(&workspace.project_root))
+            {
+                Ok((_, project_identity_path)) => project_identity_path,
+                Err(error) => {
+                    log::debug!(
+                        "could not resolve the Git project for daemon workspace {} at {}: {error:#}",
+                        workspace.id,
+                        workspace.project_root
+                    );
+                    continue;
+                }
+            };
+            let project_identity = util::path_list::PathList::new(&[project_identity_path])
+                .serialize()
+                .paths;
+            if project_identity.is_empty() {
+                log::debug!(
+                    "Git returned an empty project identity for daemon workspace {} at {}",
+                    workspace.id,
+                    workspace.project_root
+                );
+                continue;
+            }
+            let project_id = project_id_from_identity(&project_identity);
+            let fallback_revision = next_project_scope_rev(workspace.project_scope_rev)?;
+            let project_root = workspace.project_root.clone();
+            let minimum_scope_rev = fallback_revision;
+            workspace.project_id = Some(project_id.clone());
+            workspace.project_identity = Some(project_identity.clone());
+            workspace.project_scope_rev = self
+                .persist_discovery_scope(
+                    backend,
+                    daemon,
+                    daemon_id,
+                    workspace,
+                    &project_id,
+                    &project_identity,
+                    &project_root,
+                    minimum_scope_rev,
+                )
+                .unwrap_or(fallback_revision);
+        }
+        Ok(())
+    }
+
     fn forget_discovery(&self, daemon: &DaemonKey, wire_id: &str) {
         if let Some(held) = self
             .discoveries
@@ -1297,10 +1862,9 @@ impl WorkspaceLifecycleService {
     /// daemon's identity on the rows that already mirror its records. Answers
     /// with the listing and the registry as it then stands.
     ///
-    /// **Nothing daemon-only is written.** The only writes here rebind a row
-    /// this client already has to the spelling and identity it was just reached
-    /// by, which is what keeps two aliases of one daemon from reading as two
-    /// hosts. A record no row points at stays a discovery.
+    /// Canonical Git scope is copied onto daemon records when supported. The
+    /// other writes only rebind or hydrate a row this client already has. A
+    /// record no row points at stays a discovery.
     ///
     /// **Matched by `terminal_session_id`, which is the identity.**
     /// [`AdeWorkspace::daemon_workspace_id`] returns that column when it is
@@ -1314,6 +1878,7 @@ impl WorkspaceLifecycleService {
         backend: &Arc<dyn SessionBackend>,
         host: Option<&str>,
     ) -> Result<(DaemonKey, Vec<BackendWorkspace>, Vec<AdeWorkspace>)> {
+        self.ensure_history_backfill().await?;
         for _ in 0..3 {
             let route_lock = self.daemon_decision_lock(DaemonKey::Host(host.map(str::to_owned)));
             let _route_decision = route_lock.lock().await;
@@ -1337,9 +1902,69 @@ impl WorkspaceLifecycleService {
 
             let instance_id = listing.daemon_id;
             let key = daemon_key(instance_id.as_deref(), host);
-            let known = self.registry.list_workspaces()?;
-            let mut rebound = false;
-            for workspace in &listing.items {
+            let mut held = listing.items;
+            let mut known = self.registry.list_workspaces()?;
+            self.enrich_workspace_project_scopes(
+                backend,
+                &key,
+                instance_id.as_deref(),
+                host,
+                &known,
+                &mut held,
+            )?;
+            let mut changed = false;
+            for existing in known.iter_mut().filter(|known| {
+                known.project_identity.is_none()
+                    && known.remote_host.as_deref() == host
+                    && !held.iter().any(|workspace| {
+                        is_the_same_daemons_row(known, instance_id.as_deref(), host, workspace)
+                    })
+            }) {
+                let project_identity_path = match backend
+                    .resolve_repository(&existing.repository_path)
+                {
+                    Ok((_, project_identity_path)) => project_identity_path,
+                    Err(error) => {
+                        log::debug!(
+                            "could not resolve the Git project for registry workspace {} at {}: {error:#}",
+                            existing.id,
+                            existing.repository_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let project_identity = util::path_list::PathList::new(&[project_identity_path])
+                    .serialize()
+                    .paths;
+                if project_identity.is_empty() {
+                    log::debug!(
+                        "Git returned an empty project identity for registry workspace {} at {}",
+                        existing.id,
+                        existing.repository_path.display()
+                    );
+                    continue;
+                }
+                let project_id = project_id_from_identity(&project_identity);
+                let project_scope_rev = next_project_scope_rev(existing.project_scope_rev)?;
+                let (applied, stored) = self
+                    .registry
+                    .update_project_scope(
+                        existing.id.clone(),
+                        project_scope_rev,
+                        project_id.clone(),
+                        project_identity.clone(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "recording resolved project identity for workspace {}",
+                            existing.id
+                        )
+                    })?;
+                *existing = stored;
+                changed |= applied;
+            }
+            for workspace in &held {
                 // Prefer the row that already owns this identity over a matching
                 // legacy row, or the update can collide with the unique index.
                 let existing = known
@@ -1349,6 +1974,60 @@ impl WorkspaceLifecycleService {
                     })
                     .max_by_key(|known| known.daemon_id.is_some());
                 if let Some(existing) = existing {
+                    if let Some(project_identity) = workspace.project_identity.as_deref() {
+                        let project_id = workspace
+                            .project_id
+                            .clone()
+                            .unwrap_or_else(|| crate::project_id_from_identity(project_identity));
+                        let daemon_wins = existing.project_identity.is_none()
+                            || workspace.project_scope_rev > existing.project_scope_rev;
+                        if daemon_wins {
+                            self.registry
+                                .update_repository_scope(
+                                    existing.id.clone(),
+                                    PathBuf::from(&workspace.project_root),
+                                    workspace.project_scope_rev,
+                                    project_id,
+                                    project_identity.to_owned(),
+                                )
+                                .await
+                                .with_context(|| {
+                                    format!(
+                                        "recording daemon project identity for workspace {}",
+                                        existing.id
+                                    )
+                                })?;
+                            changed = true;
+                        }
+                    } else if let Some(project_identity) = existing.project_identity.as_deref() {
+                        let updated = backend.update_workspace_project_scope(
+                            &workspace.id,
+                            &existing.project_id,
+                            project_identity,
+                            Some(&existing.repository_path.to_string_lossy()),
+                            Some(existing.project_scope_rev),
+                            instance_id.as_deref(),
+                        );
+                        match updated {
+                            Ok(Some(project_scope_rev)) => {
+                                self.registry
+                                    .update_repository_scope(
+                                        existing.id.clone(),
+                                        existing.repository_path.clone(),
+                                        project_scope_rev,
+                                        existing.project_id.clone(),
+                                        project_identity.to_owned(),
+                                    )
+                                    .await?;
+                                changed = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => log::warn!(
+                                "could not repair project identity for workspace {}: {error:#}",
+                                existing.id
+                            ),
+                        }
+                    }
                     if existing.remote_host.as_deref() != host || existing.daemon_id != instance_id
                     {
                         let rebound_result = self
@@ -1383,22 +2062,34 @@ impl WorkspaceLifecycleService {
                                 )
                             });
                         }
-                        rebound = true;
+                        changed = true;
                     }
                 }
             }
-            self.remember_discoveries(&key, &listing.items);
-            let rows = if rebound {
+            self.remember_discoveries(&key, &held);
+            let rows = if changed {
                 self.registry.list_workspaces()?
             } else {
                 known
             };
-            return Ok((key, listing.items, rows));
+            return Ok((key, held, rows));
         }
         bail!(
             "the daemon identity on {} kept changing while listing workspaces",
             host_label(host)
         )
+    }
+
+    async fn ensure_history_backfill(&self) -> Result<()> {
+        let mut complete = self.history_backfilled.lock().await;
+        if !*complete {
+            self.registry
+                .backfill_project_identities_from_workspace_history()
+                .await
+                .context("backfilling ADE project identities")?;
+            *complete = true;
+        }
+        Ok(())
     }
 
     /// The argv a terminal pane runs to attach to this workspace.
@@ -1987,10 +2678,16 @@ impl WorkspaceLifecycleService {
     /// a path on *its* host — the backend for that host is the one that will
     /// resolve it, and this machine's filesystem never enters into it.
     fn session_spec(workspace: &AdeWorkspace) -> SessionSpec {
-        SessionSpec::new(
+        let spec = SessionSpec::new(
             workspace.daemon_workspace_id(),
             workspace.repository_path.clone(),
-        )
+        );
+        match workspace.project_identity.as_deref() {
+            Some(project_identity) => {
+                spec.with_project_scope(&workspace.project_id, project_identity)
+            }
+            None => spec,
+        }
     }
 
     async fn record_probe(
@@ -2084,14 +2781,28 @@ impl EventFanout {
                     event,
                 },
             ),
-            DaemonEvent::WorkspaceReset(event) => send_or_clear(
-                &self.layout,
-                WorkspaceEvent::Reset {
-                    remote_host: remote_host.clone(),
-                    daemon_id,
-                    event,
-                },
-            ),
+            DaemonEvent::WorkspaceChanged(event) => {
+                send_or_clear(
+                    &self.layout,
+                    WorkspaceEvent::Layout {
+                        remote_host: remote_host.clone(),
+                        daemon_id,
+                        event,
+                    },
+                );
+                self.notify_workspace_changes();
+            }
+            DaemonEvent::WorkspaceReset(event) => {
+                send_or_clear(
+                    &self.layout,
+                    WorkspaceEvent::Reset {
+                        remote_host: remote_host.clone(),
+                        daemon_id,
+                        event,
+                    },
+                );
+                self.notify_workspace_changes();
+            }
             DaemonEvent::WorkspaceRemoved { workspace_id } => {
                 send_or_clear(
                     &self.layout,
@@ -2101,13 +2812,17 @@ impl EventFanout {
                         workspace_id,
                     },
                 );
-                self.workspace_changes
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .retain(|sender| sender.try_send(()).is_ok());
+                self.notify_workspace_changes();
             }
         }
         !self.is_idle()
+    }
+
+    fn notify_workspace_changes(&self) {
+        self.workspace_changes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|sender| sender.try_send(()).is_ok());
     }
 }
 
@@ -2217,7 +2932,10 @@ mod tests {
         BackendWorkspace {
             id: id.to_owned(),
             name: name.to_owned(),
+            project_id: None,
+            project_identity: None,
             project_root: root.to_owned(),
+            project_scope_rev: 0,
             created_at,
         }
     }
@@ -2310,6 +3028,180 @@ mod tests {
 
         // And this machine's backend was never asked about another host's.
         assert!(local.calls().is_empty(), "{:?}", local.calls());
+    }
+
+    #[gpui::test]
+    async fn test_legacy_discoveries_share_resolved_project_scope_and_cache_it() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_legacy_discovery_scope").await;
+        let project_identity_path = PathBuf::from("/repos/viral-studio");
+        let project_identity =
+            util::path_list::PathList::new(std::slice::from_ref(&project_identity_path))
+                .serialize()
+                .paths;
+        let host = Arc::new(
+            FakeBackend::new("dev-box")
+                .identified("daemon-dev-box")
+                .holding(vec![
+                    record(
+                        "ade-seedance2-5-2de8b3",
+                        "ade-seedance2-5-2de8b3",
+                        "/worktrees/viral-studio/seedance2-5",
+                        1_700_000_000,
+                    ),
+                    record(
+                        "ade-yookassa-0f1e2d",
+                        "ade-yookassa-0f1e2d",
+                        "/worktrees/viral-studio/yookassa",
+                        1_700_000_100,
+                    ),
+                ])
+                .resolving_repository("/worktrees/viral-studio/seedance2-5", project_identity_path),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("dev-box", host.clone());
+
+        for _ in 0..2 {
+            let listed = service
+                .ensure_host_workspaces(Some("dev-box"))
+                .await
+                .unwrap();
+            assert_eq!(discoveries(&listed).len(), 2);
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(WorkspaceEntry::project_identity)
+                    .collect::<HashSet<_>>(),
+                HashSet::from([project_identity.clone()])
+            );
+            assert!(
+                listed
+                    .iter()
+                    .all(|entry| entry.project_id() == "viral-studio")
+            );
+            assert!(registry.list_workspaces().unwrap().is_empty());
+        }
+
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            2,
+            "each legacy root is resolved only on the first listing"
+        );
+        assert_eq!(host.project_scope_updates().len(), 2);
+
+        let confirmed = service
+            .confirm_discovered(Some("dev-box"), "ade-seedance2-5-2de8b3")
+            .await
+            .unwrap();
+        assert_eq!(confirmed.project_id, "viral-studio");
+        assert_eq!(
+            confirmed.project_identity.as_deref(),
+            Some(project_identity.as_str())
+        );
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            2,
+            "confirmation reuses the enriched discovery"
+        );
+        assert_eq!(host.project_scope_updates().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_a_failed_legacy_resolution_can_heal_on_the_next_listing() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_legacy_scope_retry").await;
+        let host = Arc::new(
+            FakeBackend::new("dev-box")
+                .identified("daemon-dev-box")
+                .holding(vec![record(
+                    "ade-seedance2-5-2de8b3",
+                    "ade-seedance2-5-2de8b3",
+                    "/worktrees/viral-studio/seedance2-5",
+                    1_700_000_000,
+                )]),
+        );
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("dev-box", host.clone());
+
+        let first = service
+            .ensure_host_workspaces(Some("dev-box"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first[0].project_identity(),
+            "/worktrees/viral-studio/seedance2-5"
+        );
+
+        host.set_repository_resolution(
+            "/worktrees/viral-studio/seedance2-5",
+            "/repos/viral-studio",
+        );
+        let second = service
+            .ensure_host_workspaces(Some("dev-box"))
+            .await
+            .unwrap();
+        assert_eq!(second[0].project_identity(), "/repos/viral-studio");
+        service
+            .ensure_host_workspaces(Some("dev-box"))
+            .await
+            .unwrap();
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            2,
+            "a failure retries once, then the successful result is cached"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_a_failed_daemon_scope_write_retries_without_resolving_git_again() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_legacy_scope_write_retry").await;
+        let host = Arc::new(
+            FakeBackend::new("dev-box")
+                .identified("daemon-dev-box")
+                .holding(vec![record(
+                    "ade-seedance2-5-2de8b3",
+                    "ade-seedance2-5-2de8b3",
+                    "/worktrees/viral-studio/seedance2-5",
+                    1_700_000_000,
+                )])
+                .resolving_repository("/worktrees/viral-studio/seedance2-5", "/repos/viral-studio"),
+        );
+        host.fail_next_project_scope_update("connection reset");
+        let service =
+            WorkspaceLifecycleService::with_backend(registry, Arc::new(FakeBackend::new("local")))
+                .with_backend_for_host("dev-box", host.clone());
+
+        for _ in 0..3 {
+            let listed = service
+                .ensure_host_workspaces(Some("dev-box"))
+                .await
+                .unwrap();
+            assert_eq!(listed[0].project_identity(), "/repos/viral-studio");
+        }
+        assert_eq!(
+            host.calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            1,
+            "the successful Git result remains cached"
+        );
+        assert_eq!(
+            host.project_scope_updates().len(),
+            2,
+            "the transient write is retried once and old-daemon false is then cached"
+        );
     }
 
     /// Opening is what records a workspace, and records it **once**: the row
@@ -2849,6 +3741,8 @@ mod tests {
             ..AdeWorkspace::new("main", "project-a", "/home/user/main")
         };
         exact.last_opened_at = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        exact.project_identity = Some("/home/user/main".to_owned());
+        exact.project_scope_rev = 2;
         registry.create_workspace(exact.clone()).await.unwrap();
 
         let mut legacy = AdeWorkspace {
@@ -2857,6 +3751,9 @@ mod tests {
             ..AdeWorkspace::new("legacy", "project-a", "/home/user/main")
         };
         legacy.last_opened_at = OffsetDateTime::from_unix_timestamp(2_000).unwrap();
+        legacy.project_id = "wrong-project".to_owned();
+        legacy.project_identity = Some("/home/user/wrong-project".to_owned());
+        legacy.project_scope_rev = 3;
         registry.create_workspace(legacy.clone()).await.unwrap();
 
         let backend = Arc::new(
@@ -2888,10 +3785,12 @@ mod tests {
             .expect("the identified row survives");
         assert_eq!(exact.remote_host.as_deref(), Some("new-alias"));
         assert_eq!(exact.daemon_id.as_deref(), Some("daemon-a"));
+        assert_eq!(exact.project_identity.as_deref(), Some("/home/user/main"));
         let legacy = rows
             .iter()
             .find(|workspace| workspace.id == legacy.id)
             .expect("the legacy row is not rebound");
+        assert_eq!(legacy.project_id, "wrong-project");
         assert!(legacy.daemon_id.is_none());
     }
 
@@ -2969,7 +3868,10 @@ mod tests {
                 .holding(vec![BackendWorkspace {
                     id: "ade-stale-000001".to_owned(),
                     name: "stale".to_owned(),
+                    project_id: None,
+                    project_identity: None,
                     project_root: "/repos/stale".to_owned(),
+                    project_scope_rev: 0,
                     created_at: 1,
                 }]),
         );
@@ -2997,6 +3899,462 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_project_scope_update_keeps_dead_row_recreatable_when_record_is_missing() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_scope_dead_missing_record").await;
+        let mut row = AdeWorkspace::new(
+            "seedance2-5",
+            "seedance2-5",
+            "/worktrees/viral-studio/seedance2-5",
+        );
+        row.terminal_session_id = Some("ade-seedance2-5-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        );
+
+        let updated = service
+            .update_workspace_project_scope(&row.id, "viral-studio", "/repos/viral-studio")
+            .await
+            .unwrap();
+        assert_eq!(updated.project_id, "viral-studio");
+        assert_eq!(
+            updated.project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+        assert_eq!(
+            registry
+                .get_workspace(row.id)
+                .unwrap()
+                .unwrap()
+                .project_identity
+                .as_deref(),
+            Some("/repos/viral-studio")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repository_scope_update_moves_root_and_identity_together() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_repository_scope_update").await;
+        let mut row = AdeWorkspace::new("feature", "project-a", "/repos/project-a-old");
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-project-a-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let mut sibling = AdeWorkspace::new("other", "project-a", "/repos/project-a-old");
+        sibling.daemon_id = Some("daemon-a".to_owned());
+        sibling.terminal_session_id = Some("ade-project-a-000002".to_owned());
+        registry.create_workspace(sibling.clone()).await.unwrap();
+        let backend = Arc::new(
+            FakeBackend::new("local")
+                .identified("daemon-a")
+                .holding(vec![
+                    record("ade-project-a-000001", "feature", "/repos/project-a-old", 1),
+                    record("ade-project-a-000002", "other", "/repos/project-a-old", 1),
+                ]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(registry.clone(), backend.clone());
+
+        let updated = service
+            .update_workspace_repository_scope(
+                &row.id,
+                PathBuf::from("/repos/project-a-new"),
+                "project-a-new",
+                "/repos/project-a-main",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.repository_path, Path::new("/repos/project-a-new"));
+        assert_eq!(updated.project_scope_rev, 1);
+        assert_eq!(updated.project_id, "project-a-new");
+        assert_eq!(
+            updated.project_identity.as_deref(),
+            Some("/repos/project-a-main")
+        );
+        assert_eq!(registry.get_workspace(row.id).unwrap(), Some(updated));
+        let stored_sibling = registry.get_workspace(sibling.id).unwrap().unwrap();
+        assert_eq!(
+            stored_sibling.repository_path,
+            Path::new("/repos/project-a-new")
+        );
+        assert_eq!(stored_sibling.project_scope_rev, 1);
+        assert_eq!(stored_sibling.project_id, "project-a-new");
+        assert_eq!(
+            stored_sibling.project_identity.as_deref(),
+            Some("/repos/project-a-main")
+        );
+        assert_eq!(backend.project_scope_updates().len(), 2);
+        assert_eq!(
+            backend.project_scope_updates()[0].3.as_deref(),
+            Some("/repos/project-a-new")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_old_daemon_discovery_gets_a_canonical_local_scope() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_old_daemon_discovery_scope").await;
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-seedance2-5-000001".to_owned(),
+                    name: "seedance2-5".to_owned(),
+                    project_id: None,
+                    project_identity: None,
+                    project_root: "/worktrees/viral-studio/seedance2-5".to_owned(),
+                    project_scope_rev: 0,
+                    created_at: 1,
+                }]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote);
+
+        assert_eq!(
+            service
+                .update_discovered_workspace_project_scope(
+                    Some("remote"),
+                    "ade-seedance2-5-000001",
+                    "viral-studio",
+                    "/repos/viral-studio",
+                )
+                .await
+                .unwrap(),
+            Some(false),
+            "the old backend cannot persist project metadata"
+        );
+        let rows = registry.list_workspaces().unwrap();
+        assert_eq!(rows.len(), 1, "the discovered record is adopted once");
+        assert_eq!(rows[0].project_id, "viral-studio");
+        assert_eq!(
+            rows[0].project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+        assert_eq!(
+            rows[0].terminal_session_id.as_deref(),
+            Some("ade-seedance2-5-000001")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconciliation_hydrates_project_scope_from_daemon() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_scope_hydrates_from_daemon").await;
+        let mut row = AdeWorkspace::new(
+            "seedance2-5",
+            "seedance2-5",
+            "/worktrees/viral-studio/seedance2-5",
+        );
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-seedance2-5-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-seedance2-5-000001".to_owned(),
+                    name: "seedance2-5".to_owned(),
+                    project_id: Some("viral-studio".to_owned()),
+                    project_identity: Some("/repos/viral-studio".to_owned()),
+                    project_root: "/worktrees/viral-studio/seedance2-5".to_owned(),
+                    project_scope_rev: 0,
+                    created_at: 1,
+                }]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote);
+
+        service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.project_id, "viral-studio");
+        assert_eq!(
+            stored.project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconciliation_hydrates_root_and_scope_from_daemon_together() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_root_hydrates_from_daemon").await;
+        let mut row = AdeWorkspace::new("feature", "viral-studio", "/repos/viral-studio-old");
+        row.project_identity = Some("/repos/viral-studio".to_owned());
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-viral-studio-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-viral-studio-000001".to_owned(),
+                    name: "feature".to_owned(),
+                    project_id: Some("viral-studio".to_owned()),
+                    project_identity: Some("/repos/viral-studio-main".to_owned()),
+                    project_root: "/repos/viral-studio-new".to_owned(),
+                    project_scope_rev: 1,
+                    created_at: 1,
+                }]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote);
+
+        service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.repository_path, Path::new("/repos/viral-studio-new"));
+        assert_eq!(stored.project_scope_rev, 1);
+        assert_eq!(stored.project_id, "viral-studio");
+        assert_eq!(
+            stored.project_identity.as_deref(),
+            Some("/repos/viral-studio-main")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_equal_root_revision_keeps_the_local_pending_root() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_equal_root_revision").await;
+        let mut row = AdeWorkspace::new("feature", "viral-studio", "/repos/viral-studio-new");
+        row.project_identity = Some("/repos/viral-studio-main".to_owned());
+        row.project_scope_rev = 1;
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-viral-studio-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-viral-studio-000001".to_owned(),
+                    name: "feature".to_owned(),
+                    project_id: Some("viral-studio".to_owned()),
+                    project_identity: Some("/repos/viral-studio-main".to_owned()),
+                    project_root: "/repos/viral-studio-old".to_owned(),
+                    project_scope_rev: 1,
+                    created_at: 1,
+                }]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote.clone());
+
+        service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.repository_path, Path::new("/repos/viral-studio-new"));
+        assert_eq!(stored.project_scope_rev, 1);
+        assert_eq!(
+            remote.project_scope_updates()[0].3.as_deref(),
+            Some("/repos/viral-studio-new")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconciliation_hydrates_scope_from_a_resolved_legacy_record() {
+        let registry =
+            AdeWorkspaceRegistry::open_test_db("test_scope_hydrates_from_legacy_record").await;
+        let mut row = AdeWorkspace::new(
+            "seedance2-5",
+            "seedance2-5",
+            "/worktrees/viral-studio/seedance2-5",
+        );
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-seedance2-5-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![BackendWorkspace {
+                    id: "ade-seedance2-5-000001".to_owned(),
+                    name: "seedance2-5".to_owned(),
+                    project_id: None,
+                    project_identity: None,
+                    project_root: "/worktrees/viral-studio/seedance2-5".to_owned(),
+                    project_scope_rev: 0,
+                    created_at: 1,
+                }])
+                .resolving_repository("/worktrees/viral-studio/seedance2-5", "/repos/viral-studio"),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote);
+
+        service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.project_id, "viral-studio");
+        assert_eq!(
+            stored.project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_missing_legacy_record_resolves_scope_without_a_daemon_workspace() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_scope_hydrates_dead_row").await;
+        let mut row = AdeWorkspace::new(
+            "seedance2-5",
+            "seedance2-5",
+            "/worktrees/viral-studio/seedance2-5",
+        );
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-seedance2-5-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .resolving_repository("/worktrees/viral-studio/seedance2-5", "/repos/viral-studio"),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote.clone());
+
+        for _ in 0..2 {
+            let listed = service
+                .ensure_host_workspaces(Some("remote"))
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].project_id(), "viral-studio");
+            assert_eq!(listed[0].project_identity(), "/repos/viral-studio");
+        }
+        assert_eq!(
+            remote
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            1,
+            "the persisted scope is the success cache"
+        );
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.project_id, "viral-studio");
+        assert_eq!(
+            stored.project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+    }
+
+    #[gpui::test]
+    async fn test_missing_legacy_record_resolves_on_its_route_after_daemon_restart() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_scope_hydrates_stale_daemon").await;
+        let mut row = AdeWorkspace::new(
+            "seedance2-5",
+            "seedance2-5",
+            "/worktrees/viral-studio/seedance2-5",
+        );
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-seedance2-5-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-b")
+                .resolving_repository("/worktrees/viral-studio/seedance2-5", "/repos/viral-studio"),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote.clone());
+
+        service
+            .ensure_host_workspaces(Some("remote"))
+            .await
+            .unwrap();
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.project_id, "viral-studio");
+        assert_eq!(
+            stored.project_identity.as_deref(),
+            Some("/repos/viral-studio")
+        );
+        assert_eq!(
+            remote
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("resolve:"))
+                .count(),
+            1
+        );
+    }
+
+    #[gpui::test]
+    async fn test_persisted_multi_root_scope_beats_a_legacy_daemon_record() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_multi_root_scope_precedence").await;
+        let project_identity = util::path_list::PathList::new(&[
+            PathBuf::from("/repos/project-a"),
+            PathBuf::from("/repos/project-b"),
+        ])
+        .serialize()
+        .paths;
+        let mut row =
+            AdeWorkspace::new("project-a", "multi-project", "/worktrees/project-a/feature");
+        row.project_identity = Some(project_identity.clone());
+        row.remote_host = Some("remote".to_owned());
+        row.daemon_id = Some("daemon-a".to_owned());
+        row.terminal_session_id = Some("ade-project-a-000001".to_owned());
+        registry.create_workspace(row.clone()).await.unwrap();
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .identified("daemon-a")
+                .holding(vec![record(
+                    "ade-project-a-000001",
+                    "project-a",
+                    "/worktrees/project-a/feature",
+                    1,
+                )]),
+        );
+        let service = WorkspaceLifecycleService::with_backend(
+            registry.clone(),
+            Arc::new(FakeBackend::new("local")),
+        )
+        .with_backend_for_host("remote", remote.clone());
+
+        for _ in 0..2 {
+            let listed = service
+                .ensure_host_workspaces(Some("remote"))
+                .await
+                .unwrap();
+            assert_eq!(listed[0].project_id(), "multi-project");
+            assert_eq!(listed[0].project_identity(), project_identity);
+        }
+        assert!(
+            remote
+                .calls()
+                .iter()
+                .all(|call| !call.starts_with("resolve:")),
+            "an authoritative multi-root identity must not be replaced by a Git lookup"
+        );
+        assert_eq!(remote.project_scope_updates().len(), 1);
+        let stored = registry.get_workspace(row.id).unwrap().unwrap();
+        assert_eq!(stored.project_id, "multi-project");
+        assert_eq!(stored.project_identity, Some(project_identity));
+    }
+
+    #[gpui::test]
     async fn test_discovery_retries_when_the_listing_changes_daemon() {
         let registry = AdeWorkspaceRegistry::open_test_db("test_discovery_retries_identity").await;
         let remote = Arc::new(
@@ -3006,7 +4364,10 @@ mod tests {
                 .holding(vec![BackendWorkspace {
                     id: "ade-current-000001".to_owned(),
                     name: "current".to_owned(),
+                    project_id: None,
+                    project_identity: None,
                     project_root: "/repos/current".to_owned(),
+                    project_scope_rev: 0,
                     created_at: 1,
                 }]),
         );
@@ -3038,7 +4399,10 @@ mod tests {
         let daemon_workspace = BackendWorkspace {
             id: "ade-shared-000001".to_owned(),
             name: "shared".to_owned(),
+            project_id: None,
+            project_identity: None,
             project_root: "/repos/shared".to_owned(),
+            project_scope_rev: 0,
             created_at: 1,
         };
         let backend = Arc::new(
@@ -3088,6 +4452,46 @@ mod tests {
         assert!(rows[0].terminal_session_id.is_none());
         assert!(rows[0].daemon_id.is_none());
         assert!(backend.workspaces.lock().unwrap().is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_manual_remote_create_uses_the_git_project_identity() {
+        let registry = AdeWorkspaceRegistry::open_test_db("test_manual_remote_project_scope").await;
+        let local = Arc::new(FakeBackend::new("local"));
+        let checkout =
+            PathBuf::from("/home/user/Code/worktrees/viral-studio/vast-dune/seedance2-5");
+        let project_identity = PathBuf::from("/home/user/Code/viral-studio");
+        let remote = Arc::new(
+            FakeBackend::new("remote")
+                .resolving_repository(checkout.clone(), project_identity.clone()),
+        );
+        let service = WorkspaceLifecycleService::with_backend(registry, local.clone())
+            .with_backend_for_host("build-box", remote.clone());
+        let requested = PathBuf::from("~/Code/worktrees/viral-studio/vast-dune/seedance2-5/src");
+
+        let created = service
+            .create_workspace_from_repository(
+                "seedance2-5",
+                requested.clone(),
+                None,
+                Some("build-box".to_owned()),
+            )
+            .await
+            .expect("manual workspace creation should resolve its repository");
+
+        assert_eq!(created.repository_path, checkout);
+        assert_eq!(created.project_id, "viral-studio");
+        assert_eq!(
+            created.project_identity,
+            Some(project_identity.display().to_string())
+        );
+        assert_eq!(created.remote_host.as_deref(), Some("build-box"));
+        assert!(
+            remote
+                .calls()
+                .contains(&format!("resolve:{}", requested.display()))
+        );
+        assert!(local.calls().is_empty());
     }
 
     /// A workspace the daemon holds and the registry does not becomes a row in
@@ -3265,7 +4669,11 @@ mod tests {
 
         let killed = service.kill_workspace_session(&workspace.id).await.unwrap();
         assert_eq!(killed.status, WorkspaceStatus::Stopped);
-        assert!(killed.terminal_session_id.is_none());
+        assert_eq!(
+            killed.terminal_session_id.as_deref(),
+            Some(session.as_str())
+        );
+        assert_eq!(killed.daemon_id, workspace.daemon_id);
         assert!(host.calls().contains(&format!("kill:{session}")));
 
         assert!(
@@ -3435,6 +4843,17 @@ mod tests {
         assert_eq!(layout.workspace_id, "ade-here-000001");
         assert_eq!(layout.rev, 7);
 
+        local.push_workspace_changed(LayoutEvent {
+            workspace_id: "ade-here-000001".to_owned(),
+            layout: LayoutDoc::empty(),
+            rev: 7,
+        });
+        assert!(matches!(
+            smol::block_on(layouts.recv()).unwrap(),
+            WorkspaceEvent::Layout { .. }
+        ));
+        smol::block_on(workspace_changes.recv()).unwrap();
+
         local.push_workspace_reset(LayoutEvent {
             workspace_id: "ade-here-000001".to_owned(),
             layout: LayoutDoc::empty(),
@@ -3452,6 +4871,7 @@ mod tests {
         assert_eq!(daemon_id, None);
         assert_eq!(reset.workspace_id, "ade-here-000001");
         assert_eq!(reset.rev, 1);
+        smol::block_on(workspace_changes.recv()).unwrap();
 
         // A killed workspace rides the same stream, so a client cannot see a
         // layout for a workspace it has already been told is gone.
@@ -3543,6 +4963,63 @@ mod tests {
                 .count(),
             1,
             "the replacement backend needs its own pump"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_killing_sessions_preserves_daemon_mapping_for_recreate() {
+        let registry = AdeWorkspaceRegistry::open_test_db(
+            "test_killing_sessions_preserves_daemon_mapping_for_recreate",
+        )
+        .await;
+        let backend = Arc::new(FakeBackend::new("local").identified("daemon-a"));
+        let service = WorkspaceLifecycleService::with_backend(registry, backend.clone());
+        let workspace = service
+            .create_workspace("main", "project-a", "/repos/zed", None, None)
+            .await
+            .expect("the workspace session should be created");
+        let daemon_workspace_id = workspace.daemon_workspace_id();
+
+        let killed = service
+            .kill_workspace_session(&workspace.id)
+            .await
+            .expect("the workspace sessions should be killed");
+        assert_eq!(
+            killed.terminal_session_id.as_deref(),
+            Some(daemon_workspace_id.as_str())
+        );
+        assert_eq!(killed.daemon_id.as_deref(), Some("daemon-a"));
+        assert_eq!(
+            service
+                .registry()
+                .get_workspace(workspace.id.clone())
+                .expect("the retained mapping should remain readable"),
+            Some(killed.clone())
+        );
+
+        let (opened, state) = service
+            .open_workspace(&workspace.id)
+            .await
+            .expect("the retained workspace should reopen");
+        assert_eq!(state, SessionState::Dead);
+        assert_eq!(opened.daemon_workspace_id(), daemon_workspace_id);
+
+        let recreated = service
+            .recreate_session(&workspace.id)
+            .await
+            .expect("the retained workspace should recreate its session");
+        assert_eq!(recreated.daemon_workspace_id(), daemon_workspace_id);
+        assert_eq!(recreated.daemon_id.as_deref(), Some("daemon-a"));
+        assert!(
+            backend
+                .calls()
+                .contains(&format!("create:{daemon_workspace_id}|daemon-a"))
+        );
+        assert!(
+            !backend
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("kill_workspace:"))
         );
     }
 
@@ -4181,11 +5658,12 @@ mod tests {
             .kill_workspace_session(&workspace.id)
             .await
             .expect("killing through the forward");
-        assert!(killed.terminal_session_id.is_none());
+        assert_eq!(killed.terminal_session_id, workspace.terminal_session_id);
+        assert_eq!(killed.daemon_id, workspace.daemon_id);
         let after = service.reconcile_all().await.expect("reconciling again");
         assert_eq!(
             after.entries.first().map(WorkspaceEntry::state),
-            Some(SessionState::NeverCreated)
+            Some(SessionState::Dead)
         );
     }
 
@@ -4283,11 +5761,12 @@ mod tests {
             .kill_workspace_session(&workspace.id)
             .await
             .expect("killing through the forward");
-        assert!(killed.terminal_session_id.is_none());
+        assert_eq!(killed.terminal_session_id, workspace.terminal_session_id);
+        assert_eq!(killed.daemon_id, workspace.daemon_id);
         let after = service.reconcile_all().await.expect("reconciling again");
         assert_eq!(
             after.entries.first().map(WorkspaceEntry::state),
-            Some(SessionState::NeverCreated)
+            Some(SessionState::Dead)
         );
     }
 
@@ -4366,6 +5845,18 @@ mod tests {
         /// what discovery has to find.
         workspaces: Mutex<Vec<BackendWorkspace>>,
         workspaces_after_next_list: Mutex<Option<Vec<BackendWorkspace>>>,
+        repository_resolution: Mutex<Option<(PathBuf, PathBuf)>>,
+        project_scope_updates: Mutex<
+            Vec<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<u64>,
+                Option<String>,
+            )>,
+        >,
+        project_scope_update_failure: Mutex<Option<String>>,
         listing_instance_ids: Mutex<Vec<Option<String>>>,
         calls: Mutex<Vec<String>>,
         status: Mutex<Option<Sender<IdentifiedDaemonEvent>>>,
@@ -4388,6 +5879,9 @@ mod tests {
                 sessions_after_next_list: Mutex::new(Vec::new()),
                 workspaces: Mutex::new(Vec::new()),
                 workspaces_after_next_list: Mutex::new(None),
+                repository_resolution: Mutex::new(None),
+                project_scope_updates: Mutex::new(Vec::new()),
+                project_scope_update_failure: Mutex::new(None),
                 listing_instance_ids: Mutex::new(Vec::new()),
                 calls: Mutex::new(Vec::new()),
                 status: Mutex::new(None),
@@ -4426,6 +5920,25 @@ mod tests {
         fn holding(self, workspaces: Vec<BackendWorkspace>) -> Self {
             *self.workspaces.lock().unwrap() = workspaces;
             self
+        }
+
+        fn resolving_repository(
+            self,
+            repository_path: impl Into<PathBuf>,
+            project_identity_path: impl Into<PathBuf>,
+        ) -> Self {
+            *self.repository_resolution.lock().unwrap() =
+                Some((repository_path.into(), project_identity_path.into()));
+            self
+        }
+
+        fn set_repository_resolution(
+            &self,
+            repository_path: impl Into<PathBuf>,
+            project_identity_path: impl Into<PathBuf>,
+        ) {
+            *self.repository_resolution.lock().unwrap() =
+                Some((repository_path.into(), project_identity_path.into()));
         }
 
         fn hold(&self, workspace: BackendWorkspace) {
@@ -4469,6 +5982,23 @@ mod tests {
             self.calls.lock().unwrap().clone()
         }
 
+        fn project_scope_updates(
+            &self,
+        ) -> Vec<(
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<u64>,
+            Option<String>,
+        )> {
+            self.project_scope_updates.lock().unwrap().clone()
+        }
+
+        fn fail_next_project_scope_update(&self, message: &str) {
+            *self.project_scope_update_failure.lock().unwrap() = Some(message.to_owned());
+        }
+
         fn remove_session(&self, id: &str) {
             self.sessions
                 .lock()
@@ -4503,6 +6033,16 @@ mod tests {
                 smol::block_on(sender.send(IdentifiedDaemonEvent {
                     daemon_id: self.instance_id.clone(),
                     event: DaemonEvent::Layout(event),
+                }))
+                .expect("the merged stream is listening");
+            }
+        }
+
+        fn push_workspace_changed(&self, event: LayoutEvent) {
+            if let Some(sender) = self.status.lock().unwrap().as_ref() {
+                smol::block_on(sender.send(IdentifiedDaemonEvent {
+                    daemon_id: self.instance_id.clone(),
+                    event: DaemonEvent::WorkspaceChanged(event),
                 }))
                 .expect("the merged stream is listening");
             }
@@ -4592,6 +6132,38 @@ mod tests {
                 }
             };
             Ok(Identified { daemon_id, items })
+        }
+
+        fn resolve_repository(&self, path: &Path) -> Result<(PathBuf, PathBuf)> {
+            self.record(format!("resolve:{}", path.display()))?;
+            self.repository_resolution
+                .lock()
+                .unwrap()
+                .clone()
+                .context("the fake repository resolution was not configured")
+        }
+
+        fn update_workspace_project_scope(
+            &self,
+            workspace_id: &str,
+            project_id: &str,
+            project_identity: &str,
+            project_root: Option<&str>,
+            minimum_scope_rev: Option<u64>,
+            expected_daemon_id: Option<&str>,
+        ) -> Result<Option<u64>> {
+            self.project_scope_updates.lock().unwrap().push((
+                workspace_id.to_owned(),
+                project_id.to_owned(),
+                project_identity.to_owned(),
+                project_root.map(str::to_owned),
+                minimum_scope_rev,
+                expected_daemon_id.map(str::to_owned),
+            ));
+            if let Some(message) = self.project_scope_update_failure.lock().unwrap().take() {
+                bail!(message);
+            }
+            Ok(None)
         }
 
         fn exists(&self, id: &SessionId, expected: Option<&str>) -> Result<bool> {
@@ -4696,7 +6268,10 @@ mod tests {
             FakeBackend::new("current-box").holding(vec![BackendWorkspace {
                 id: "ade-proj-0a1b2c".to_owned(),
                 name: "ade-proj-0a1b2c".to_owned(),
+                project_id: None,
+                project_identity: None,
                 project_root: "/home/kingii/proj".to_owned(),
+                project_scope_rev: 0,
                 created_at: 1_700_000_000,
             }]),
         );

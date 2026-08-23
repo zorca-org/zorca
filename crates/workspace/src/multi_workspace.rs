@@ -298,7 +298,7 @@ pub struct ProjectGroupState {
     pub last_active_workspace: Option<WeakEntity<Workspace>>,
 }
 
-fn project_group_identity_is_known(project: &Project, cx: &App) -> bool {
+pub(crate) fn project_group_identity_is_known(project: &Project, cx: &App) -> bool {
     let mut worktrees = project.visible_worktrees(cx).peekable();
     worktrees.peek().is_some()
         && worktrees.all(|worktree| {

@@ -156,6 +156,8 @@ async fn workspace(connection: &mut Connection<UnixStream>, root: &Path) -> Stri
         .send(&Frame::CreateWorkspace {
             root: root.display().to_string(),
             name: Some("attached".into()),
+            project_id: None,
+            project_identity: None,
             request_id: Some(2),
             env: Vec::new(),
             cols: None,
@@ -184,6 +186,8 @@ async fn create(connection: &mut Connection<UnixStream>, cwd: &Path, command: &s
         .send(&Frame::CreateSession {
             workspace_id,
             cwd: cwd.display().to_string(),
+            project_id: None,
+            project_identity: None,
             command: command.into(),
             env: Vec::new(),
             cols: 80,

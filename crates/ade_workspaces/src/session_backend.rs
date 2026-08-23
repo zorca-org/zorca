@@ -99,6 +99,8 @@ pub struct SessionSpec {
     pub id: SessionId,
     /// Where the session's processes start.
     pub directory: PathBuf,
+    pub project_id: Option<String>,
+    pub project_identity: Option<String>,
 }
 
 impl SessionSpec {
@@ -106,7 +108,19 @@ impl SessionSpec {
         Self {
             id: id.into(),
             directory: directory.into(),
+            project_id: None,
+            project_identity: None,
         }
+    }
+
+    pub fn with_project_scope(
+        mut self,
+        project_id: impl Into<String>,
+        project_identity: impl Into<String>,
+    ) -> Self {
+        self.project_id = Some(project_id.into());
+        self.project_identity = Some(project_identity.into());
+        self
     }
 }
 
@@ -156,8 +170,11 @@ pub struct BackendWorkspace {
     /// as `terminal_session_id` and hands back to every later call.
     pub id: String,
     pub name: String,
+    pub project_id: Option<String>,
+    pub project_identity: Option<String>,
     /// Resolved on the backend's host, so a remote one is a path over there.
     pub project_root: String,
+    pub project_scope_rev: u64,
     /// Unix seconds.
     pub created_at: u64,
 }
@@ -280,6 +297,9 @@ pub struct LayoutEvent {
 pub enum DaemonEvent {
     Session(StatusEvent),
     Layout(LayoutEvent),
+    /// A full workspace record was published. Its layout may be unchanged, but
+    /// display or project metadata may require a fresh inventory listing.
+    WorkspaceChanged(LayoutEvent),
     /// The daemon still has this workspace, but its persisted incarnation was
     /// replaced while the event stream was disconnected. Unlike removal, the
     /// window keeps owning it; its revision gate and layout are reset together.
@@ -434,6 +454,15 @@ pub trait SessionBackend: Send + Sync {
         })
     }
 
+    /// Resolves a user-entered repository path on this backend's host.
+    ///
+    /// The first path is the workspace directory. The second is the repository
+    /// identity shared by linked worktrees, or the same path for a non-Git
+    /// directory.
+    fn resolve_repository(&self, _repository_path: &Path) -> Result<(PathBuf, PathBuf)> {
+        bail!("this session backend cannot resolve project directories")
+    }
+
     /// Whether one session is alive: [`SessionBackend::list`] narrowed to a
     /// single id, for the probe of a single workspace.
     ///
@@ -575,6 +604,23 @@ pub trait SessionBackend: Send + Sync {
         _expected_daemon_id: Option<&str>,
     ) -> Result<()> {
         bail!("this session backend has no workspaces of its own to rename")
+    }
+
+    /// Stores project metadata and, when supplied, the root in one mutation.
+    /// The backend advances past `minimum_scope_rev` when reconciliation must
+    /// preserve a newer client-side scope.
+    /// `Some` is the scope revision echoed by the backend; `None` means the
+    /// backend did not support or verify the mutation.
+    fn update_workspace_project_scope(
+        &self,
+        _workspace_id: &str,
+        _project_id: &str,
+        _project_identity: &str,
+        _project_root: Option<&str>,
+        _minimum_scope_rev: Option<u64>,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<Option<u64>> {
+        Ok(None)
     }
 
     /// Kills every session in the workspace **and deletes the workspace

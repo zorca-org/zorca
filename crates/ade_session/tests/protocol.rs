@@ -143,7 +143,10 @@ fn workspace_info() -> WorkspaceInfo {
     WorkspaceInfo {
         id: "w-1".into(),
         name: "proj".into(),
+        project_id: Some("proj".into()),
+        project_identity: Some("/home/u/proj".into()),
         project_root: "/home/u/proj".into(),
+        project_scope_rev: 3,
         created_at: 1_754_200_000,
         layout_rev: 4,
         layout: nested_layout(),
@@ -157,6 +160,8 @@ fn every_variant() -> Vec<Frame> {
         Frame::CreateSession {
             workspace_id: "ws-1".into(),
             cwd: "/home/u/proj".into(),
+            project_id: Some("proj".into()),
+            project_identity: Some("/home/u/proj".into()),
             command: "claude".into(),
             env: vec![("TERM".into(), "xterm-256color".into())],
             cols: 120,
@@ -169,6 +174,8 @@ fn every_variant() -> Vec<Frame> {
         Frame::CreateSession {
             workspace_id: "ws-2".into(),
             cwd: "/srv/app".into(),
+            project_id: None,
+            project_identity: None,
             command: "aider".into(),
             env: Vec::new(),
             cols: 80,
@@ -289,6 +296,8 @@ fn every_variant() -> Vec<Frame> {
         Frame::CreateWorkspace {
             root: "/home/u/proj".into(),
             name: Some("proj".into()),
+            project_id: Some("proj".into()),
+            project_identity: Some("/home/u/proj".into()),
             request_id: Some(15),
             env: Vec::new(),
             cols: None,
@@ -312,9 +321,17 @@ fn every_variant() -> Vec<Frame> {
             name: "vector db spike".into(),
             request_id: Some(19),
         },
+        Frame::UpdateWorkspaceProject {
+            workspace_id: "w-1".into(),
+            project_id: "proj".into(),
+            project_identity: "/home/u/proj".into(),
+            project_root: Some("/home/u/worktrees/proj/feature".into()),
+            minimum_scope_rev: Some(8),
+            request_id: Some(20),
+        },
         Frame::KillWorkspace {
             workspace_id: "w-1".into(),
-            request_id: Some(20),
+            request_id: Some(21),
         },
         Frame::Workspace {
             workspace: workspace_info(),
@@ -392,6 +409,78 @@ fn the_persisted_flag_is_absent_unless_it_is_false() {
     );
 }
 
+#[test]
+fn updating_a_workspace_project_keeps_the_root_backward_compatible() {
+    let legacy = Frame::UpdateWorkspaceProject {
+        workspace_id: "w-1".into(),
+        project_id: "proj".into(),
+        project_identity: "/home/u/proj".into(),
+        project_root: None,
+        minimum_scope_rev: None,
+        request_id: Some(20),
+    };
+    assert_eq!(
+        decode_frame(
+            br#"{"op":"update_workspace_project","rid":20,"body":{"workspace_id":"w-1","project_id":"proj","project_identity":"/home/u/proj"}}"#,
+        )
+        .unwrap(),
+        legacy
+    );
+    assert!(
+        !serde_json::from_slice::<Value>(&encode_frame(&legacy).unwrap()).unwrap()["body"]
+            .as_object()
+            .unwrap()
+            .contains_key("project_root")
+    );
+    assert!(
+        !serde_json::from_slice::<Value>(&encode_frame(&legacy).unwrap()).unwrap()["body"]
+            .as_object()
+            .unwrap()
+            .contains_key("minimum_scope_rev")
+    );
+
+    let encoded = encode_frame(&Frame::UpdateWorkspaceProject {
+        workspace_id: "w-1".into(),
+        project_id: "proj".into(),
+        project_identity: "/home/u/proj".into(),
+        project_root: Some(" /home/u/worktrees/proj/feature ".into()),
+        minimum_scope_rev: Some(8),
+        request_id: Some(20),
+    })
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&encoded).unwrap()["body"]["project_root"],
+        json!(" /home/u/worktrees/proj/feature ")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&encoded).unwrap()["body"]["minimum_scope_rev"],
+        json!(8)
+    );
+}
+
+#[test]
+fn a_legacy_workspace_scope_starts_at_revision_zero() {
+    let mut encoded = serde_json::from_slice::<Value>(
+        &encode_frame(&Frame::Workspace {
+            workspace: workspace_info(),
+            sessions: Vec::new(),
+            persisted: true,
+            request_id: Some(20),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    encoded["body"]["workspace"]
+        .as_object_mut()
+        .unwrap()
+        .remove("project_scope_rev");
+
+    match decode_frame(&serde_json::to_vec(&encoded).unwrap()).unwrap() {
+        Frame::Workspace { workspace, .. } => assert_eq!(workspace.project_scope_rev, 0),
+        other => panic!("expected Workspace, got {other:?}"),
+    }
+}
+
 /// A generation-3 `create_workspace` carries the record's identity and nothing
 /// else: the legacy first-session fields exist only to decode an old peer's
 /// request, so a sender at 3 must put none of them on the wire.
@@ -400,6 +489,8 @@ fn create_workspace_carries_nothing_but_the_record_at_generation_three() {
     let encoded = encode_frame(&Frame::CreateWorkspace {
         root: "/home/u/proj".into(),
         name: None,
+        project_id: None,
+        project_identity: None,
         request_id: Some(5),
         env: Vec::new(),
         cols: None,
@@ -427,7 +518,7 @@ fn frame_round_trip_covers_every_variant() {
     // Guard against a variant being added to the enum but not to the fixture.
     assert_eq!(
         frames.len(),
-        38,
+        39,
         "add the new Frame variant to every_variant()"
     );
 
@@ -1333,6 +1424,8 @@ fn the_generation_two_create_workspace_still_decodes_whole() {
         Frame::CreateWorkspace {
             root: "/home/u/proj".into(),
             name: Some("proj".into()),
+            project_id: None,
+            project_identity: None,
             env: vec![
                 ("TERM".into(), "xterm-256color".into()),
                 ("ADE_TEST".into(), "1".into()),

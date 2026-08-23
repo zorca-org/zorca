@@ -7,9 +7,9 @@
 //! no scrollback, no process state.
 //!
 //! **Workspaces are different: they really are restored.** A workspace's name,
-//! project root, layout and `layout_rev` all survive a restart, because none of
-//! them is tied to a live process — only the terminal tabs inside the layout
-//! are, and those are pruned on load (see
+//! project root, `project_scope_rev`, layout and `layout_rev` all survive a
+//! restart, because none of them is tied to a live process — only the terminal
+//! tabs inside the layout are, and those are pruned on load (see
 //! [`SessionTable::load`](crate::sessions::SessionTable::load)).
 //!
 //! Writes are atomic *and* durable (temp file, fsync, rename, fsync the

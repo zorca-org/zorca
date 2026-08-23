@@ -5,7 +5,7 @@ use db::{
     sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
     sqlez_macros::sql,
 };
-use std::cmp::Reverse;
+use std::{cmp::Reverse, path::PathBuf};
 use time::OffsetDateTime;
 
 /// Durable metadata store for [`AdeWorkspace`]s, in Zed's shared sqlite
@@ -69,6 +69,11 @@ impl Domain for AdeWorkspaceRegistry {
                 terminal_session_id
             ) WHERE used_by_client_at IS NOT NULL AND terminal_session_id IS NOT NULL;
         ),
+        sql!(ALTER TABLE ade_workspaces ADD COLUMN project_identity TEXT;),
+        sql!(
+            ALTER TABLE ade_workspaces
+            ADD COLUMN project_scope_rev INTEGER NOT NULL DEFAULT 0;
+        ),
     ];
 }
 
@@ -78,7 +83,9 @@ db::static_connection!(AdeWorkspaceRegistry, []);
 const COLUMNS: &str = "id,
     name,
     project_id,
+    project_identity,
     repository_path,
+    project_scope_rev,
     branch,
     remote_host,
     remote_workspace_path,
@@ -89,16 +96,108 @@ const COLUMNS: &str = "id,
     last_opened_at";
 
 impl AdeWorkspaceRegistry {
+    query! {
+        fn workspace_history_table_count() -> Result<Vec<i64>> {
+            SELECT COUNT(*) FROM sqlite_schema
+            WHERE type = "table" AND name IN ("workspaces", "remote_connections")
+        }
+    }
+
+    pub async fn backfill_project_identities_from_workspace_history(&self) -> Result<bool> {
+        if self
+            .workspace_history_table_count()?
+            .first()
+            .copied()
+            .unwrap_or(0)
+            != 2
+        {
+            return Ok(false);
+        }
+
+        self.write(|connection| {
+            Statement::prepare(
+                connection,
+                "WITH candidate_identities AS (
+                     SELECT ade.id, MIN(history.identity_paths) AS project_identity
+                     FROM ade_workspaces ade
+                     JOIN workspaces history
+                       ON history.paths = CAST(ade.repository_path AS TEXT)
+                     LEFT JOIN remote_connections remote
+                       ON remote.id = history.remote_connection_id
+                     WHERE ade.project_identity IS NULL
+                       AND history.identity_paths IS NOT NULL
+                       AND history.identity_paths <> ''
+                       AND (
+                         (ade.remote_host IS NULL AND history.remote_connection_id IS NULL)
+                         OR (
+                           ade.remote_host IS NOT NULL
+                           AND remote.kind = 'ssh'
+                           AND ade.remote_host = CASE
+                             WHEN remote.port IS NOT NULL AND remote.port <> 22 THEN
+                               'ssh://'
+                               || CASE WHEN remote.user IS NULL THEN '' ELSE remote.user || '@' END
+                               || CASE
+                                    WHEN instr(remote.host, ':') > 0
+                                      AND substr(remote.host, 1, 1) <> '['
+                                    THEN '[' || remote.host || ']'
+                                    ELSE remote.host
+                                  END
+                               || ':' || remote.port
+                             ELSE
+                               CASE WHEN remote.user IS NULL THEN '' ELSE remote.user || '@' END
+                               || remote.host
+                           END
+                         )
+                       )
+                     GROUP BY ade.id
+                     HAVING COUNT(DISTINCT history.identity_paths) = 1
+                 )
+                 UPDATE ade_workspaces
+                 SET project_identity = (
+                   SELECT candidate.project_identity
+                   FROM candidate_identities candidate
+                   WHERE candidate.id = ade_workspaces.id
+                 )
+                 WHERE id IN (SELECT id FROM candidate_identities)",
+            )?
+            .exec()
+        })
+        .await?;
+
+        for workspace in self.list_workspaces()? {
+            let Some(project_identity) = workspace.project_identity.as_deref() else {
+                continue;
+            };
+            let project_id = crate::project_id_from_identity(project_identity);
+            if workspace.project_id != project_id {
+                let project_scope_rev = workspace
+                    .project_scope_rev
+                    .checked_add(1)
+                    .context("project scope revision overflowed during history backfill")?;
+                self.update_project_scope(
+                    workspace.id,
+                    project_scope_rev,
+                    project_id,
+                    project_identity.to_owned(),
+                )
+                .await?;
+            }
+        }
+        Ok(true)
+    }
+
     /// Replaces the row with the same id, but preserves the existing owner of a
     /// conflicting daemon record so callers can re-list it without data loss.
     pub async fn create_workspace(&self, workspace: AdeWorkspace) -> Result<()> {
         let query = format!(
             "INSERT INTO ade_workspaces ({COLUMNS}, used_by_client_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT (id) DO UPDATE SET
                 name = excluded.name,
                 project_id = excluded.project_id,
+                project_identity = excluded.project_identity,
                 repository_path = excluded.repository_path,
+                project_scope_rev = excluded.project_scope_rev,
                 branch = excluded.branch,
                 remote_host = excluded.remote_host,
                 remote_workspace_path = excluded.remote_workspace_path,
@@ -134,7 +233,9 @@ impl AdeWorkspaceRegistry {
                 id,
                 name,
                 project_id,
+                project_identity,
                 repository_path,
+                project_scope_rev,
                 branch,
                 remote_host,
                 remote_workspace_path,
@@ -154,7 +255,9 @@ impl AdeWorkspaceRegistry {
                 id,
                 name,
                 project_id,
+                project_identity,
                 repository_path,
+                project_scope_rev,
                 branch,
                 remote_host,
                 remote_workspace_path,
@@ -175,7 +278,9 @@ impl AdeWorkspaceRegistry {
                 id,
                 name,
                 project_id,
+                project_identity,
                 repository_path,
+                project_scope_rev,
                 branch,
                 remote_host,
                 remote_workspace_path,
@@ -218,7 +323,9 @@ impl AdeWorkspaceRegistry {
                 id,
                 name,
                 project_id,
+                project_identity,
                 repository_path,
+                project_scope_rev,
                 branch,
                 remote_host,
                 remote_workspace_path,
@@ -399,6 +506,88 @@ impl AdeWorkspaceRegistry {
         }
     }
 
+    pub async fn update_project_scope(
+        &self,
+        id: WorkspaceId,
+        project_scope_rev: u64,
+        project_id: String,
+        project_identity: String,
+    ) -> Result<(bool, AdeWorkspace)> {
+        let applied = self
+            .update_project_scope_if_newer(
+                id.clone(),
+                project_scope_rev,
+                project_id,
+                project_identity,
+            )
+            .await?
+            .is_some();
+        let stored = self.get_workspace(id.clone())?.with_context(|| {
+            format!("workspace {id} disappeared while updating its project scope")
+        })?;
+        Ok((applied, stored))
+    }
+
+    query! {
+        async fn update_project_scope_if_newer(
+            id: WorkspaceId,
+            project_scope_rev: u64,
+            project_id: String,
+            project_identity: String
+        ) -> Result<Option<WorkspaceId>> {
+            UPDATE ade_workspaces
+            SET project_scope_rev = ?2, project_id = ?3, project_identity = ?4
+            WHERE id = ?1
+              AND (project_scope_rev < ?2
+                   OR (project_scope_rev = ?2 AND project_identity IS NULL))
+            RETURNING id
+        }
+    }
+
+    pub async fn update_repository_scope(
+        &self,
+        id: WorkspaceId,
+        repository_path: PathBuf,
+        project_scope_rev: u64,
+        project_id: String,
+        project_identity: String,
+    ) -> Result<(bool, AdeWorkspace)> {
+        let applied = self
+            .update_repository_scope_if_newer(
+                id.clone(),
+                repository_path,
+                project_scope_rev,
+                project_id,
+                project_identity,
+            )
+            .await?
+            .is_some();
+        let stored = self.get_workspace(id.clone())?.with_context(|| {
+            format!("workspace {id} disappeared while updating its repository scope")
+        })?;
+        Ok((applied, stored))
+    }
+
+    query! {
+        async fn update_repository_scope_if_newer(
+            id: WorkspaceId,
+            repository_path: PathBuf,
+            project_scope_rev: u64,
+            project_id: String,
+            project_identity: String
+        ) -> Result<Option<WorkspaceId>> {
+            UPDATE ade_workspaces
+            SET repository_path = ?2,
+                project_scope_rev = ?3,
+                project_id = ?4,
+                project_identity = ?5
+            WHERE id = ?1
+              AND (project_scope_rev < ?3
+                   OR (project_scope_rev = ?3 AND project_identity IS NULL))
+            RETURNING id
+        }
+    }
+
     query! {
         pub async fn update_terminal_session_id(
             id: WorkspaceId,
@@ -506,6 +695,19 @@ mod tests {
         created_at,
         last_opened_at";
 
+    const BEFORE_PROJECT_IDENTITY_COLUMNS: &str = "id,
+        name,
+        project_id,
+        repository_path,
+        branch,
+        remote_host,
+        remote_workspace_path,
+        terminal_session_id,
+        daemon_id,
+        status,
+        created_at,
+        last_opened_at";
+
     fn workspace(name: &str, project_id: &str) -> AdeWorkspace {
         AdeWorkspace::new(name, project_id, "/repos/zed")
     }
@@ -548,13 +750,26 @@ mod tests {
         used_by_client_at: Option<i64>,
     ) {
         let query = format!(
-            "INSERT INTO ade_workspaces ({COLUMNS}, used_by_client_at)
+            "INSERT INTO ade_workspaces ({BEFORE_PROJECT_IDENTITY_COLUMNS}, used_by_client_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         );
         connection
             .write(move |connection| {
                 let mut statement = Statement::prepare(connection, &query)?;
-                let next_index = statement.bind(&workspace, 1)?;
+                let next_index = statement.bind(&workspace.id, 1)?;
+                let next_index = statement.bind(&workspace.name, next_index)?;
+                let next_index = statement.bind(&workspace.project_id, next_index)?;
+                let next_index = statement.bind(&workspace.repository_path, next_index)?;
+                let next_index = statement.bind(&workspace.branch, next_index)?;
+                let next_index = statement.bind(&workspace.remote_host, next_index)?;
+                let next_index = statement.bind(&workspace.remote_workspace_path, next_index)?;
+                let next_index = statement.bind(&workspace.terminal_session_id, next_index)?;
+                let next_index = statement.bind(&workspace.daemon_id, next_index)?;
+                let next_index = statement.bind(&workspace.status, next_index)?;
+                let next_index =
+                    statement.bind(&workspace.created_at.unix_timestamp(), next_index)?;
+                let next_index =
+                    statement.bind(&workspace.last_opened_at.unix_timestamp(), next_index)?;
                 statement.bind(&used_by_client_at, next_index)?;
                 statement.exec()
             })
@@ -606,6 +821,7 @@ mod tests {
         let db = AdeWorkspaceRegistry::open_test_db("test_workspace_round_trip").await;
 
         let mut local = workspace("main", "project-a");
+        local.project_identity = Some("/repos/project-a".into());
         local.branch = Some("main".into());
         local.terminal_session_id = Some(local.tmux_session_name());
         local.status = WorkspaceStatus::Running;
@@ -662,6 +878,26 @@ mod tests {
         );
         assert_eq!(stored.last_opened_at, opened_at);
         assert_eq!(stored.created_at, remote.created_at);
+
+        db.update_project_scope(remote.id.clone(), 1, "zed".into(), "/repos/zed".into())
+            .await
+            .unwrap();
+        let stored = db.get_workspace(remote.id.clone()).unwrap().unwrap();
+        assert_eq!(stored.project_id, "zed");
+        assert_eq!(stored.project_identity.as_deref(), Some("/repos/zed"));
+        assert_eq!(stored.project_scope_rev, 1);
+        let (applied, winner) = db
+            .update_repository_scope(
+                remote.id.clone(),
+                PathBuf::from("/repos/stale"),
+                1,
+                "stale".into(),
+                "/repos/stale".into(),
+            )
+            .await
+            .unwrap();
+        assert!(!applied, "an equal-revision mismatch must lose");
+        assert_eq!(winner, stored);
         // The updates touched only that workspace.
         assert_eq!(
             db.get_workspace(local.id.clone()).unwrap(),
@@ -683,6 +919,123 @@ mod tests {
         db.delete_workspace(remote.id.clone()).await.unwrap();
         assert!(db.get_workspace(remote.id.clone()).unwrap().is_none());
         assert_eq!(db.list_workspaces().unwrap().len(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_project_identity_history_backfill_respects_workspace_location() {
+        let absent = AdeWorkspaceRegistry::open_test_db("test_identity_backfill_absent").await;
+        assert!(
+            !absent
+                .backfill_project_identities_from_workspace_history()
+                .await
+                .unwrap(),
+            "an isolated registry has no workspace history tables"
+        );
+
+        let db = AdeWorkspaceRegistry::open_test_db("test_identity_backfill_by_location").await;
+        db.write(|connection| {
+            Statement::prepare(
+                connection,
+                "CREATE TABLE remote_connections(
+                     id INTEGER PRIMARY KEY,
+                     kind TEXT NOT NULL,
+                     host TEXT,
+                     port INTEGER,
+                     user TEXT
+                 )",
+            )?
+            .exec()?;
+            Statement::prepare(
+                connection,
+                "CREATE TABLE workspaces(
+                     paths TEXT,
+                     identity_paths TEXT,
+                     remote_connection_id INTEGER
+                 )",
+            )?
+            .exec()?;
+            Statement::prepare(
+                connection,
+                "INSERT INTO remote_connections(id, kind, host, port, user) VALUES
+                   (1, 'ssh', 'host-a', NULL, 'user'),
+                   (2, 'ssh', 'host-b', NULL, 'user'),
+                   (3, 'ssh', 'host-c', 2222, 'alice'),
+                   (4, 'docker', 'host-d', NULL, 'user')",
+            )?
+            .exec()?;
+            Statement::prepare(
+                connection,
+                "INSERT INTO workspaces(paths, identity_paths, remote_connection_id) VALUES
+                   ('/checkout/shared', '/repos/local-project', NULL),
+                   ('/checkout/shared', '/repos/a-project', 1),
+                   ('/checkout/shared', '/repos/b-project', 2),
+                   ('/checkout/port', '/repos/c-project', 3),
+                   ('/checkout/docker', '/repos/docker-project', 4),
+                   ('/checkout/ambiguous', '/repos/a-project', 1),
+                   ('/checkout/ambiguous', '/repos/other-project', 1)",
+            )?
+            .exec()
+        })
+        .await
+        .unwrap();
+
+        let local = AdeWorkspace::new("local", "shared", "/checkout/shared");
+        let mut host_a = AdeWorkspace::new("host-a", "shared", "/checkout/shared");
+        host_a.remote_host = Some("user@host-a".to_owned());
+        let mut host_b = AdeWorkspace::new("host-b", "shared", "/checkout/shared");
+        host_b.remote_host = Some("user@host-b".to_owned());
+        let mut nondefault_port = AdeWorkspace::new("host-c", "port", "/checkout/port");
+        nondefault_port.remote_host = Some("ssh://alice@host-c:2222".to_owned());
+        let mut alias = AdeWorkspace::new("alias", "shared", "/checkout/shared");
+        alias.remote_host = Some("host-a".to_owned());
+        let mut non_ssh = AdeWorkspace::new("docker", "docker", "/checkout/docker");
+        non_ssh.remote_host = Some("user@host-d".to_owned());
+        let mut ambiguous = AdeWorkspace::new("ambiguous", "ambiguous", "/checkout/ambiguous");
+        ambiguous.remote_host = Some("user@host-a".to_owned());
+
+        for workspace in [
+            &local,
+            &host_a,
+            &host_b,
+            &nondefault_port,
+            &alias,
+            &non_ssh,
+            &ambiguous,
+        ] {
+            db.create_workspace(workspace.clone()).await.unwrap();
+        }
+
+        assert!(
+            db.backfill_project_identities_from_workspace_history()
+                .await
+                .unwrap()
+        );
+        for (workspace, expected_identity, expected_label) in [
+            (&local, "/repos/local-project", "local-project"),
+            (&host_a, "/repos/a-project", "a-project"),
+            (&host_b, "/repos/b-project", "b-project"),
+            (&nondefault_port, "/repos/c-project", "c-project"),
+        ] {
+            let stored = db.get_workspace(workspace.id.clone()).unwrap().unwrap();
+            assert_eq!(
+                stored.project_identity.as_deref(),
+                Some(expected_identity),
+                "{} must use history from its own location",
+                workspace.name
+            );
+            assert_eq!(stored.project_id, expected_label);
+        }
+        for workspace in [&alias, &non_ssh, &ambiguous] {
+            assert!(
+                db.get_workspace(workspace.id.clone())
+                    .unwrap()
+                    .unwrap()
+                    .project_identity
+                    .is_none(),
+                "{} has no unambiguous exact SSH location",
+                workspace.name
+            );
+        }
     }
 
     #[gpui::test]

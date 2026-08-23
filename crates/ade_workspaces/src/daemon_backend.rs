@@ -60,7 +60,8 @@ use crate::{
     SessionSpec, StatusDelivery, StatusEvent, WorkspaceLayout, WorkspaceStatus,
 };
 use ade_session::{
-    EnsureOutcome, LOOPBACK_ADDRESS, LayoutDoc, LocalEndpoint, PRE_CUT_DIAGNOSIS, ReadFrameError,
+    EnsureOutcome, HostExec, LOOPBACK_ADDRESS, LayoutDoc, LocalEndpoint, LocalHost,
+    PRE_CUT_DIAGNOSIS, ReadFrameError,
     deploy::{DEFAULT_SOCKET_PATH, DEFAULT_STATE_DIR, DaemonEndpoint},
     framing::bounded,
     is_handshake_eof,
@@ -651,7 +652,10 @@ impl DaemonBackend {
                 .map(|workspace| BackendWorkspace {
                     id: workspace.id,
                     name: workspace.name,
+                    project_id: workspace.project_id,
+                    project_identity: workspace.project_identity,
                     project_root: workspace.project_root,
+                    project_scope_rev: workspace.project_scope_rev,
                     created_at: workspace.created_at,
                 })
                 .collect(),
@@ -711,6 +715,8 @@ impl DaemonBackend {
                 // from the registry's cached name. See the module docs.
                 workspace_id: spec.id.to_string(),
                 cwd: spec.directory.display().to_string(),
+                project_id: spec.project_id.clone(),
+                project_identity: spec.project_identity.clone(),
                 // Empty means "the user's login shell", resolved by the daemon
                 // on its own host. Resolving it here would send this machine's
                 // `$SHELL` to a host that may not even share our OS.
@@ -760,7 +766,7 @@ impl DaemonBackend {
         expected_daemon_id: Option<&str>,
     ) -> Result<()> {
         let request_id = self.request_id();
-        self.request(
+        let result = self.request(
             expected_daemon_id,
             request_id,
             Frame::Kill {
@@ -775,8 +781,12 @@ impl DaemonBackend {
                 Frame::Removed { session_id } if session_id == id => Some(()),
                 _ => None,
             },
-        )
-        .with_context(|| format!("killing daemon session {id}"))
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if is_not_found(&error) => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("killing daemon session {id}")),
+        }
     }
 
     fn kill_workspace_sessions_seen(
@@ -845,6 +855,8 @@ impl SessionBackend for DaemonBackend {
                 Frame::CreateSession {
                     workspace_id: workspace_id.to_owned(),
                     cwd: cwd.display().to_string(),
+                    project_id: None,
+                    project_identity: None,
                     // Empty means the user's login shell, resolved on the
                     // daemon's own host — see [`Self::create_session`].
                     command: String::new(),
@@ -912,6 +924,15 @@ impl SessionBackend for DaemonBackend {
     fn list_workspaces_identified(&self) -> Result<Identified<BackendWorkspace>> {
         let (items, daemon_id) = self.daemon_workspaces_seen()?;
         Ok(Identified { daemon_id, items })
+    }
+
+    fn resolve_repository(&self, repository_path: &Path) -> Result<(PathBuf, PathBuf)> {
+        match &self.endpoint.transport {
+            Transport::Forwarded(link) => resolve_repository_on_host(&link.host, repository_path),
+            Transport::Proxy => resolve_repository_on_host(&LocalHost, repository_path),
+            #[cfg(test)]
+            Transport::Direct => resolve_repository_on_host(&LocalHost, repository_path),
+        }
     }
 
     fn attach(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<Attached> {
@@ -1050,6 +1071,53 @@ impl SessionBackend for DaemonBackend {
             },
         )
         .with_context(|| format!("renaming workspace {workspace_id}"))
+    }
+
+    fn update_workspace_project_scope(
+        &self,
+        workspace_id: &str,
+        project_id: &str,
+        project_identity: &str,
+        project_root: Option<&str>,
+        minimum_scope_rev: Option<u64>,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<Option<u64>> {
+        let request_id = self.request_id();
+        let result = self.request(
+            expected_daemon_id,
+            request_id,
+            Frame::UpdateWorkspaceProject {
+                workspace_id: workspace_id.to_owned(),
+                project_id: project_id.to_owned(),
+                project_identity: project_identity.to_owned(),
+                project_root: project_root.map(str::to_owned),
+                minimum_scope_rev,
+                request_id: Some(request_id),
+            },
+            |frame| match frame {
+                Frame::Workspace {
+                    workspace,
+                    request_id: Some(reply_id),
+                    ..
+                } if *reply_id == request_id => Some(workspace.clone()),
+                _ => None,
+            },
+        );
+        match result {
+            Ok(workspace)
+                if workspace.id == workspace_id
+                    && workspace.project_id.as_deref() == Some(project_id)
+                    && workspace.project_identity.as_deref() == Some(project_identity)
+                    && project_root.is_none_or(|root| workspace.project_root == root)
+                    && workspace.project_scope_rev > minimum_scope_rev.unwrap_or_default() =>
+            {
+                Ok(Some(workspace.project_scope_rev))
+            }
+            Ok(_) => Ok(None),
+            Err(error) if is_unknown_operation(&error) => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("storing project scope for workspace {workspace_id}")),
+        }
     }
 
     /// One frame, and the daemon does the rest: every session in the workspace
@@ -1397,10 +1465,8 @@ fn workspace_snapshot_events(
                 layout: workspace.layout,
                 rev: workspace.layout_rev,
             }));
-        } else if previous.is_none_or(|previous| {
-            workspace.layout_rev != previous.rev || workspace.layout != previous.layout
-        }) {
-            events.push(DaemonEvent::Layout(LayoutEvent {
+        } else {
+            events.push(DaemonEvent::WorkspaceChanged(LayoutEvent {
                 workspace_id: workspace.id,
                 layout: workspace.layout,
                 rev: workspace.layout_rev,
@@ -1421,6 +1487,22 @@ fn accept_workspace_event(
             if known
                 .get(&event.workspace_id)
                 .is_some_and(|workspace| workspace.rev >= event.rev)
+            {
+                return false;
+            }
+            known.insert(
+                event.workspace_id.clone(),
+                KnownWorkspace {
+                    rev: event.rev,
+                    layout: event.layout.clone(),
+                },
+            );
+            true
+        }
+        DaemonEvent::WorkspaceChanged(event) => {
+            if known
+                .get(&event.workspace_id)
+                .is_some_and(|workspace| workspace.rev > event.rev)
             {
                 return false;
             }
@@ -1612,7 +1694,7 @@ fn status_event(frame: Frame, join: &mut SessionJoin) -> Option<DaemonEvent> {
             }));
         }
         Frame::Workspace { workspace, .. } => {
-            return Some(DaemonEvent::Layout(LayoutEvent {
+            return Some(DaemonEvent::WorkspaceChanged(LayoutEvent {
                 workspace_id: workspace.id,
                 layout: workspace.layout,
                 rev: workspace.layout_rev,
@@ -1653,6 +1735,87 @@ fn newest_live(sessions: &[proto::SessionInfo], id: &SessionId) -> Option<proto:
         })
         .max_by_key(|session| session.created_at)
         .cloned()
+}
+
+const RESOLVE_REPOSITORY_SCRIPT: &str = r#"repository_path=$1
+case "$repository_path" in
+    '~') repository_path=$HOME ;;
+    '~/'*) repository_path=$HOME/${repository_path#\~/} ;;
+esac
+cd "$repository_path" || exit $?
+if git_paths=$(git rev-parse --path-format=absolute --show-toplevel --git-common-dir 2>/dev/null); then
+    printf 'git\n%s\n' "$git_paths"
+else
+    directory=$(pwd -P) || exit $?
+    printf 'directory\n%s\n%s\n' "$directory" "$directory"
+fi
+"#;
+
+fn resolve_repository_on_host(
+    host: &dyn HostExec,
+    repository_path: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    let output = host
+        .run(&[
+            "sh".to_owned(),
+            "-c".to_owned(),
+            RESOLVE_REPOSITORY_SCRIPT.to_owned(),
+            "sh".to_owned(),
+            repository_path.to_string_lossy().into_owned(),
+        ])
+        .with_context(|| format!("inspecting project directory {}", repository_path.display()))?;
+    if !output.success() {
+        let detail = output
+            .stderr
+            .trim_end_matches(|character| character == '\r' || character == '\n');
+        if detail.is_empty() {
+            bail!(
+                "could not inspect {} (exit {})",
+                repository_path.display(),
+                output.exit_code
+            );
+        }
+        bail!("could not inspect {}: {detail}", repository_path.display());
+    }
+
+    let stdout = output
+        .stdout
+        .strip_suffix("\r\n")
+        .or_else(|| output.stdout.strip_suffix('\n'))
+        .unwrap_or(&output.stdout);
+    let Some((kind, paths)) = stdout.split_once('\n') else {
+        bail!(
+            "the host returned an invalid project identity for {}",
+            repository_path.display()
+        );
+    };
+    let Some((checkout_root, identity)) = paths.split_once('\n') else {
+        bail!(
+            "the host returned an invalid project identity for {}",
+            repository_path.display()
+        );
+    };
+    let checkout_root = checkout_root.strip_suffix('\r').unwrap_or(checkout_root);
+    if !matches!(kind, "git" | "directory")
+        || checkout_root.is_empty()
+        || identity.is_empty()
+        || identity.contains('\n')
+        || identity.contains('\r')
+    {
+        bail!(
+            "the host returned an invalid project identity for {}",
+            repository_path.display()
+        );
+    }
+
+    Ok((
+        PathBuf::from(checkout_root),
+        if kind == "git" {
+            project::repo_identity_path(Path::new(identity)).to_path_buf()
+        } else {
+            PathBuf::from(identity)
+        },
+    ))
 }
 
 /// Where the daemon is, and how to reach it.
@@ -1899,6 +2062,18 @@ pub(crate) fn is_incompatible_daemon(error: &anyhow::Error) -> bool {
     error
         .chain()
         .any(|cause| cause.to_string().contains(PRE_CUT_DIAGNOSIS))
+}
+
+fn is_unknown_operation(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("unknown_op:"))
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("not_found:"))
 }
 
 /// The POSIX script the forced upgrade runs to take down a pre-cut daemon.
@@ -3917,6 +4092,117 @@ mod control_connection {
         );
     }
 
+    #[test]
+    fn killing_an_already_gone_session_succeeds() {
+        let backend = scripted_daemon(vec![Script::AnswerWith(vec![error(
+            proto::error_code::NOT_FOUND,
+            "no such session s1",
+            Some(1),
+        )])]);
+
+        bounded("the idempotent kill", move || {
+            backend
+                .kill_session("s1", None)
+                .expect("the requested state already holds");
+        });
+    }
+
+    #[test]
+    fn a_project_scope_update_requires_its_root_to_be_echoed() {
+        let backend = scripted_daemon(vec![Script::AnswerWith(vec![Frame::Workspace {
+            workspace: proto::WorkspaceInfo {
+                id: "w-1".to_owned(),
+                name: "feature".to_owned(),
+                project_id: Some("viral-studio".to_owned()),
+                project_identity: Some("/repos/viral-studio".to_owned()),
+                project_root: "/old/root".to_owned(),
+                project_scope_rev: 7,
+                created_at: 1,
+                layout_rev: 0,
+                layout: LayoutDoc::empty(),
+            },
+            sessions: Vec::new(),
+            persisted: true,
+            request_id: Some(1),
+        }])]);
+
+        let updated = bounded("the project scope update", move || {
+            backend
+                .update_workspace_project_scope(
+                    "w-1",
+                    "viral-studio",
+                    "/repos/viral-studio",
+                    Some("/new/root"),
+                    None,
+                    None,
+                )
+                .expect("a mismatched echo is a compatibility fallback")
+        });
+        assert_eq!(updated, None);
+    }
+
+    #[test]
+    fn a_project_scope_update_requires_an_advanced_revision() {
+        let reply = |project_scope_rev| Frame::Workspace {
+            workspace: proto::WorkspaceInfo {
+                id: "w-1".to_owned(),
+                name: "feature".to_owned(),
+                project_id: Some("viral-studio".to_owned()),
+                project_identity: Some("/repos/viral-studio".to_owned()),
+                project_root: "/new/root".to_owned(),
+                project_scope_rev,
+                created_at: 1,
+                layout_rev: 0,
+                layout: LayoutDoc::empty(),
+            },
+            sessions: Vec::new(),
+            persisted: true,
+            request_id: Some(1),
+        };
+
+        for (revision, minimum, expected) in
+            [(0, None, None), (8, Some(8), None), (9, Some(8), Some(9))]
+        {
+            let backend = scripted_daemon(vec![Script::AnswerWith(vec![reply(revision)])]);
+            let updated = bounded("the revision-checked project scope update", move || {
+                backend
+                    .update_workspace_project_scope(
+                        "w-1",
+                        "viral-studio",
+                        "/repos/viral-studio",
+                        Some("/new/root"),
+                        minimum,
+                        None,
+                    )
+                    .expect("the daemon answered the project scope update")
+            });
+            assert_eq!(updated, expected);
+        }
+    }
+
+    #[test]
+    fn an_old_daemon_can_decline_a_project_root_update() {
+        let backend = scripted_daemon(vec![Script::AnswerWith(vec![error(
+            proto::error_code::UNKNOWN_OP,
+            "unknown operation update_workspace_project",
+            Some(1),
+        )])]);
+
+        let updated = bounded("the unsupported project scope update", move || {
+            backend
+                .update_workspace_project_scope(
+                    "w-1",
+                    "viral-studio",
+                    "/repos/viral-studio",
+                    Some("/new/root"),
+                    None,
+                    None,
+                )
+                .expect("the connection survives an unsupported operation")
+        });
+        assert_eq!(updated, None);
+    }
+
     /// §6.1: a handshake that ends in EOF buys exactly one retry, on a *fresh*
     /// connection. A daemon that was merely still binding its socket is what
     /// this recovers, and it must recover it silently.
@@ -4204,7 +4490,10 @@ mod control_connection {
             proto::WorkspaceInfo {
                 id: id.to_owned(),
                 name: id.to_owned(),
+                project_id: None,
+                project_identity: None,
                 project_root: "/worktree".to_owned(),
+                project_scope_rev: 0,
                 created_at: 1,
                 layout_rev: rev,
                 layout: LayoutDoc::new(ade_session::LayoutNode::leaf(vec![
@@ -4212,6 +4501,20 @@ mod control_connection {
                         path: path.to_owned(),
                     },
                 ])),
+            }
+        }
+
+        fn empty_workspace(id: &str) -> proto::WorkspaceInfo {
+            proto::WorkspaceInfo {
+                id: id.to_owned(),
+                name: id.to_owned(),
+                project_id: None,
+                project_identity: None,
+                project_root: "/worktree".to_owned(),
+                project_scope_rev: 0,
+                created_at: 1,
+                layout_rev: 0,
+                layout: LayoutDoc::empty(),
             }
         }
 
@@ -4234,6 +4537,7 @@ mod control_connection {
                     workspace("changed", 1, "/before"),
                     workspace("recreated", 9, "/old-incarnation"),
                     workspace("repaired", 3, "/before-repair"),
+                    empty_workspace("unchanged-empty"),
                 ],
                 pending: Vec::new(),
             },
@@ -4244,6 +4548,7 @@ mod control_connection {
                     workspace("changed", 2, "/after"),
                     workspace("recreated", 1, "/new-incarnation"),
                     workspace("repaired", 3, "/after-repair"),
+                    empty_workspace("unchanged-empty"),
                 ],
                 pending: vec![
                     Frame::LayoutChanged {
@@ -4291,7 +4596,7 @@ mod control_connection {
         }));
         assert!(events.iter().any(|event| matches!(
             event,
-            DaemonEvent::Layout(LayoutEvent {
+            DaemonEvent::WorkspaceChanged(LayoutEvent {
                 workspace_id,
                 rev: 2,
                 ..
@@ -4302,7 +4607,7 @@ mod control_connection {
                 .iter()
                 .filter(|event| matches!(
                     event,
-                    DaemonEvent::Layout(LayoutEvent {
+                    DaemonEvent::WorkspaceChanged(LayoutEvent {
                         workspace_id,
                         ..
                     }) if workspace_id == "changed"
@@ -4310,6 +4615,18 @@ mod control_connection {
                 .count(),
             2,
             "the queued pre-snapshot revision must not be replayed"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    DaemonEvent::WorkspaceChanged(LayoutEvent { workspace_id, .. })
+                        if workspace_id == "unchanged-empty"
+                ))
+                .count(),
+            2,
+            "an unchanged empty workspace must wake inventory after reconnect"
         );
         assert_eq!(
             events
@@ -4350,7 +4667,12 @@ mod control_connection {
                 .iter()
                 .map(|(workspace_id, workspace)| (workspace_id.as_str(), workspace.rev))
                 .collect::<HashMap<_, _>>(),
-            HashMap::from([("changed", 2), ("recreated", 1), ("repaired", 3)])
+            HashMap::from([
+                ("changed", 2),
+                ("recreated", 1),
+                ("repaired", 3),
+                ("unchanged-empty", 0),
+            ])
         );
 
         let backend = scripted_daemon(vec![
@@ -4388,7 +4710,7 @@ mod control_connection {
             identified.daemon_id.as_deref() == Some("daemon-b")
                 && matches!(
                     &identified.event,
-                    DaemonEvent::Layout(LayoutEvent {
+                    DaemonEvent::WorkspaceChanged(LayoutEvent {
                         workspace_id,
                         rev: 1,
                         ..
@@ -4705,6 +5027,81 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn linked_worktrees_resolve_to_the_main_repository_identity() {
+        fn git(directory: &Path, arguments: &[&str]) {
+            let mut command = vec![
+                "git".to_owned(),
+                "-C".to_owned(),
+                directory.to_string_lossy().into_owned(),
+            ];
+            command.extend(arguments.iter().map(|argument| (*argument).to_owned()));
+            let output = LocalHost.run(&command).expect("git should run");
+            assert!(
+                output.success(),
+                "git {arguments:?} failed: {}",
+                output.stderr
+            );
+        }
+
+        let directory = TempDir::new().expect("temp dir");
+        let main = directory.path().join(" viral-studio ");
+        let linked = directory.path().join("seedance2-5");
+        std::fs::create_dir(&main).expect("main checkout directory");
+        git(&main, &["init", "--quiet"]);
+        git(&main, &["config", "user.name", "ADE Test"]);
+        git(&main, &["config", "user.email", "ade@example.com"]);
+        git(
+            &main,
+            &["commit", "--quiet", "--allow-empty", "-m", "initial"],
+        );
+        let linked_path = linked.to_string_lossy();
+        git(
+            &main,
+            &["worktree", "add", "--quiet", "-b", "feature", &linked_path],
+        );
+
+        let (main_root, main_identity) =
+            resolve_repository_on_host(&LocalHost, &main).expect("main repository should resolve");
+        let (linked_root, linked_identity) = resolve_repository_on_host(&LocalHost, &linked)
+            .expect("linked worktree should resolve");
+
+        assert_eq!(main_root, main.canonicalize().expect("canonical main path"));
+        assert_eq!(
+            linked_root,
+            linked.canonicalize().expect("canonical linked path")
+        );
+        assert_eq!(main_identity, main_root);
+        assert_eq!(linked_identity, main_identity);
+
+        let plain = directory.path().join("plain folder");
+        std::fs::create_dir(&plain).expect("plain directory");
+        let (plain_root, plain_identity) = resolve_repository_on_host(&LocalHost, &plain)
+            .expect("an existing non-Git directory should resolve");
+        let canonical_plain = plain.canonicalize().expect("canonical plain directory");
+        assert_eq!(plain_root, canonical_plain);
+        assert_eq!(plain_identity, plain_root);
+
+        #[cfg(unix)]
+        {
+            let plain_link = directory.path().join("plain-link");
+            std::os::unix::fs::symlink(&plain, &plain_link).expect("plain directory symlink");
+            let (linked_plain_root, linked_plain_identity) =
+                resolve_repository_on_host(&LocalHost, &plain_link)
+                    .expect("a symlinked non-Git directory should resolve");
+            assert_eq!(linked_plain_root, canonical_plain);
+            assert_eq!(linked_plain_identity, linked_plain_root);
+        }
+
+        let missing = directory.path().join("missing");
+        let error = resolve_repository_on_host(&LocalHost, &missing)
+            .expect_err("a missing repository path should be rejected");
+        assert!(
+            format!("{error:#}").contains(&missing.display().to_string()),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -5093,6 +5490,55 @@ mod tests {
         // Killed: gone from the listing, so there is nothing to adopt back.
         backend.kill_workspace(spec.id.as_str(), None).unwrap();
         assert!(backend.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_project_scope_update_replaces_the_workspace_root_atomically() {
+        let (dir, _server, backend) = backend();
+        let spec = spec("ade-project-scope-000021", &dir);
+        backend.create(&spec, None).unwrap();
+
+        let project_root = " /repos/viral-studio/worktrees/feature ";
+        assert_eq!(
+            backend
+                .update_workspace_project_scope(
+                    spec.id.as_str(),
+                    " viral-studio ",
+                    "/repos/viral-studio ",
+                    Some(project_root),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            backend
+                .update_workspace_project_scope(
+                    spec.id.as_str(),
+                    " viral-studio ",
+                    "/repos/viral-studio ",
+                    Some(project_root),
+                    Some(5),
+                    None,
+                )
+                .unwrap(),
+            Some(6)
+        );
+
+        let workspace = backend
+            .list_workspaces()
+            .unwrap()
+            .into_iter()
+            .find(|workspace| workspace.id == spec.id.as_str())
+            .expect("updated workspace");
+        assert_eq!(workspace.project_id.as_deref(), Some(" viral-studio "));
+        assert_eq!(
+            workspace.project_identity.as_deref(),
+            Some("/repos/viral-studio ")
+        );
+        assert_eq!(workspace.project_root, project_root);
+        assert_eq!(workspace.project_scope_rev, 6);
     }
 
     /// The layout's own attach: an argv for a session the daemon already has,

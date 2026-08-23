@@ -70,6 +70,7 @@ pub const KNOWN_OPS: &[&str] = &[
     "list_workspaces",
     "update_layout",
     "rename_workspace",
+    "update_workspace_project",
     "kill_workspace",
     "create_session",
     "list_sessions",
@@ -505,7 +506,17 @@ impl Default for LayoutDoc {
 pub struct WorkspaceInfo {
     pub id: String,
     pub name: String,
+    /// Human-readable project group label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// Canonical main-worktree paths identifying the project group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_identity: Option<String>,
     pub project_root: String,
+    /// Bumped when project identity metadata or `project_root` changes.
+    /// Absent legacy values are revision 0.
+    #[serde(default)]
+    pub project_scope_rev: u64,
     /// Unix seconds.
     pub created_at: u64,
     /// Bumped on every accepted [`Frame::UpdateLayout`]; the guard that makes
@@ -666,6 +677,10 @@ pub enum Frame {
         /// Defaults to the last component of `root`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_identity: Option<String>,
         /// Generation-2 request field: the first session's environment. A
         /// gen-3 receiver ignores it and a gen-3 sender must not emit it —
         /// kept only so the gen-2 request can still be decoded whole.
@@ -715,6 +730,20 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_id: Option<u64>,
     },
+    UpdateWorkspaceProject {
+        workspace_id: String,
+        project_id: String,
+        project_identity: String,
+        /// Replaces a stale legacy root in the same persisted mutation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_root: Option<String>,
+        /// A client revision the daemon must advance past when applying this
+        /// scope, used to preserve an offline update during reconciliation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_scope_rev: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<u64>,
+    },
     /// Kill every session in the workspace and forget the workspace. The only
     /// workspace-level kill; closing one terminal tab is [`Frame::Kill`].
     KillWorkspace {
@@ -733,6 +762,12 @@ pub enum Frame {
         /// `cwd` and named from `instance_label`.
         workspace_id: String,
         cwd: String,
+        /// Generation-2 workspace metadata used when this request auto-creates
+        /// the workspace record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_identity: Option<String>,
         /// What to run on the new pty, resolved **on the daemon's host**.
         ///
         /// An **empty string means "the user's login shell"** — the daemon
@@ -1007,6 +1042,7 @@ impl Frame {
             | Frame::ListWorkspaces { .. }
             | Frame::UpdateLayout { .. }
             | Frame::RenameWorkspace { .. }
+            | Frame::UpdateWorkspaceProject { .. }
             | Frame::KillWorkspace { .. }
             | Frame::Workspace { .. }
             | Frame::WorkspaceList { .. }
@@ -1022,6 +1058,7 @@ impl Frame {
             | Frame::OpenWorkspace { workspace_id, .. }
             | Frame::UpdateLayout { workspace_id, .. }
             | Frame::RenameWorkspace { workspace_id, .. }
+            | Frame::UpdateWorkspaceProject { workspace_id, .. }
             | Frame::KillWorkspace { workspace_id, .. }
             | Frame::LayoutChanged { workspace_id, .. }
             | Frame::WorkspaceRemoved { workspace_id, .. } => Some(workspace_id),
@@ -1051,6 +1088,7 @@ impl Frame {
             | Frame::ListWorkspaces { request_id }
             | Frame::UpdateLayout { request_id, .. }
             | Frame::RenameWorkspace { request_id, .. }
+            | Frame::UpdateWorkspaceProject { request_id, .. }
             | Frame::KillWorkspace { request_id, .. }
             | Frame::Workspace { request_id, .. }
             | Frame::WorkspaceList { request_id, .. }

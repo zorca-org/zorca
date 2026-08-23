@@ -1,23 +1,22 @@
 //! The "new workspace" modal behind the sidebar's `+`.
 //!
 //! Deliberately three fields — a human name, a repository path, and an optional
-//! host. The project group is *derived* from the path's basename rather than
-//! asked for, so the common case (several workspaces on one checkout) groups
-//! itself, and the branch is left `None`.
+//! host. Git resolves the project group from the repository's common directory,
+//! so linked worktrees stay under the same project, and the branch is left
+//! `None`.
 //!
 //! **The host decides what the path means.** Left empty, the workspace is local
 //! and the path is a path here. Filled in, the path is read on *that* host and
-//! is never touched locally. There is no validation past a trim: the
-//! destination is whatever `ssh` accepts, and the user's `~/.ssh/config` owns
-//! resolution — ADE never implements its own auth or host database.
+//! is never touched locally. Submission validates the directory on that host
+//! and uses its Git identity when present; the destination is whatever `ssh` accepts, and the user's
+//! `~/.ssh/config` owns resolution — ADE never implements its own auth or host
+//! database.
 //!
 //! **The rest of the field list is deferred.** Branch and the agent command
 //! both belong here eventually; they are left out so this modal stays the small
 //! thing it needs to be.
 
-use crate::{
-    AdeWorkspace, WorkspaceLifecycleService, attach::attach_terminal, project_id_from_path,
-};
+use crate::{AdeWorkspace, WorkspaceLifecycleService, attach::attach_terminal};
 use anyhow::Result;
 use editor::Editor;
 use gpui::{
@@ -28,7 +27,7 @@ use ui::{Divider, prelude::*};
 use workspace::{ModalView, Workspace};
 
 /// Called with the freshly created workspace, on the foreground, once
-/// [`WorkspaceLifecycleService::create_workspace`] has returned.
+/// [`WorkspaceLifecycleService::create_workspace_from_repository`] has returned.
 pub type OnWorkspaceCreated = Rc<dyn Fn(AdeWorkspace, &mut Window, &mut App)>;
 
 pub(crate) type OnCreated = OnWorkspaceCreated;
@@ -47,8 +46,7 @@ pub(crate) type OnCreated = OnWorkspaceCreated;
 /// layout of its own wants.
 ///
 /// `remote_host` is a destination `ssh` accepts and `repository_path` is read on
-/// that host; both are `None` for a workspace on this machine. Neither is
-/// validated here — see the module docs.
+/// that host; both are `None` for a workspace on this machine.
 pub fn open_create_workspace_modal(
     zed_workspace: &Entity<Workspace>,
     remote_host: Option<String>,
@@ -249,16 +247,12 @@ impl CreateWorkspaceModal {
             return;
         }
 
-        // Empty is local. Nothing more is checked: the destination is whatever
-        // ssh accepts, including an alias out of the user's config.
+        // Empty is local. A nonempty destination is whatever ssh accepts,
+        // including an alias out of the user's config.
         let remote_host = Some(self.host_editor.read(cx).text(cx).trim().to_owned())
             .filter(|host| !host.is_empty());
 
         let repository_path = PathBuf::from(path);
-        // The basename either way — the group is what the checkout is called,
-        // and a remote path has one too. `project_id` is host-blind, so two
-        // hosts with a `zed` checkout share a heading; accepted for now.
-        let project_id = project_id_from_path(&repository_path);
         let lifecycle = self.lifecycle.clone();
         let on_created = self.on_created.clone();
 
@@ -271,7 +265,7 @@ impl CreateWorkspaceModal {
             let created = cx
                 .background_spawn(async move {
                     lifecycle
-                        .create_workspace(name, project_id, repository_path, None, remote_host)
+                        .create_workspace_from_repository(name, repository_path, None, remote_host)
                         .await
                 })
                 .await;
@@ -352,7 +346,7 @@ impl Render for CreateWorkspaceModal {
             .child(self.render_field("Name", "shown in the sidebar", &self.name_editor, cx))
             .child(self.render_field(
                 "Repository path",
-                "the project group is its folder name",
+                "linked worktrees share their Git project group",
                 &self.path_editor,
                 cx,
             ))

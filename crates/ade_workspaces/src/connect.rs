@@ -156,7 +156,7 @@ pub fn open_connection_workspace(
 
     let lifecycle = crate::lifecycle_service(cx);
     cx.spawn_in(window, async move |this, cx| {
-        let Some(repository_path) = wait_for_project_root(&this, root_deadline, cx).await else {
+        let Some(project_scope) = wait_for_project_root(&this, root_deadline, cx).await else {
             log::info!(
                 "ADE waited {root_deadline:?} for {label}'s project root; \
                  releasing the claim so a later caller can try again"
@@ -164,6 +164,9 @@ pub fn open_connection_workspace(
             give_up_on_window(window_id, &this, cx);
             return;
         };
+        let repository_path = project_scope.repository_path;
+        let project_id = project_scope.project_id;
+        let project_identity = project_scope.project_identity;
         // Connecting with nothing but `~` filled in is how the remote picker
         // behaves before a folder is chosen; a workspace rooted at the whole
         // account is not a project (operator ruling, 2026-08-05). The same
@@ -252,8 +255,80 @@ pub fn open_connection_workspace(
             }
         };
 
-        // The host has just been contacted, so whatever its daemon holds can
-        // become panel rows now rather than at the next thing that asks.
+        // A row this client already has for the root leads. A transient record
+        // stays in the sidebar until the user opens it; creating beside it
+        // would duplicate the daemon workspace.
+        let existing_id = most_recent_workspace(ssh.as_ref(), &repository_path, &workspaces)
+            .map(|workspace| workspace.id.clone());
+        let persisted_ids = workspaces
+            .iter()
+            .filter_map(WorkspaceEntry::persisted)
+            .map(|(workspace, _)| workspace)
+            .filter(|workspace| {
+                persisted_workspace_matches_connection(ssh.as_ref(), workspace)
+                    && workspace.repository_path == repository_path
+            })
+            .map(|workspace| workspace.id.clone())
+            .collect::<Vec<_>>();
+        let discovered_ids = workspaces
+            .iter()
+            .filter_map(|entry| match entry {
+                WorkspaceEntry::Discovered {
+                    remote_host,
+                    workspace,
+                    ..
+                } if workspace_matches_connection(ssh.as_ref(), remote_host.as_deref())
+                    && Path::new(&workspace.project_root) == repository_path =>
+                {
+                    Some(workspace.id.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let scoped = cx
+            .background_spawn({
+                let lifecycle = lifecycle.clone();
+                let host = host.clone();
+                let project_id = project_id.clone();
+                let project_identity = project_identity.clone();
+                async move {
+                    let mut persisted = Vec::with_capacity(persisted_ids.len());
+                    for id in persisted_ids {
+                        persisted.push(
+                            lifecycle
+                                .update_workspace_project_scope(
+                                    &id,
+                                    &project_id,
+                                    &project_identity,
+                                )
+                                .await?,
+                        );
+                    }
+                    let mut discovered_exists = false;
+                    for id in discovered_ids {
+                        discovered_exists |= lifecycle
+                            .update_discovered_workspace_project_scope(
+                                host.as_deref(),
+                                &id,
+                                &project_id,
+                                &project_identity,
+                            )
+                            .await?
+                            .is_some();
+                    }
+                    anyhow::Ok((persisted, discovered_exists))
+                }
+            })
+            .await;
+        let (persisted, discovered_exists) = match scoped {
+            Ok(scoped) => scoped,
+            Err(error) => {
+                log::warn!("updating ADE project identity for {label} failed: {error:#}");
+                open_plain_terminal_if_empty(&this, cx);
+                return;
+            }
+        };
+
         cx.update(|_, cx| {
             if let Some(store) = AdeWorkspaceStore::try_global(cx) {
                 store.update(cx, |store, cx| store.refresh(cx));
@@ -261,13 +336,11 @@ pub fn open_connection_workspace(
         })
         .ok();
 
-        // A row this client already has for the root leads. A transient record
-        // stays in the sidebar until the user opens it; creating beside it
-        // would duplicate the daemon workspace.
-        let existing = most_recent_workspace(ssh.as_ref(), &repository_path, &workspaces).cloned();
-        if existing.is_none()
-            && has_discovered_workspace(ssh.as_ref(), &repository_path, &workspaces)
-        {
+        let existing = existing_id
+            .as_ref()
+            .and_then(|id| persisted.iter().find(|workspace| &workspace.id == id))
+            .cloned();
+        if existing.is_none() && discovered_exists {
             open_plain_terminal_if_empty(&this, cx);
             return;
         }
@@ -277,13 +350,19 @@ pub fn open_connection_workspace(
                 let created = cx
                     .background_spawn({
                         let lifecycle = lifecycle.clone();
-                        let name = crate::project_id_from_path(&repository_path);
-                        let project_id = name.clone();
+                        let name = project_id.clone();
                         let repository_path = repository_path.clone();
                         let host = host.clone();
                         async move {
                             lifecycle
-                                .create_workspace(name, project_id, repository_path, None, host)
+                                .create_workspace_scoped(
+                                    name,
+                                    project_id,
+                                    Some(project_identity),
+                                    repository_path,
+                                    None,
+                                    host,
+                                )
                                 .await
                         }
                     })
@@ -342,25 +421,46 @@ async fn offer_incompatible_daemon_upgrade(
 /// The first visible worktree's root, awaited because a restored window loads
 /// its worktrees after the workspace exists. `None` means the deadline passed
 /// with the project still rootless.
+struct ProjectScope {
+    repository_path: std::path::PathBuf,
+    project_id: String,
+    project_identity: String,
+}
+
 async fn wait_for_project_root(
     this: &WeakEntity<Workspace>,
     deadline: std::time::Duration,
     cx: &mut AsyncWindowContext,
-) -> Option<std::path::PathBuf> {
+) -> Option<ProjectScope> {
     let poll = std::time::Duration::from_millis(250);
     let mut waited = std::time::Duration::ZERO;
     loop {
-        let root = this
+        let scope = this
             .update(cx, |workspace, cx| {
                 let project = workspace.project().read(cx);
-                project
+                let repository_path = project
                     .visible_worktrees(cx)
                     .next()
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())?;
+                if !workspace.project_group_identity_is_known(cx) {
+                    return None;
+                }
+                let project_group_key = project.project_group_key(cx);
+                let project_identity = project_group_key.path_list().serialize().paths;
+                if project_identity.is_empty() {
+                    return None;
+                }
+                Some(ProjectScope {
+                    repository_path,
+                    project_id: project_group_key
+                        .display_name(&Default::default())
+                        .to_string(),
+                    project_identity,
+                })
             })
             .ok()?;
-        if let Some(root) = root {
-            return Some(root);
+        if let Some(scope) = scope {
+            return Some(scope);
         }
         if waited >= deadline {
             return None;
@@ -504,6 +604,7 @@ fn persisted_workspace_matches_connection(
 
 /// Whether the host already holds a record for this connected root. The
 /// sidebar owns promotion; the connection flow only avoids duplicating it.
+#[cfg(test)]
 fn has_discovered_workspace(
     ssh: Option<&SshConnectionOptions>,
     root: &Path,
@@ -930,7 +1031,10 @@ mod tests {
                 workspace: crate::BackendWorkspace {
                     id: id.to_owned(),
                     name: id.to_owned(),
+                    project_id: None,
+                    project_identity: None,
                     project_root: root.to_owned(),
+                    project_scope_rev: 0,
                     created_at,
                 },
                 state: SessionState::Unknown,
@@ -1001,6 +1105,33 @@ mod tests {
                 "a root that lands late must still find the window claimable"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_project_scope_ignores_a_stale_project_group_hint(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        window.update(|_, cx| {
+            workspace.update(cx, |workspace, _cx| {
+                workspace.test_set_project_group_key_hint(project::ProjectGroupKey::new(
+                    None,
+                    util::path_list::PathList::new(&[Path::new("/stale-worktree")]),
+                ));
+            });
+        });
+
+        let workspace = workspace.downgrade();
+        let scope = window
+            .update(|window, cx| {
+                window.spawn(cx, async move |cx| {
+                    wait_for_project_root(&workspace, std::time::Duration::ZERO, cx).await
+                })
+            })
+            .await
+            .expect("the scanned project has a canonical scope");
+
+        assert_eq!(scope.repository_path, Path::new("/repo"));
+        assert_eq!(scope.project_id, "repo");
+        assert_eq!(scope.project_identity, "/repo");
     }
 
     #[gpui::test]

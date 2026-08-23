@@ -119,6 +119,8 @@ fn create_frame(
     Frame::CreateSession {
         workspace_id: workspace_id.to_owned(),
         cwd: cwd.display().to_string(),
+        project_id: None,
+        project_identity: None,
         command: command.into(),
         env: vec![("ADE_TEST".into(), "1".into())],
         cols: 80,
@@ -484,6 +486,8 @@ async fn empty_workspace(
         .send(&Frame::CreateWorkspace {
             root: root.display().to_string(),
             name: name.map(str::to_owned),
+            project_id: None,
+            project_identity: None,
             request_id: Some(61),
             env: Vec::new(),
             cols: None,
@@ -1382,6 +1386,8 @@ fn opening_a_workspace_returns_its_layout_and_every_session_in_it() {
             .send(&Frame::CreateSession {
                 workspace_id: workspace.id.clone(),
                 cwd: dir.path().display().to_string(),
+                project_id: None,
+                project_identity: None,
                 command: "sleep 300".into(),
                 env: Vec::new(),
                 cols: 80,
@@ -4057,6 +4063,8 @@ async fn legacy_create_workspace(
         .send(&Frame::CreateWorkspace {
             root: root.display().to_string(),
             name: name.map(str::to_owned),
+            project_id: None,
+            project_identity: None,
             env: vec![("ADE_COMBINED".to_owned(), COMBINED_ENV.to_owned())],
             cols: Some(120),
             rows: Some(40),
@@ -4080,6 +4088,8 @@ async fn legacy_create_session(
         .send(&Frame::CreateSession {
             workspace_id: workspace_id.to_owned(),
             cwd: cwd.display().to_string(),
+            project_id: None,
+            project_identity: None,
             command: String::new(),
             env: Vec::new(),
             cols: 90,
@@ -4237,6 +4247,7 @@ fn a_generation_two_create_session_makes_the_workspace_it_names() {
                 .expect("the auto-created record");
             assert_eq!(workspace.name, expected_name);
             assert_eq!(workspace.project_root, cwd.display().to_string());
+            assert_eq!(workspace.project_scope_rev, 0);
             assert_eq!(
                 workspace.layout.terminal_sessions(),
                 vec![session.id.clone()],
@@ -4503,6 +4514,8 @@ fn the_requesting_connection_learns_the_auto_created_layout() {
             .send(&Frame::CreateSession {
                 workspace_id: "ws-self-taught".to_owned(),
                 cwd: cwd.display().to_string(),
+                project_id: None,
+                project_identity: None,
                 command: String::new(),
                 env: Vec::new(),
                 cols: 90,

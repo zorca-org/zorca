@@ -583,6 +583,8 @@ pub struct WorkspaceRequest {
     pub root: String,
     /// `None` means the last component of `root`.
     pub name: Option<String>,
+    pub project_id: Option<String>,
+    pub project_identity: Option<String>,
     /// The id to record this workspace under. `None` mints one — the only
     /// thing a client ever gets. Set only by the generation-2 `create_session`
     /// auto-create, which must keep the id the old client already named.
@@ -612,7 +614,10 @@ fn new_workspace(request: WorkspaceRequest) -> WorkspaceInfo {
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| default_workspace_name(&request.root)),
+        project_id: request.project_id,
+        project_identity: request.project_identity,
         project_root: request.root,
+        project_scope_rev: 0,
         created_at: now_unix(),
         // No document yet, and revision zero so the client's first layout
         // write — which must exceed the stored rev — is 1.
@@ -1049,7 +1054,10 @@ impl SessionTable {
                     WorkspaceInfo {
                         id: workspace_id.clone(),
                         name,
+                        project_id: None,
+                        project_identity: None,
                         project_root: persisted.cwd.clone(),
+                        project_scope_rev: 0,
                         created_at: persisted.created_at,
                         layout_rev: 1,
                         layout: LayoutDoc::single_terminal(id.clone()),
@@ -1861,6 +1869,93 @@ impl SessionTable {
         if !workspaces.contains_key(id) {
             return Err(TableError::not_found(format!(
                 "workspace {id} was killed while it was being renamed"
+            )));
+        }
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .publish(&Frame::Workspace {
+                workspace: workspace.clone(),
+                sessions: workspace_sessions.clone(),
+                persisted: self.persisted(),
+                request_id: None,
+            });
+        Ok((workspace, workspace_sessions))
+    }
+
+    pub fn update_workspace_project(
+        &self,
+        id: &str,
+        project_id: &str,
+        project_identity: &str,
+        project_root: Option<&str>,
+        minimum_scope_rev: Option<u64>,
+    ) -> TableResult<(WorkspaceInfo, Vec<SessionInfo>)> {
+        if project_id.trim().is_empty()
+            || project_identity.trim().is_empty()
+            || project_root.is_some_and(|root| root.trim().is_empty())
+        {
+            return Err(TableError::invalid_argument(
+                "workspace project scope cannot contain empty values",
+            ));
+        }
+
+        let _persisting = self.persisting.lock().unwrap_or_else(|e| e.into_inner());
+        let (workspace, workspace_sessions, previous) = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+            let workspace = workspaces
+                .get_mut(id)
+                .ok_or_else(|| TableError::not_found(format!("no such workspace {id}")))?;
+            let minimum_scope_rev = minimum_scope_rev.unwrap_or_default();
+            let fields_changed = workspace.project_id.as_deref() != Some(project_id)
+                || workspace.project_identity.as_deref() != Some(project_identity)
+                || project_root.is_some_and(|root| workspace.project_root != root);
+            if !fields_changed && workspace.project_scope_rev >= minimum_scope_rev {
+                return Ok((workspace.clone(), workspace_sessions_in(&sessions, id)));
+            }
+            let next_revision = workspace
+                .project_scope_rev
+                .max(minimum_scope_rev)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    TableError::internal(format!(
+                        "project scope revision overflowed for workspace {id}"
+                    ))
+                })?;
+            let previous = (
+                workspace.project_id.replace(project_id.to_owned()),
+                workspace
+                    .project_identity
+                    .replace(project_identity.to_owned()),
+                project_root
+                    .map(|root| std::mem::replace(&mut workspace.project_root, root.to_owned())),
+                std::mem::replace(&mut workspace.project_scope_rev, next_revision),
+            );
+            let workspace = workspace.clone();
+            let workspace_sessions = workspace_sessions_in(&sessions, id);
+            (workspace, workspace_sessions, previous)
+        };
+        if let Err(err) = self.persist_serialized() {
+            let mut workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(workspace) = workspaces.get_mut(id) {
+                workspace.project_id = previous.0;
+                workspace.project_identity = previous.1;
+                if let Some(project_root) = previous.2 {
+                    workspace.project_root = project_root;
+                }
+                workspace.project_scope_rev = previous.3;
+            }
+            return Err(TableError::persist_failed(format!(
+                "could not record the project scope of workspace {id}: {err:#}"
+            )));
+        }
+        #[cfg(test)]
+        self.test_gate();
+        let workspaces = self.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+        if !workspaces.contains_key(id) {
+            return Err(TableError::not_found(format!(
+                "workspace {id} was killed while its project scope was being updated"
             )));
         }
         self.events
@@ -3155,7 +3250,10 @@ mod tests {
         let workspace = WorkspaceInfo {
             id: session.workspace_id.clone(),
             name: "one".to_owned(),
+            project_id: None,
+            project_identity: None,
             project_root: session.cwd.clone(),
+            project_scope_rev: 0,
             created_at: 1,
             layout_rev: 1,
             layout: LayoutDoc::single_terminal(session.id.clone()),
@@ -3188,7 +3286,10 @@ mod tests {
         let owner = WorkspaceInfo {
             id: "workspace-b".to_owned(),
             name: "b".to_owned(),
+            project_id: None,
+            project_identity: None,
             project_root: "/tmp/b".to_owned(),
+            project_scope_rev: 0,
             created_at: 1,
             layout_rev: 1,
             layout: LayoutDoc::single_terminal(session.id.clone()),
@@ -3196,7 +3297,10 @@ mod tests {
         let borrower = WorkspaceInfo {
             id: "workspace-a".to_owned(),
             name: "a".to_owned(),
+            project_id: None,
+            project_identity: None,
             project_root: "/tmp/a".to_owned(),
+            project_scope_rev: 0,
             created_at: 2,
             layout_rev: 4,
             layout: LayoutDoc::single_terminal(session.id.clone()),
@@ -3461,6 +3565,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_project_scope_that_cannot_be_recorded_restores_its_root_too() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, _) = seeded_table(dir.path());
+        let (queue, _outbound) = subscribed(&table);
+        let before = table.list_workspaces();
+        wedge_the_ledger(dir.path());
+
+        let error = table
+            .update_workspace_project(
+                "workspace-1",
+                "viral-studio",
+                "/repos/viral-studio",
+                Some("/repos/viral-studio/worktree"),
+                None,
+            )
+            .expect_err("a project scope the ledger refused must not ack success");
+
+        assert_eq!(error.code, error_code::PERSIST_FAILED);
+        assert_eq!(table.list_workspaces(), before);
+        assert!(published(&queue).is_empty());
+    }
+
     /// §8.3 class A: the child is already dead, so `removed` goes out whatever
     /// the disk says — withholding it would hang an attached terminal — and the
     /// ack is the only thing that can carry the failure.
@@ -3527,6 +3654,8 @@ mod tests {
         super::WorkspaceRequest {
             root: "/tmp/proj".to_owned(),
             name: Some(name.to_owned()),
+            project_id: None,
+            project_identity: None,
             id: None,
         }
     }
@@ -3546,6 +3675,7 @@ mod tests {
             .expect("the empty create");
 
         assert_eq!(workspace.name, "proj");
+        assert_eq!(workspace.project_scope_rev, 0);
         assert!(workspace.layout.terminal_sessions().is_empty());
         // Zero, so the client's first layout write is revision 1.
         assert_eq!(workspace.layout_rev, 0);
@@ -3568,6 +3698,100 @@ mod tests {
             vec![workspace],
             "the record was announced before it was on disk"
         );
+    }
+
+    #[test]
+    fn project_scope_revision_advances_and_survives_reload() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let table = empty_table(dir.path());
+        let workspace = table
+            .create_workspace(workspace_request("seedance2-5"))
+            .expect("workspace");
+        assert_eq!(workspace.project_scope_rev, 0);
+
+        let refused = table
+            .update_workspace_project(
+                &workspace.id,
+                "viral-studio",
+                "/home/user/Code/viral-studio",
+                Some(" \t"),
+                None,
+            )
+            .expect_err("an empty replacement root must be refused");
+        assert_eq!(refused.code, error_code::INVALID_ARGUMENT);
+        assert_eq!(table.list_workspaces(), vec![workspace.clone()]);
+
+        let (updated, _) = table
+            .update_workspace_project(
+                &workspace.id,
+                " viral-studio ",
+                "/home/user/Code/viral-studio ",
+                Some(" /home/user/Code/worktrees/viral-studio/seedance2-5 "),
+                None,
+            )
+            .expect("project identity update");
+        assert_eq!(updated.name, "seedance2-5");
+        assert_eq!(updated.project_id.as_deref(), Some(" viral-studio "));
+        assert_eq!(
+            updated.project_identity.as_deref(),
+            Some("/home/user/Code/viral-studio ")
+        );
+        assert_eq!(
+            updated.project_root,
+            " /home/user/Code/worktrees/viral-studio/seedance2-5 "
+        );
+        assert_eq!(updated.project_scope_rev, 1);
+
+        let (updated, _) = table
+            .update_workspace_project(
+                &workspace.id,
+                "viral-studio",
+                "/home/user/Code/viral-studio",
+                Some(" /home/user/Code/worktrees/viral-studio/seedance2-5 "),
+                None,
+            )
+            .expect("project metadata update at the same root");
+        assert_eq!(updated.project_scope_rev, 2);
+
+        let (updated, _) = table
+            .update_workspace_project(
+                &workspace.id,
+                "viral-studio",
+                "/home/user/Code/viral-studio",
+                Some(" /home/user/Code/worktrees/viral-studio/seedance2-5 "),
+                None,
+            )
+            .expect("an identical project scope update");
+        assert_eq!(updated.project_scope_rev, 2);
+
+        let (updated, _) = table
+            .update_workspace_project(
+                &workspace.id,
+                "viral-studio",
+                "/home/user/Code/viral-studio",
+                Some(" /home/user/Code/worktrees/viral-studio/seedance2-5 "),
+                Some(5),
+            )
+            .expect("advancing past the client's revision");
+        assert_eq!(updated.project_scope_rev, 6);
+
+        let (updated, _) = table
+            .update_workspace_project(
+                &workspace.id,
+                "viral-studio",
+                "/home/user/Code/viral-studio",
+                Some(" /home/user/Code/worktrees/viral-studio/seedance2-5 "),
+                Some(5),
+            )
+            .expect("an already reconciled project scope update");
+        assert_eq!(updated.project_scope_rev, 6);
+
+        drop(table);
+        let restored = empty_table(dir.path())
+            .open_workspace(&workspace.id)
+            .expect("restored workspace")
+            .0;
+        assert_eq!(restored, updated);
     }
 
     // --------------------------------- the generation-2 auto-create's parts ---
@@ -3594,7 +3818,10 @@ mod tests {
                 &[WorkspaceInfo {
                     id: "ws-2".to_owned(),
                     name: "proj".to_owned(),
+                    project_id: None,
+                    project_identity: None,
                     project_root: "/tmp/proj".to_owned(),
+                    project_scope_rev: 0,
                     created_at: 1,
                     layout_rev: 0,
                     layout: LayoutDoc::empty(),
@@ -3616,6 +3843,8 @@ mod tests {
         let named = || super::WorkspaceRequest {
             root: "/tmp/proj".to_owned(),
             name: Some("proj".to_owned()),
+            project_id: None,
+            project_identity: None,
             id: Some("ws-named".to_owned()),
         };
 

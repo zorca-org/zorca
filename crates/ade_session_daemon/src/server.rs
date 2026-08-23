@@ -583,6 +583,7 @@ fn touches_state(frame: &Frame) -> bool {
             | Frame::CreateWorkspace { .. }
             | Frame::UpdateLayout { .. }
             | Frame::RenameWorkspace { .. }
+            | Frame::UpdateWorkspaceProject { .. }
             | Frame::KillWorkspace { .. }
     )
 }
@@ -969,6 +970,8 @@ async fn combined_create(
     subscriber: SubscriberId,
     root: String,
     name: Option<String>,
+    project_id: Option<String>,
+    project_identity: Option<String>,
     env: Vec<(String, String)>,
     cols: Option<u16>,
     rows: Option<u16>,
@@ -985,6 +988,8 @@ async fn combined_create(
     let workspace = match sessions.create_workspace(WorkspaceRequest {
         root: root.clone(),
         name,
+        project_id,
+        project_identity,
         id: None,
     }) {
         Ok(workspace) => workspace,
@@ -1087,6 +1092,8 @@ async fn handle_frame(
         Frame::CreateSession {
             workspace_id,
             cwd,
+            project_id,
+            project_identity,
             command,
             env,
             cols,
@@ -1111,6 +1118,8 @@ async fn handle_frame(
                 match sessions.ensure_workspace(WorkspaceRequest {
                     root: cwd.clone(),
                     name: (!instance_label.is_empty()).then(|| instance_label.clone()),
+                    project_id,
+                    project_identity,
                     id: (!workspace_id.is_empty()).then(|| workspace_id.clone()),
                 }) {
                     Ok((workspace, created_here)) => Some((workspace.id, created_here)),
@@ -1185,6 +1194,8 @@ async fn handle_frame(
         Frame::CreateWorkspace {
             root,
             name,
+            project_id,
+            project_identity,
             env,
             cols,
             rows,
@@ -1193,7 +1204,17 @@ async fn handle_frame(
             if generation == LEGACY_GENERATION {
                 return Some(
                     combined_create(
-                        sessions, subscriber, root, name, env, cols, rows, persisted, request_id,
+                        sessions,
+                        subscriber,
+                        root,
+                        name,
+                        project_id,
+                        project_identity,
+                        env,
+                        cols,
+                        rows,
+                        persisted,
+                        request_id,
                     )
                     .await,
                 );
@@ -1203,6 +1224,8 @@ async fn handle_frame(
             let request = WorkspaceRequest {
                 root,
                 name,
+                project_id,
+                project_identity,
                 id: None,
             };
             Some(match sessions.create_workspace(request) {
@@ -1262,6 +1285,30 @@ async fn handle_frame(
             },
             Err(err) => refusal(err, None, Some(workspace_id), request_id),
         }),
+        Frame::UpdateWorkspaceProject {
+            workspace_id,
+            project_id,
+            project_identity,
+            project_root,
+            minimum_scope_rev,
+            request_id,
+        } => Some(
+            match sessions.update_workspace_project(
+                &workspace_id,
+                &project_id,
+                &project_identity,
+                project_root.as_deref(),
+                minimum_scope_rev,
+            ) {
+                Ok((workspace, sessions)) => Frame::Workspace {
+                    workspace,
+                    sessions,
+                    persisted,
+                    request_id,
+                },
+                Err(err) => refusal(err, None, Some(workspace_id), request_id),
+            },
+        ),
         Frame::KillWorkspace {
             workspace_id,
             request_id,

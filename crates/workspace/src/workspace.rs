@@ -2286,6 +2286,11 @@ impl Workspace {
             .unwrap_or_else(|| self.project.read(cx).project_group_key(cx))
     }
 
+    pub fn project_group_identity_is_known(&self, cx: &App) -> bool {
+        self.project
+            .read_with(cx, multi_workspace::project_group_identity_is_known)
+    }
+
     pub(crate) fn set_project_group_key_hint(&mut self, key: Option<ProjectGroupKey>) {
         self.project_group_key_hint = key;
     }
