@@ -851,12 +851,15 @@ async fn pump_input(
 ) {
     let mut stdin = Unblock::new(std::io::stdin());
     let mut buffer = vec![0u8; INPUT_CHUNK_BYTES];
+    let mut focus_in = FocusInDetector::default();
     loop {
         let read = match stdin.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        if !claim_focus(&outbound, &session_id, view_id.as_deref(), &can_focus).await {
+        if focus_in.advance(&buffer[..read])
+            && !claim_focus(&outbound, &session_id, view_id.as_deref(), &can_focus).await
+        {
             break;
         }
         let frame = Frame::Write {
@@ -866,6 +869,27 @@ async fn pump_input(
         if outbound.send(QueuedFrame::Persistent(frame)).await.is_err() {
             break;
         }
+    }
+}
+
+#[derive(Default)]
+struct FocusInDetector(u8);
+
+impl FocusInDetector {
+    fn advance(&mut self, bytes: &[u8]) -> bool {
+        let mut found = false;
+        for &byte in bytes {
+            self.0 = match (self.0, byte) {
+                (_, b'\x1b') => 1,
+                (1, b'[') => 2,
+                (2, b'I') => {
+                    found = true;
+                    0
+                }
+                _ => 0,
+            };
+        }
+        found
     }
 }
 
@@ -1439,6 +1463,15 @@ mod handshake_tests {
                 other => panic!("expected a focus claim, got {:?}", other.frame()),
             }
         });
+    }
+
+    #[test]
+    fn focus_in_is_detected_across_reads() {
+        let mut detector = FocusInDetector::default();
+        assert!(!detector.advance(b"terminal reply\x1b"));
+        assert!(!detector.advance(b"["));
+        assert!(detector.advance(b"Ityped input"));
+        assert!(!detector.advance(b"\x1b[0n"));
     }
 
     /// A daemon that reports `generation` and `instance_id`, then records every
