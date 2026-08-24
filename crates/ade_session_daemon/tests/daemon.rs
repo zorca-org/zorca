@@ -3152,6 +3152,142 @@ fn a_focus_change_repaints_the_new_owner() {
     });
 }
 
+#[test]
+fn an_equal_size_focus_change_still_repaints_the_new_owner() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut sibling = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut sibling, dir.path()).await;
+
+        let mut viewer = client(server.socket_path()).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sending the viewer size");
+        viewer
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-equal".to_owned()),
+                request_id: Some(33),
+            })
+            .await
+            .expect("attaching the viewer");
+        let _ = recv(&mut viewer, "Replay").await;
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-equal".to_owned(),
+                hover: true,
+            })
+            .await
+            .expect("focusing the equal-size viewer");
+        match recv(&mut viewer, "the equal-size repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+            }
+            other => panic!("expected focused repaint, got {other:?}"),
+        }
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-equal".to_owned(),
+                hover: true,
+            })
+            .await
+            .expect("hovering the owning viewer again");
+        assert!(matches!(
+            recv(&mut viewer, "the repeated hover repaint").await,
+            Frame::Output { .. }
+        ));
+    });
+}
+
+#[test]
+fn typing_reclaims_the_writers_view_size() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut control = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut control, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut control,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+
+        let mut short = client(server.socket_path()).await;
+        short
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending the short size");
+        short
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-short".to_owned()),
+                request_id: Some(34),
+            })
+            .await
+            .expect("attaching the short view");
+        let _ = recv(&mut short, "short replay").await;
+
+        let mut tall = client(server.socket_path()).await;
+        tall.send(&Frame::Resize {
+            session_id: session.id.clone(),
+            cols: 80,
+            rows: 24,
+        })
+        .await
+        .expect("sending the tall size");
+        tall.send(&Frame::Attach {
+            session_id: session.id.clone(),
+            view_id: Some("view-tall".to_owned()),
+            request_id: Some(35),
+        })
+        .await
+        .expect("attaching the tall view");
+        let _ = recv(&mut tall, "tall replay").await;
+
+        short
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-short".to_owned(),
+                hover: false,
+            })
+            .await
+            .expect("focusing the short view");
+        let _ = recv(&mut short, "short focus repaint").await;
+
+        tall.send(&Frame::Write {
+            session_id: session.id.clone(),
+            bytes: b"typed\n".to_vec(),
+        })
+        .await
+        .expect("typing in the tall view");
+        match recv(&mut tall, "typing focus repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                assert!(contains(&bytes, b"\x1b[12;1H"), "{bytes:?}");
+            }
+            other => panic!("expected typing focus repaint, got {other:?}"),
+        }
+    });
+}
+
 /// A full-screen app is replayed as the alternate screen, and leaving it puts
 /// the primary screen back.
 ///

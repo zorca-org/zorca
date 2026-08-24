@@ -2161,6 +2161,21 @@ impl WorkspaceLifecycleService {
             .attach_session(session_id, workspace.daemon_id.as_deref())
     }
 
+    pub fn focus_session(
+        &self,
+        workspace: &AdeWorkspace,
+        session_id: &str,
+        view_id: &str,
+        hover: bool,
+    ) -> Result<()> {
+        self.backend_for(workspace)?.focus_session(
+            session_id,
+            view_id,
+            hover,
+            workspace.daemon_id.as_deref(),
+        )
+    }
+
     /// The workspace's layout as the backend holds it, with the revision that
     /// guards the next write.
     ///

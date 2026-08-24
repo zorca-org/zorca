@@ -478,12 +478,7 @@ where
     let (outbound, queued) = smol::channel::bounded::<QueuedFrame>(OUTBOUND_QUEUE_FRAMES);
     let can_focus = Arc::new(AtomicBool::new(can_focus));
     let view_id = config.view_id.clone();
-    let input = smol::spawn(pump_input(
-        outbound.clone(),
-        config.session_id.clone(),
-        view_id.clone(),
-        can_focus.clone(),
-    ));
+    let input = smol::spawn(pump_input(outbound.clone(), config.session_id.clone()));
     let resize = raw.is_some().then(|| {
         smol::spawn(pump_resize(
             outbound.clone(),
@@ -843,34 +838,14 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Local keystrokes → [`Frame::Write`]. Ends on EOF, which leaves the client
 /// running: a closed stdin is not a closed session.
-async fn pump_input(
-    outbound: Sender<QueuedFrame>,
-    session_id: SessionId,
-    view_id: Option<String>,
-    can_focus: Arc<AtomicBool>,
-) {
+async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     let mut stdin = Unblock::new(std::io::stdin());
     let mut buffer = vec![0u8; INPUT_CHUNK_BYTES];
-    let mut interaction = TerminalInteractionDetector::default();
     loop {
         let read = match stdin.read(&mut buffer).await {
             Ok(0) | Err(_) => break,
             Ok(read) => read,
         };
-        if let Some(hover) = interaction.advance(&buffer[..read]) {
-            if !claim_focus(
-                &outbound,
-                &session_id,
-                view_id.as_deref(),
-                &can_focus,
-                hover,
-                hover.then(initial_terminal_size).flatten(),
-            )
-            .await
-            {
-                break;
-            }
-        }
         let frame = Frame::Write {
             session_id: session_id.clone(),
             bytes: buffer[..read].to_vec(),
@@ -878,34 +853,6 @@ async fn pump_input(
         if outbound.send(QueuedFrame::Persistent(frame)).await.is_err() {
             break;
         }
-    }
-}
-
-#[derive(Default)]
-struct TerminalInteractionDetector(u8);
-
-impl TerminalInteractionDetector {
-    /// `Some(false)` for focus-in, `Some(true)` for an SGR mouse report.
-    fn advance(&mut self, bytes: &[u8]) -> Option<bool> {
-        let mut found = None;
-        for &byte in bytes {
-            self.0 = match (self.0, byte) {
-                (_, b'\x1b') => 1,
-                (1, b'[') => 2,
-                (2, b'I') => {
-                    found = Some(false);
-                    0
-                }
-                (2, b'<') => 3,
-                (3, b'M' | b'm') => {
-                    found.get_or_insert(true);
-                    0
-                }
-                (3, b'0'..=b'9' | b';') => 3,
-                _ => 0,
-            };
-        }
-        found
     }
 }
 
@@ -1026,7 +973,7 @@ async fn send_size(
     if is_zed_bootstrap_size((cols, rows)) {
         return true;
     }
-    if claim && !claim_focus(outbound, session_id, view_id, can_focus, false, None).await {
+    if claim && !claim_focus(outbound, session_id, view_id, can_focus).await {
         return false;
     }
     outbound
@@ -1044,8 +991,6 @@ async fn claim_focus(
     session_id: &SessionId,
     view_id: Option<&str>,
     can_focus: &AtomicBool,
-    hover: bool,
-    resize_to: Option<(u16, u16)>,
 ) -> bool {
     if !can_focus.load(Ordering::SeqCst) {
         return true;
@@ -1053,23 +998,11 @@ async fn claim_focus(
     let Some(view_id) = view_id else {
         return true;
     };
-    if let Some((cols, rows)) = resize_to
-        && outbound
-            .send(QueuedFrame::Persistent(Frame::Resize {
-                session_id: session_id.clone(),
-                cols,
-                rows,
-            }))
-            .await
-            .is_err()
-    {
-        return false;
-    }
     outbound
         .send(QueuedFrame::Persistent(Frame::FocusSession {
             session_id: session_id.clone(),
             view_id: view_id.to_owned(),
-            hover,
+            hover: false,
         }))
         .await
         .is_ok()
@@ -1468,31 +1401,18 @@ mod handshake_tests {
     }
 
     #[test]
-    fn a_capable_hover_resizes_then_claims_focus() {
+    fn a_capable_resize_claims_focus() {
         smol::block_on(async {
-            let (outbound, queued) = smol::channel::bounded(2);
+            let (outbound, queued) = smol::channel::bounded(1);
             assert!(
                 claim_focus(
                     &outbound,
                     &SessionId::new("s-1"),
                     Some("view-1"),
                     &AtomicBool::new(true),
-                    true,
-                    Some((120, 40)),
                 )
                 .await
             );
-            match queued.recv().await.expect("the resize") {
-                QueuedFrame::Persistent(Frame::Resize {
-                    session_id,
-                    cols,
-                    rows,
-                }) => {
-                    assert_eq!(session_id, SessionId::new("s-1"));
-                    assert_eq!((cols, rows), (120, 40));
-                }
-                other => panic!("expected a resize, got {:?}", other.frame()),
-            }
             match queued.recv().await.expect("the focus claim") {
                 QueuedFrame::Persistent(Frame::FocusSession {
                     session_id,
@@ -1501,21 +1421,11 @@ mod handshake_tests {
                 }) => {
                     assert_eq!(session_id, SessionId::new("s-1"));
                     assert_eq!(view_id, "view-1");
-                    assert!(hover);
+                    assert!(!hover);
                 }
                 other => panic!("expected a focus claim, got {:?}", other.frame()),
             }
         });
-    }
-
-    #[test]
-    fn focus_and_hover_are_detected_across_reads() {
-        let mut detector = TerminalInteractionDetector::default();
-        assert_eq!(detector.advance(b"terminal reply\x1b"), None);
-        assert_eq!(detector.advance(b"["), None);
-        assert_eq!(detector.advance(b"Ityped input"), Some(false));
-        assert_eq!(detector.advance(b"\x1b[0n\x1b[<35;"), None);
-        assert_eq!(detector.advance(b"42;7M"), Some(true));
     }
 
     /// A daemon that reports `generation` and `instance_id`, then records every

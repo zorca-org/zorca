@@ -542,6 +542,17 @@ pub trait SessionBackend: Send + Sync {
         bail!("this session backend has no sessions of its own to attach to")
     }
 
+    /// Prefer this terminal view's size for the shared session PTY.
+    fn focus_session(
+        &self,
+        _session_id: &str,
+        _view_id: &str,
+        _hover: bool,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The workspace's stored layout and the revision guarding the next write.
     ///
     /// Errors — including "no such workspace" — mean the caller has nothing to

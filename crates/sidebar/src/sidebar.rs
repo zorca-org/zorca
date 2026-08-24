@@ -4899,6 +4899,8 @@ impl Sidebar {
                     .any(|state| state.matches(key, context.host_key.as_deref()))
             })
         });
+        let daemon_host =
+            daemon_row_host(context.kind, context.ade_host.as_deref()).map(str::to_owned);
 
         move |window, cx| {
             let context = context.clone();
@@ -4906,6 +4908,7 @@ impl Sidebar {
             let multi_workspace = multi_workspace.clone();
             let group_names = group_names.clone();
             let host_key = context.host_key.clone();
+            let daemon_host = daemon_host.clone();
 
             ContextMenu::build(window, cx, move |menu, _window, _cx| {
                 use workspace_manager::RowKind;
@@ -4975,6 +4978,17 @@ impl Sidebar {
                             ));
                         }
                     }
+                });
+
+                let menu = menu.when_some(daemon_host, |menu, host| {
+                    let sidebar = sidebar.clone();
+                    menu.entry("Upgrade Host Daemon", None, move |_window, cx| {
+                        sidebar
+                            .update(cx, |sidebar, cx| {
+                                sidebar.upgrade_host_daemon(host.clone(), cx);
+                            })
+                            .ok();
+                    })
                 });
 
                 // One definition, shared with the center pane's "New…" menu.

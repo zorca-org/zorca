@@ -2254,8 +2254,13 @@ impl SessionTable {
     ///
     /// **The lookup is the whole critical section and the write happens after
     /// it**: nothing that can block is done under the table lock.
-    pub async fn write(&self, id: &SessionId, bytes: &[u8]) -> TableResult<()> {
-        let target = {
+    pub async fn write(
+        &self,
+        id: &SessionId,
+        subscriber: SubscriberId,
+        bytes: &[u8],
+    ) -> TableResult<()> {
+        let (target, view_id) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2271,8 +2276,16 @@ impl SessionTable {
                     "session {id} has exited"
                 )));
             }
-            live.writer.clone()
+            let view_id = session
+                .view_ids
+                .iter()
+                .find(|(owner, _)| *owner == subscriber)
+                .map(|(_, view_id)| view_id.clone());
+            (live.writer.clone(), view_id)
         };
+        if let Some(view_id) = view_id {
+            self.focus(id, &view_id, false).await?;
+        }
         let mut writer = target.lock().unwrap_or_else(|e| e.into_inner());
         writer
             .write_all(bytes)
@@ -2349,7 +2362,7 @@ impl SessionTable {
     /// Same lock discipline as [`Self::resize`], and for the same reason: the
     /// decision is made under the table lock, the pty call is made after it.
     pub async fn focus(&self, id: &SessionId, view_id: &str, hover: bool) -> TableResult<()> {
-        let (effective, repaint) = {
+        let (resize, repaint) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2388,12 +2401,15 @@ impl SessionTable {
             let Some(effective) = effective else {
                 return Ok(());
             };
-            if effective == (session.cols, session.rows) {
-                return Ok(());
-            }
-            (effective, owner.map(|owner| (session.hub.clone(), owner)))
+            let size_changed = effective != (session.cols, session.rows);
+            let repaint = (hover || !already || size_changed)
+                .then(|| owner.map(|owner| (session.hub.clone(), owner)))
+                .flatten();
+            (size_changed.then_some(effective), repaint)
         };
-        self.apply_size(id, effective.0, effective.1).await?;
+        if let Some((cols, rows)) = resize {
+            self.apply_size(id, cols, rows).await?;
+        }
         if let Some((hub, owner)) = repaint {
             hub.lock()
                 .unwrap_or_else(|e| e.into_inner())

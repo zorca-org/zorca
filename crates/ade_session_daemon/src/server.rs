@@ -1357,10 +1357,12 @@ async fn handle_frame(
         // so their failures go out as the legal *unsolicited* error frame: no
         // rid to echo, but a session named, which is what makes it routable to
         // diagnostics rather than to a pending request (§2).
-        Frame::Write { session_id, bytes } => match sessions.write(&session_id, &bytes).await {
-            Ok(()) => None,
-            Err(err) => Some(refusal(err, Some(session_id), None, None)),
-        },
+        Frame::Write { session_id, bytes } => {
+            match sessions.write(&session_id, subscriber, &bytes).await {
+                Ok(()) => None,
+                Err(err) => Some(refusal(err, Some(session_id), None, None)),
+            }
+        }
         Frame::Resize {
             session_id,
             cols,

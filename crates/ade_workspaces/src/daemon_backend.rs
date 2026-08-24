@@ -186,6 +186,8 @@ const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// the disallowed `smol::Timer`), not a different number here.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
+const VIEW_GENERATION: u32 = 3;
+
 /// What an on-demand "upgrade host daemon" actually did.
 ///
 /// Two answers rather than a bool, because "nothing happened" is not a failure
@@ -222,6 +224,8 @@ pub struct DaemonBackend {
     /// gone. Sessions lost that way come back as exited `(lost)` rows rather
     /// than being quietly recreated.
     connection: Mutex<Option<Control>>,
+    /// Orders short-lived generation-3 focus hints.
+    focus_lock: Mutex<()>,
     next_request_id: AtomicU64,
     /// [`ANSWER_TIMEOUT`], except in tests that would otherwise have to sit
     /// through it to reach the failure they are about.
@@ -269,6 +273,7 @@ impl DaemonBackend {
         Self {
             endpoint,
             connection: Mutex::new(None),
+            focus_lock: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
             answer_timeout: ANSWER_TIMEOUT,
         }
@@ -954,6 +959,34 @@ impl SessionBackend for DaemonBackend {
         expected_daemon_id: Option<&str>,
     ) -> Result<Vec<String>> {
         Ok(self.session_argv(&proto::SessionId::new(session_id), expected_daemon_id))
+    }
+
+    fn focus_session(
+        &self,
+        session_id: &str,
+        view_id: &str,
+        hover: bool,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        let _guard = self.focus_lock.lock().unwrap_or_else(|e| e.into_inner());
+        smol::block_on(async {
+            let (mut connection, ack) =
+                handshaken(|| self.endpoint.open(), Hello::current()).await?;
+            if !identity_admits(expected_daemon_id, ack.instance_id.as_deref()) {
+                bail!("the terminal view belongs to another daemon");
+            }
+            if ack.generation < VIEW_GENERATION {
+                return Ok(());
+            }
+            connection
+                .send(&Frame::FocusSession {
+                    session_id: proto::SessionId::new(session_id),
+                    view_id: view_id.to_owned(),
+                    hover,
+                })
+                .await
+        })
+        .with_context(|| format!("focusing view {view_id} on daemon session {session_id}"))
     }
 
     fn open_workspace(
@@ -1913,7 +1946,7 @@ impl Endpoint {
         } else {
             None
         };
-        let (connection, ack) = handshaken(|| self.open()).await?;
+        let (connection, ack) = handshaken(|| self.open(), control_hello()).await?;
         // Shared for observation only; requests use `Control::instance_id`.
         *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id.clone();
         if let Some((link, ensure_line)) = freshness_probe {
@@ -2009,7 +2042,7 @@ impl Endpoint {
 /// diagnosed. Anything else is an *answer*: a generation outside this client's
 /// range, an explicit error frame, a spawn that failed. Retrying an answer
 /// would just get it twice.
-async fn handshaken<C, F>(open: C) -> Result<(DaemonConnection, proto::HelloAck)>
+async fn handshaken<C, F>(open: C, hello: Hello) -> Result<(DaemonConnection, proto::HelloAck)>
 where
     C: Fn() -> F,
     F: Future<Output = Result<DaemonConnection>>,
@@ -2017,7 +2050,7 @@ where
     let mut retried = false;
     loop {
         let mut connection = open().await?;
-        let error = match connection.handshake().await {
+        let error = match connection.handshake(hello.clone()).await {
             Ok(ack) => return Ok((connection, ack)),
             Err(error) => error,
         };
@@ -2692,11 +2725,14 @@ impl HostLink {
             // a pre-cut daemon is exactly the host an upgrade is aimed at, so
             // the forced path treats the diagnosis as its cue to act rather
             // than a sentence to report.
-            let mut connection = match handshaken(|| async {
-                Ok(DaemonConnection::Proxied(
-                    ChildConnection::spawn(&argv).context("spawning the shutdown channel")?,
-                ))
-            })
+            let mut connection = match handshaken(
+                || async {
+                    Ok(DaemonConnection::Proxied(
+                        ChildConnection::spawn(&argv).context("spawning the shutdown channel")?,
+                    ))
+                },
+                control_hello(),
+            )
             .await
             {
                 Ok((connection, _ack)) => connection,
@@ -2910,17 +2946,17 @@ enum DaemonConnection {
     Tcp(ade_session::Connection<smol::net::TcpStream>),
 }
 
+fn control_hello() -> Hello {
+    // Control operations still use generation-2 create semantics. View focus
+    // uses its own short-lived generation-3 connection.
+    Hello {
+        max_generation: proto::MIN_GENERATION,
+        ..Hello::current()
+    }
+}
+
 impl DaemonConnection {
-    async fn handshake(&mut self) -> Result<proto::HelloAck> {
-        // Pinned at generation 2: this client still implements gen-2 semantics
-        // (auto-created workspaces, the combined create), while the crate can
-        // already speak 3. Announcing 3 would have the daemon hold it to the
-        // gen-3 meanings. The registry client that speaks 3 is the next commit,
-        // and it removes this pin.
-        let hello = Hello {
-            max_generation: proto::MIN_GENERATION,
-            ..Hello::current()
-        };
+    async fn handshake(&mut self, hello: Hello) -> Result<proto::HelloAck> {
         let ack = match self {
             Self::Proxied(connection) => connection.handshake(hello.clone()).await,
             #[cfg(unix)]
@@ -3440,6 +3476,7 @@ mod control_connection {
         /// What proves a frame was *not* sent: a later request that does arrive
         /// is the first thing the channel yields.
         Watched(Option<String>, std::sync::mpsc::Sender<Frame>),
+        WatchedAtGeneration(u32, std::sync::mpsc::Sender<Frame>),
     }
 
     fn ack() -> proto::HelloAck {
@@ -3678,6 +3715,29 @@ mod control_connection {
                             }
                             continue;
                         }
+                        if let Script::WatchedAtGeneration(generation, seen) = script {
+                            let mut hello_ack = ack();
+                            hello_ack.generation = generation;
+                            daemon
+                                .send(&Frame::HelloAck(hello_ack))
+                                .await
+                                .expect("sending the ack");
+                            while let Ok(frame) = daemon.recv().await {
+                                if let Frame::ListSessions { request_id } = &frame {
+                                    daemon
+                                        .send(&Frame::SessionList {
+                                            sessions: Vec::new(),
+                                            request_id: *request_id,
+                                        })
+                                        .await
+                                        .expect("answering the listing");
+                                }
+                                if seen.send(frame).is_err() {
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         let mut hello_ack = ack();
                         let (quiet_for, frames, repeated) = match script {
                             Script::EofDuringHandshake => continue,
@@ -3691,6 +3751,7 @@ mod control_connection {
                             Script::LegacySessionList(_) => unreachable!(),
                             Script::SubscriptionSnapshot { .. } => unreachable!(),
                             Script::Watched(..) => unreachable!(),
+                            Script::WatchedAtGeneration(..) => unreachable!(),
                         };
                         daemon
                             .send(&Frame::HelloAck(hello_ack))
@@ -4143,6 +4204,41 @@ mod control_connection {
     fn instance_id_is_none_before_any_handshake() {
         let backend = scripted_daemon(Vec::new());
         assert_eq!(backend.instance_id(), None);
+    }
+
+    #[test]
+    fn focus_is_sent_only_to_a_generation_three_daemon() {
+        let (seen, frames) = std::sync::mpsc::channel();
+        let backend = scripted_daemon(vec![Script::WatchedAtGeneration(3, seen)]);
+        backend
+            .focus_session("session-1", "view-1", true, None)
+            .expect("sending focus");
+        assert!(matches!(
+            frames.recv_timeout(Duration::from_secs(1)).expect("focus frame"),
+            Frame::FocusSession {
+                session_id,
+                view_id,
+                hover: true,
+            } if session_id == proto::SessionId::new("session-1") && view_id == "view-1"
+        ));
+
+        let (ignored_seen, ignored_frames) = std::sync::mpsc::channel();
+        let (listed_seen, listed_frames) = std::sync::mpsc::channel();
+        let backend = scripted_daemon(vec![
+            Script::WatchedAtGeneration(2, ignored_seen),
+            Script::Watched(None, listed_seen),
+        ]);
+        backend
+            .focus_session("session-1", "view-1", false, None)
+            .expect("generation two ignores focus");
+        assert!(ignored_frames.try_recv().is_err());
+        backend.list().expect("later request still works");
+        assert!(matches!(
+            listed_frames
+                .recv_timeout(Duration::from_secs(1))
+                .expect("listing frame"),
+            Frame::ListSessions { .. }
+        ));
     }
 
     #[test]
