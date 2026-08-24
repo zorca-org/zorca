@@ -77,15 +77,55 @@ impl DisconnectedOverlay {
                     Host::CollabGuestProject
                 };
 
-                workspace.toggle_modal(window, cx, |_, cx| DisconnectedOverlay {
-                    finished: false,
-                    workspace: handle,
-                    host,
-                    focus_handle: cx.focus_handle(),
-                });
+                Self::show(workspace, handle, host, window, cx);
             },
         )
         .detach();
+    }
+
+    fn show(
+        workspace: &mut Workspace,
+        handle: WeakEntity<Workspace>,
+        host: Host,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        workspace.toggle_modal(window, cx, |_, cx| DisconnectedOverlay {
+            finished: false,
+            workspace: handle,
+            host,
+            focus_handle: cx.focus_handle(),
+        });
+    }
+
+    pub(crate) fn restore_if_disconnected(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        if workspace.active_modal::<Self>(cx).is_some() {
+            return;
+        }
+
+        let remote_connection_options = {
+            let project = workspace.project();
+            let project = project.read(cx);
+            if !project.is_disconnected(cx) {
+                return;
+            }
+            let Some(remote_connection_options) = project.remote_connection_options(cx) else {
+                return;
+            };
+            remote_connection_options
+        };
+
+        Self::show(
+            workspace,
+            cx.entity().downgrade(),
+            Host::RemoteServerProject(remote_connection_options, false),
+            window,
+            cx,
+        );
     }
 
     fn handle_reconnect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {

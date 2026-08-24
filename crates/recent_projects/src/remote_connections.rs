@@ -8,7 +8,7 @@ use askpass::EncryptedPassword;
 use editor::Editor;
 use extension_host::ExtensionStore;
 use futures::{FutureExt as _, channel::oneshot, select};
-use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
+use gpui::{AppContext, AsyncApp, Entity, PromptLevel, WindowHandle};
 
 use project::trusted_worktrees;
 use remote::{
@@ -22,6 +22,8 @@ use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
     find_existing_workspace,
 };
+
+use crate::disconnected_overlay::DisconnectedOverlay;
 
 pub use remote_connection::{
     RemoteClientDelegate, RemoteConnectionModal, RemoteConnectionPrompt, SshConnectionHeader,
@@ -343,6 +345,7 @@ pub async fn open_remote_project(
                         .update(cx, |_, window, _| window.remove_window())
                         .ok();
                 }
+                restore_disconnected_overlay(&window, &initial_workspace, cx);
                 return Ok(window);
             }
         };
@@ -422,6 +425,8 @@ pub async fn open_remote_project(
         break;
     }
 
+    restore_disconnected_overlay(&window, &initial_workspace, cx);
+
     // Register the remote client with extensions. We use `multi_workspace.workspace()` here
     // (not `initial_workspace`) because `open_remote_project_inner` activated the new remote
     // workspace, so the active workspace is now the one with the remote project.
@@ -439,6 +444,22 @@ pub async fn open_remote_project(
         })
         .ok();
     Ok(window)
+}
+
+fn restore_disconnected_overlay(
+    window: &WindowHandle<MultiWorkspace>,
+    workspace: &Entity<Workspace>,
+    cx: &mut AsyncApp,
+) {
+    if let Err(error) = window.update(cx, |multi_workspace, window, cx| {
+        if multi_workspace.workspace() == workspace {
+            workspace.update(cx, |workspace, cx| {
+                DisconnectedOverlay::restore_if_disconnected(workspace, window, cx);
+            });
+        }
+    }) {
+        log::warn!("failed to restore disconnected workspace overlay: {error:#}");
+    }
 }
 
 pub fn navigate_to_positions(
@@ -832,7 +853,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_reconnect_when_server_not_running(
+    async fn test_reconnect_retry_cancel_and_recover_when_server_not_running(
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) {
@@ -922,6 +943,75 @@ mod tests {
 
         executor.run_until_parked();
 
+        let disconnected_workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        assert!(disconnected_workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<DisconnectedOverlay>(cx).is_some()
+        }));
+        // Reconnect dismisses the overlay before starting open_remote_project.
+        cx.dispatch_action(window.into(), menu::Cancel);
+        executor.run_until_parked();
+        assert!(disconnected_workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<DisconnectedOverlay>(cx).is_none()
+        }));
+
+        let reconnect = cx.spawn({
+            let opts = opts.clone();
+            let paths = paths.clone();
+            let app_state = app_state.clone();
+            move |mut cx| async move {
+                open_remote_project(
+                    opts,
+                    paths,
+                    app_state,
+                    workspace::OpenOptions {
+                        requesting_window: Some(window),
+                        ..Default::default()
+                    },
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        executor.run_until_parked();
+
+        window
+            .read_with(cx, |multi_workspace, _| {
+                assert_eq!(
+                    multi_workspace.workspace().entity_id(),
+                    disconnected_workspace.entity_id()
+                );
+            })
+            .unwrap();
+        assert_eq!(
+            cx.pending_prompt().map(|prompt| prompt.0),
+            Some("Failed to connect to mock server".to_string())
+        );
+        cx.simulate_prompt_answer("Retry");
+        executor.run_until_parked();
+        assert_eq!(
+            cx.pending_prompt().map(|prompt| prompt.0),
+            Some("Failed to connect to mock server".to_string()),
+            "retry should start another connection attempt"
+        );
+
+        cx.simulate_prompt_answer("Cancel");
+        reconnect
+            .await
+            .expect("cancel should finish reconnect flow");
+        executor.run_until_parked();
+        assert!(disconnected_workspace.read_with(cx, |workspace, cx| {
+            workspace.active_modal::<DisconnectedOverlay>(cx).is_some()
+        }));
+
+        remote_fs
+            .insert_file(
+                Path::new(path!("/project/created_while_disconnected.txt")),
+                Vec::new(),
+            )
+            .await;
+
         // Register a new mock server under the same options so the reconnect
         // path can establish a fresh connection.
         let (server_session_2, connect_guard_2) =
@@ -945,8 +1035,10 @@ mod tests {
 
         drop(connect_guard_2);
 
-        // Simulate clicking "Reconnect": calls open_remote_project with
-        // replace_window pointing to the existing window.
+        // Simulate clicking "Reconnect" again.
+        cx.dispatch_action(window.into(), menu::Cancel);
+        executor.run_until_parked();
+        let mut async_cx = cx.to_async();
         let result = open_remote_project(
             opts,
             paths,
@@ -974,10 +1066,18 @@ mod tests {
             .update(cx, |multi_workspace, _, cx| {
                 let workspace = multi_workspace.workspace().clone();
                 workspace.update(cx, |workspace, cx| {
+                    let project = workspace.project().read(cx);
                     assert!(
-                        workspace.project().read(cx).is_remote(),
+                        project.is_remote(),
                         "project should be remote after reconnect"
                     );
+                    assert!(!project.is_disconnected(cx));
+                    assert!(project.visible_worktrees(cx).any(|worktree| {
+                        worktree
+                            .read(cx)
+                            .paths()
+                            .any(|path| path == "created_while_disconnected.txt")
+                    }));
                 });
             })
             .unwrap();
