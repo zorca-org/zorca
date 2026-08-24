@@ -864,6 +864,7 @@ async fn pump_input(
                 view_id.as_deref(),
                 &can_focus,
                 hover,
+                hover.then(initial_terminal_size).flatten(),
             )
             .await
             {
@@ -1025,7 +1026,7 @@ async fn send_size(
     if is_zed_bootstrap_size((cols, rows)) {
         return true;
     }
-    if claim && !claim_focus(outbound, session_id, view_id, can_focus, false).await {
+    if claim && !claim_focus(outbound, session_id, view_id, can_focus, false, None).await {
         return false;
     }
     outbound
@@ -1044,6 +1045,7 @@ async fn claim_focus(
     view_id: Option<&str>,
     can_focus: &AtomicBool,
     hover: bool,
+    resize_to: Option<(u16, u16)>,
 ) -> bool {
     if !can_focus.load(Ordering::SeqCst) {
         return true;
@@ -1051,6 +1053,18 @@ async fn claim_focus(
     let Some(view_id) = view_id else {
         return true;
     };
+    if let Some((cols, rows)) = resize_to
+        && outbound
+            .send(QueuedFrame::Persistent(Frame::Resize {
+                session_id: session_id.clone(),
+                cols,
+                rows,
+            }))
+            .await
+            .is_err()
+    {
+        return false;
+    }
     outbound
         .send(QueuedFrame::Persistent(Frame::FocusSession {
             session_id: session_id.clone(),
@@ -1454,19 +1468,31 @@ mod handshake_tests {
     }
 
     #[test]
-    fn a_capable_view_claims_focus() {
+    fn a_capable_hover_resizes_then_claims_focus() {
         smol::block_on(async {
-            let (outbound, queued) = smol::channel::bounded(1);
+            let (outbound, queued) = smol::channel::bounded(2);
             assert!(
                 claim_focus(
                     &outbound,
                     &SessionId::new("s-1"),
                     Some("view-1"),
                     &AtomicBool::new(true),
-                    false,
+                    true,
+                    Some((120, 40)),
                 )
                 .await
             );
+            match queued.recv().await.expect("the resize") {
+                QueuedFrame::Persistent(Frame::Resize {
+                    session_id,
+                    cols,
+                    rows,
+                }) => {
+                    assert_eq!(session_id, SessionId::new("s-1"));
+                    assert_eq!((cols, rows), (120, 40));
+                }
+                other => panic!("expected a resize, got {:?}", other.frame()),
+            }
             match queued.recv().await.expect("the focus claim") {
                 QueuedFrame::Persistent(Frame::FocusSession {
                     session_id,
@@ -1475,7 +1501,7 @@ mod handshake_tests {
                 }) => {
                     assert_eq!(session_id, SessionId::new("s-1"));
                     assert_eq!(view_id, "view-1");
-                    assert!(!hover);
+                    assert!(hover);
                 }
                 other => panic!("expected a focus claim, got {:?}", other.frame()),
             }
