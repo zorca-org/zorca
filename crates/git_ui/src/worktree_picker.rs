@@ -127,6 +127,7 @@ impl WorktreePicker {
             current_branch_name,
             default_branch: None,
             default_branch_loading,
+            creating_worktree: false,
             has_multiple_repositories,
             focus_handle: cx.focus_handle(),
             show_footer,
@@ -309,6 +310,7 @@ struct WorktreePickerDelegate {
     current_branch_name: Option<String>,
     default_branch: Option<String>,
     default_branch_loading: bool,
+    creating_worktree: bool,
     has_multiple_repositories: bool,
     focus_handle: FocusHandle,
     show_footer: bool,
@@ -745,6 +747,44 @@ impl WorktreePickerDelegate {
         .detach_and_log_err(cx);
     }
 
+    fn create_worktree(
+        &mut self,
+        action: CreateWorktree,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+
+        self.creating_worktree = true;
+        cx.notify();
+
+        let task = workspace.update(cx, |workspace, cx| {
+            crate::worktree_service::create_and_activate_worktree_workspace(
+                workspace,
+                &action,
+                window,
+                self.focused_dock,
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |picker, cx| {
+            let result = task.await;
+            let succeeded = result.is_ok();
+            picker.update(cx, |picker, cx| {
+                picker.delegate.creating_worktree = false;
+                if succeeded {
+                    cx.emit(DismissEvent);
+                } else {
+                    cx.notify();
+                }
+            })?;
+            result.map(|_| ())
+        })
+        .detach_and_log_err(cx);
+    }
+
     fn sync_selected_index(&mut self, has_query: bool) {
         if !has_query {
             return;
@@ -968,12 +1008,16 @@ impl PickerDelegate for WorktreePickerDelegate {
     }
 
     fn confirm(&mut self, secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(entry) = self.matches.get(self.selected_index) else {
+        if self.creating_worktree {
+            return;
+        }
+
+        let Some(entry) = self.matches.get(self.selected_index).cloned() else {
             return;
         };
         if self.default_branch_loading
             && matches!(
-                entry,
+                &entry,
                 WorktreeEntry::CreateFromCurrentBranch
                     | WorktreeEntry::CreateFromDefaultBranch { .. }
                     | WorktreeEntry::CreateNamed { .. }
@@ -988,42 +1032,30 @@ impl PickerDelegate for WorktreePickerDelegate {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: None,
-                                branch_target: NewWorktreeBranchTarget::CurrentBranch,
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                self.create_worktree(
+                    CreateWorktree {
+                        worktree_name: None,
+                        branch_target: NewWorktreeBranchTarget::CurrentBranch,
+                    },
+                    window,
+                    cx,
+                );
+                return;
             }
             WorktreeEntry::CreateFromDefaultBranch { default_branch } => {
                 if self.creation_blocked_reason(cx).is_some() {
                     return;
                 }
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: None,
-                                branch_target: WorktreeCreateTarget::DefaultBranch(
-                                    default_branch.clone(),
-                                )
-                                .branch_target(),
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                self.create_worktree(
+                    CreateWorktree {
+                        worktree_name: None,
+                        branch_target: WorktreeCreateTarget::DefaultBranch(default_branch)
+                            .branch_target(),
+                    },
+                    window,
+                    cx,
+                );
+                return;
             }
             WorktreeEntry::Worktree { worktree, .. } => {
                 if self.deleting_worktree_paths.contains(&worktree.path) {
@@ -1069,25 +1101,18 @@ impl PickerDelegate for WorktreePickerDelegate {
                 disabled_reason: None,
             } => {
                 let branch_target = match from_branch {
-                    Some(branch) => {
-                        WorktreeCreateTarget::DefaultBranch(branch.clone()).branch_target()
-                    }
+                    Some(branch) => WorktreeCreateTarget::DefaultBranch(branch).branch_target(),
                     None => NewWorktreeBranchTarget::CurrentBranch,
                 };
-                if let Some(workspace) = self.workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        crate::worktree_service::handle_create_worktree(
-                            workspace,
-                            &CreateWorktree {
-                                worktree_name: Some(name.clone()),
-                                branch_target,
-                            },
-                            window,
-                            self.focused_dock,
-                            cx,
-                        );
-                    });
-                }
+                self.create_worktree(
+                    CreateWorktree {
+                        worktree_name: Some(name),
+                        branch_target,
+                    },
+                    window,
+                    cx,
+                );
+                return;
             }
             WorktreeEntry::CreateNamed {
                 disabled_reason: Some(_),
@@ -1437,6 +1462,7 @@ impl PickerDelegate for WorktreePickerDelegate {
 
         let focus_handle = self.focus_handle.clone();
         let selected_entry = self.matches.get(self.selected_index);
+        let creation_pending = self.default_branch_loading || self.creating_worktree;
 
         let is_creating = selected_entry.is_some_and(|e| {
             matches!(
@@ -1484,16 +1510,23 @@ impl PickerDelegate for WorktreePickerDelegate {
             Some(
                 footer
                     .child(
-                        Button::new("create-worktree", "Create")
-                            .loading(self.default_branch_loading)
-                            .disabled(self.default_branch_loading)
-                            .key_binding(
-                                KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
-                                    .map(|kb| kb.size(rems_from_px(12.))),
-                            )
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(menu::Confirm.boxed_clone(), cx)
-                            }),
+                        Button::new(
+                            "create-worktree",
+                            if self.creating_worktree {
+                                "Creating…"
+                            } else {
+                                "Create"
+                            },
+                        )
+                        .loading(creation_pending)
+                        .disabled(creation_pending)
+                        .key_binding(
+                            KeyBinding::for_action_in(&menu::Confirm, &focus_handle, cx)
+                                .map(|kb| kb.size(rems_from_px(12.))),
+                        )
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(menu::Confirm.boxed_clone(), cx)
+                        }),
                     )
                     .into_any(),
             )
@@ -2076,6 +2109,45 @@ mod tests {
             worktrees_after, worktrees_before,
             "creation must wait until the primary branch has been resolved",
         );
+    }
+
+    #[gpui::test]
+    async fn test_failed_create_clears_pending_state_without_dismissing_picker(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, worktree_picker, _repository, _worktree_path, mut cx) =
+            init_worktree_picker_test(cx).await;
+        cx.update(|_, cx| <dyn Fs>::set_global(fs.clone(), cx));
+        fs.set_create_worktree_error(
+            path!("/root/project/.git").as_ref(),
+            Some("simulated worktree creation failure".to_string()),
+        );
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&worktree_picker, |_, _: &DismissEvent, _| {
+                panic!("failed worktree creation should leave the picker open");
+            })
+        });
+
+        worktree_picker.update_in(&mut cx, |worktree_picker, window, cx| {
+            worktree_picker.picker.update(cx, |picker, cx| {
+                picker.delegate.matches = vec![WorktreeEntry::CreateNamed {
+                    name: "feature".to_string(),
+                    from_branch: None,
+                    disabled_reason: None,
+                }];
+                picker.delegate.selected_index = 0;
+                picker.delegate.confirm(false, window, cx);
+                assert!(picker.delegate.creating_worktree);
+            });
+        });
+
+        cx.run_until_parked();
+
+        worktree_picker.update(&mut cx, |worktree_picker, cx| {
+            worktree_picker.picker.update(cx, |picker, _| {
+                assert!(!picker.delegate.creating_worktree);
+            });
+        });
     }
 
     #[gpui::test]
