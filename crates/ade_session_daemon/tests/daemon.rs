@@ -3158,6 +3158,14 @@ fn an_equal_size_focus_change_still_repaints_the_new_owner() {
     smol::block_on(async {
         let mut sibling = client(server.socket_path()).await;
         let session = cat_session(&server, &mut sibling, dir.path()).await;
+        sibling
+            .send(&Frame::Write {
+                session_id: session.id.clone(),
+                bytes: b"\x1b[<35;1;1M\n".to_vec(),
+            })
+            .await
+            .expect("sending a mouse report");
+        wait_for_ring(server.socket_path(), &session.id, b"[<35;1;1M").await;
 
         let mut viewer = client(server.socket_path()).await;
         viewer

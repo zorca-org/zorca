@@ -80,9 +80,6 @@ const DRAIN_CHUNK_BYTES: usize = 8192;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// How long after input a hover claim keeps yielding.
-const TYPING_HOLD: Duration = Duration::from_secs(3);
-
 /// The byte an agent sends when it wants a human: `BEL`, 0x07.
 const BELL: u8 = 0x07;
 
@@ -887,8 +884,6 @@ struct Session {
     /// does; view ids are never reused, so a claim that never resolves is inert
     /// rather than wrong.
     focused_view: Option<String>,
-    /// When a client last wrote input, so hover claims can yield to a typist.
-    last_input: Option<Instant>,
 }
 
 impl Session {
@@ -1124,7 +1119,6 @@ impl SessionTable {
                     sizes: Vec::new(),
                     view_ids: Vec::new(),
                     focused_view: None,
-                    last_input: None,
                 },
             );
         }
@@ -1475,7 +1469,6 @@ impl SessionTable {
                     sizes: Vec::new(),
                     view_ids: Vec::new(),
                     focused_view: None,
-                    last_input: None,
                 },
             );
         (info, hub, activity)
@@ -2265,7 +2258,6 @@ impl SessionTable {
             let session = sessions
                 .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
-            session.last_input = Some(Instant::now());
             let Some(live) = session.live.as_ref() else {
                 return Err(TableError::invalid_argument(format!(
                     "session {id} was lost when the daemon restarted"
@@ -2355,10 +2347,6 @@ impl SessionTable {
     /// view nothing has attached with yet, or one that has not asked, leaves
     /// the minimum standing until it does.
     ///
-    /// `hover` claims are declined while the session was typed into recently
-    /// and some other view already holds the claim, so a stray mouse-over
-    /// cannot steal size from a typist.
-    ///
     /// Same lock discipline as [`Self::resize`], and for the same reason: the
     /// decision is made under the table lock, the pty call is made after it.
     pub async fn focus(&self, id: &SessionId, view_id: &str, hover: bool) -> TableResult<()> {
@@ -2367,17 +2355,6 @@ impl SessionTable {
             let session = sessions
                 .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
-            if hover
-                && session
-                    .last_input
-                    .is_some_and(|t| t.elapsed() < TYPING_HOLD)
-                && session.focused_view.as_deref() != Some(view_id)
-            {
-                log::info!(
-                    "session {id} hover claim by view {view_id} deferred: the session is being typed into"
-                );
-                return Ok(());
-            }
             let already = session.focused_view.as_deref() == Some(view_id);
             session.focused_view = Some(view_id.to_owned());
             let owner = session
