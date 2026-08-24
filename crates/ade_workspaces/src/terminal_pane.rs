@@ -330,7 +330,7 @@ fn claim_focused_size(
     };
     terminal_view.update(cx, |terminal_view, cx| {
         let hover_claim = claim.clone();
-        terminal_view.set_hover_callback(move |cx| hover_claim(cx, true));
+        terminal_view.set_hover_callback(move |cx| hover_claim(cx, false));
         cx.on_focus(&focus_handle, window, move |_, _, cx| claim(cx, false))
             .detach();
     });
