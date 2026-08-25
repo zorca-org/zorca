@@ -758,6 +758,7 @@ impl TerminalView {
                 TerminalSettings::get_global(cx).scroll_multiplier.max(0.01),
             )
         });
+        cx.notify();
     }
 
     fn is_alt_screen(&self, cx: &App) -> bool {
@@ -2373,6 +2374,29 @@ mod tests {
                 .is_empty(),
             "shift-up in the normal screen should not be forwarded to the shell",
         );
+    }
+
+    #[gpui::test]
+    async fn mouse_wheel_scroll_notifies_the_terminal_view(cx: &mut TestAppContext) {
+        use futures::{FutureExt as _, StreamExt as _};
+
+        let (project, _workspace, window_handle) = init_test_with_window(cx).await;
+        let (_pane, _terminal, terminal_view) =
+            add_display_only_terminal(&project, window_handle, true, cx);
+        let mut notifications = cx.notifications(&terminal_view);
+
+        terminal_view.update(cx, |view, cx| {
+            view.scroll_wheel(
+                &ScrollWheelEvent {
+                    delta: gpui::ScrollDelta::Lines(GpuiPoint::new(0.0, 1.0)),
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(notifications.next().now_or_never().flatten().is_some());
     }
 
     #[gpui::test]
