@@ -101,7 +101,6 @@ The following areas are planned, not current capabilities:
 - A REST API and CLI will support external control and integrations.
 - A mobile app will provide access to workspaces and agent sessions away from
   the desktop.
-- Automations will start agent work from saved prompts and schedules.
 
 Do not present planned work as released. If the project has no approved public
 release plan, do not attach dates.

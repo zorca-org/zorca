@@ -183,7 +183,6 @@ The roadmap includes these directions:
 
 - **REST API and CLI.** ZOrca will support external control and integrations.
 - **Mobile app.** Users will manage workspaces and agent sessions away from the desktop.
-- **Automations.** Users will start agent work from saved prompts and schedules.
 
 ## Relationship to Zed
 
