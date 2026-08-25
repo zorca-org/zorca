@@ -149,7 +149,7 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
-    resize_callback: Option<Rc<dyn Fn(&mut Context<TerminalView>)>>,
+    resize_callback: Option<Rc<dyn Fn(Option<(u16, u16)>, &mut Context<TerminalView>)>>,
     hover_resize_task: Task<()>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
@@ -449,7 +449,10 @@ impl TerminalView {
         self.custom_title.as_deref()
     }
 
-    pub fn set_resize_callback(&mut self, callback: impl Fn(&mut Context<Self>) + 'static) {
+    pub fn set_resize_callback(
+        &mut self,
+        callback: impl Fn(Option<(u16, u16)>, &mut Context<Self>) + 'static,
+    ) {
         self.resize_callback = Some(Rc::new(callback));
     }
 
@@ -1300,7 +1303,7 @@ impl TerminalView {
         self.pause_cursor_blinking(window, cx);
 
         if let Some(callback) = self.resize_callback.clone() {
-            callback(cx);
+            callback(self.view_size(cx), cx);
         }
 
         if self.process_keystroke(&event.keystroke, cx) {
@@ -1391,7 +1394,8 @@ impl Render for TerminalView {
                         cx.background_executor()
                             .timer(Duration::from_millis(300))
                             .await;
-                        this.update(cx, |_, cx| callback(cx)).ok();
+                        this.update(cx, |this, cx| callback(this.view_size(cx), cx))
+                            .ok();
                     });
                 } else if !*hovered {
                     this.hover_resize_task = Task::ready(());

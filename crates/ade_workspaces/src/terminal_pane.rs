@@ -277,15 +277,11 @@ fn request_active_resize(
     cx: &mut Context<Workspace>,
 ) {
     let focus_handle = terminal_view.focus_handle(cx);
-    let weak_terminal_view = terminal_view.downgrade();
     let resize = {
         let ade_workspace = ade_workspace.clone();
         let session_id = session_id.to_owned();
-        Rc::new(move |cx: &mut App| {
-            let Some(terminal_view) = weak_terminal_view.upgrade() else {
-                return;
-            };
-            let Some((cols, rows)) = terminal_view.read(cx).view_size(cx) else {
+        Rc::new(move |size: Option<(u16, u16)>, cx: &mut App| {
+            let Some((cols, rows)) = size else {
                 return;
             };
             let lifecycle = crate::lifecycle_service(cx);
@@ -303,9 +299,11 @@ fn request_active_resize(
     };
     terminal_view.update(cx, |terminal_view, cx| {
         let event_resize = resize.clone();
-        terminal_view.set_resize_callback(move |cx| event_resize(cx));
-        cx.on_focus(&focus_handle, window, move |_, _, cx| resize(cx))
-            .detach();
+        terminal_view.set_resize_callback(move |size, cx| event_resize(size, cx));
+        cx.on_focus(&focus_handle, window, move |terminal_view, _, cx| {
+            resize(terminal_view.view_size(cx), cx)
+        })
+        .detach();
     });
 }
 
