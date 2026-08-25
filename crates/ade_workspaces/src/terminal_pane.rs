@@ -53,7 +53,7 @@ use workspace::{Pane, Workspace};
 pub fn open_workspace_terminal(
     zed_workspace: &mut Workspace,
     ade_workspace: &AdeWorkspace,
-    mut attached: Attached,
+    attached: Attached,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<Result<Entity<TerminalView>>> {
@@ -92,8 +92,6 @@ pub fn open_workspace_terminal(
         )));
     }
 
-    let view_id = new_view_id();
-    attached.argv = with_view_id(attached.argv, &view_id);
     let session_id = attached.session_id.clone();
     let spawn_task = match attach_spawn_task(ade_workspace, attached) {
         Ok(spawn_task) => spawn_task,
@@ -130,14 +128,7 @@ pub fn open_workspace_terminal(
             AdeWorkspaceStore::global(cx).update(cx, |store, cx| {
                 store.follow_session_title(id.clone(), &terminal_view, cx);
             });
-            claim_focused_size(
-                &terminal_view,
-                &session_id,
-                &ade_workspace,
-                &view_id,
-                window,
-                cx,
-            );
+            request_active_resize(&terminal_view, &session_id, &ade_workspace, window, cx);
 
             let focus_item = !zed_workspace.has_active_modal(window, cx);
             zed_workspace.add_item_to_active_pane(
@@ -205,7 +196,6 @@ pub(crate) async fn open_session_terminal(
     ade_workspace: &AdeWorkspace,
     cwd: Option<PathBuf>,
     attach_argv: Vec<String>,
-    view_id: &str,
     destination_index: Option<usize>,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<TerminalView>> {
@@ -215,7 +205,6 @@ pub(crate) async fn open_session_terminal(
         ade_workspace,
         cwd,
         attach_argv,
-        view_id,
         cx,
     )
     .await?;
@@ -243,12 +232,10 @@ pub(crate) async fn create_session_terminal(
     ade_workspace: &AdeWorkspace,
     cwd: Option<PathBuf>,
     attach_argv: Vec<String>,
-    view_id: &str,
     cx: &mut AsyncWindowContext,
 ) -> Result<Entity<TerminalView>> {
     let title = ade_workspace.name.as_str();
     let workspace_id = ade_workspace.id.clone();
-    let attach_argv = with_view_id(attach_argv, view_id);
     let spawn_task = session_spawn_task(session_id, title, cwd, attach_argv)?;
     let terminal = zed_workspace
         .update(cx, |zed_workspace, cx| {
@@ -275,63 +262,49 @@ pub(crate) async fn create_session_terminal(
         AdeWorkspaceStore::global(cx).update(cx, |store, cx| {
             store.follow_session_title(workspace_id, &terminal_view, cx);
         });
-        claim_focused_size(
-            &terminal_view,
-            session_id,
-            ade_workspace,
-            view_id,
-            window,
-            cx,
-        );
+        request_active_resize(&terminal_view, session_id, ade_workspace, window, cx);
         terminal_view
     })?;
 
     Ok(terminal_view)
 }
 
-pub(crate) fn new_view_id() -> String {
-    db::uuid::Uuid::new_v4().to_string()
-}
-
-fn with_view_id(mut argv: Vec<String>, view_id: &str) -> Vec<String> {
-    if !argv.is_empty() {
-        argv.extend(["--view-id".to_owned(), view_id.to_owned()]);
-    }
-    argv
-}
-
-fn claim_focused_size(
+fn request_active_resize(
     terminal_view: &Entity<TerminalView>,
     session_id: &str,
     ade_workspace: &AdeWorkspace,
-    view_id: &str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
     let focus_handle = terminal_view.focus_handle(cx);
-    let claim = {
+    let weak_terminal_view = terminal_view.downgrade();
+    let resize = {
         let ade_workspace = ade_workspace.clone();
         let session_id = session_id.to_owned();
-        let view_id = view_id.to_owned();
-        Rc::new(move |cx: &mut App, hover: bool| {
+        Rc::new(move |cx: &mut App| {
+            let Some(terminal_view) = weak_terminal_view.upgrade() else {
+                return;
+            };
+            let Some((cols, rows)) = terminal_view.read(cx).view_size(cx) else {
+                return;
+            };
             let lifecycle = crate::lifecycle_service(cx);
             let ade_workspace = ade_workspace.clone();
             let session_id = session_id.clone();
-            let view_id = view_id.clone();
             cx.background_spawn(async move {
                 if let Err(error) =
-                    lifecycle.focus_session(&ade_workspace, &session_id, &view_id, hover)
+                    lifecycle.resize_session(&ade_workspace, &session_id, cols, rows)
                 {
-                    log::warn!("session {session_id} could not follow the active view: {error:#}");
+                    log::warn!("session {session_id} could not follow the active size: {error:#}");
                 }
             })
             .detach();
         })
     };
     terminal_view.update(cx, |terminal_view, cx| {
-        let hover_claim = claim.clone();
-        terminal_view.set_hover_callback(move |cx| hover_claim(cx, false));
-        cx.on_focus(&focus_handle, window, move |_, _, cx| claim(cx, false))
+        let event_resize = resize.clone();
+        terminal_view.set_resize_callback(move |cx| event_resize(cx));
+        cx.on_focus(&focus_handle, window, move |_, _, cx| resize(cx))
             .detach();
     });
 }
@@ -437,17 +410,6 @@ mod tests {
     /// Stands in for a `TerminalView`, which cannot be built without a window.
     /// The map is generic precisely so this substitution is possible.
     struct FakeView;
-
-    #[test]
-    fn test_attach_argv_carries_the_terminal_view_id() {
-        assert_eq!(
-            with_view_id(
-                vec!["ade-daemon".into(), "attach".into(), "s1".into()],
-                "view-1"
-            ),
-            vec!["ade-daemon", "attach", "s1", "--view-id", "view-1"]
-        );
-    }
 
     #[test]
     fn test_attach_spawn_task_carries_argv_cwd_and_name() {

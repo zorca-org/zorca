@@ -186,8 +186,6 @@ const HANDSHAKE_RETRY_DELAY: Duration = Duration::from_millis(200);
 /// the disallowed `smol::Timer`), not a different number here.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
-const VIEW_GENERATION: u32 = 3;
-
 /// What an on-demand "upgrade host daemon" actually did.
 ///
 /// Two answers rather than a bool, because "nothing happened" is not a failure
@@ -224,8 +222,6 @@ pub struct DaemonBackend {
     /// gone. Sessions lost that way come back as exited `(lost)` rows rather
     /// than being quietly recreated.
     connection: Mutex<Option<Control>>,
-    /// Orders short-lived generation-3 focus hints.
-    focus_lock: Mutex<()>,
     next_request_id: AtomicU64,
     /// [`ANSWER_TIMEOUT`], except in tests that would otherwise have to sit
     /// through it to reach the failure they are about.
@@ -273,7 +269,6 @@ impl DaemonBackend {
         Self {
             endpoint,
             connection: Mutex::new(None),
-            focus_lock: Mutex::new(()),
             next_request_id: AtomicU64::new(1),
             answer_timeout: ANSWER_TIMEOUT,
         }
@@ -524,6 +519,31 @@ impl DaemonBackend {
 
     fn request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn notify(&self, expected_daemon_id: Option<&str>, frame: Frame) -> Result<()> {
+        let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = smol::block_on(async {
+            if slot.as_ref().is_some_and(|control| {
+                !identity_admits(expected_daemon_id, control.instance_id.as_deref())
+            }) {
+                *slot = None;
+                self.endpoint.on_connection_lost();
+            }
+            let control = match slot.as_mut() {
+                Some(control) => control,
+                None => slot.insert(self.endpoint.connect().await?),
+            };
+            if !identity_admits(expected_daemon_id, control.instance_id.as_deref()) {
+                bail!("the terminal view belongs to another daemon");
+            }
+            control.connection.send(&frame).await
+        });
+        if outcome.is_err() {
+            *slot = None;
+            self.endpoint.on_connection_lost();
+        }
+        outcome
     }
 
     /// Replace this host's daemon binary now, because a human asked for it.
@@ -961,32 +981,22 @@ impl SessionBackend for DaemonBackend {
         Ok(self.session_argv(&proto::SessionId::new(session_id), expected_daemon_id))
     }
 
-    fn focus_session(
+    fn resize_session(
         &self,
         session_id: &str,
-        view_id: &str,
-        hover: bool,
+        cols: u16,
+        rows: u16,
         expected_daemon_id: Option<&str>,
     ) -> Result<()> {
-        let _guard = self.focus_lock.lock().unwrap_or_else(|e| e.into_inner());
-        smol::block_on(async {
-            let (mut connection, ack) =
-                handshaken(|| self.endpoint.open(), Hello::current()).await?;
-            if !identity_admits(expected_daemon_id, ack.instance_id.as_deref()) {
-                bail!("the terminal view belongs to another daemon");
-            }
-            if ack.generation < VIEW_GENERATION {
-                return Ok(());
-            }
-            connection
-                .send(&Frame::FocusSession {
-                    session_id: proto::SessionId::new(session_id),
-                    view_id: view_id.to_owned(),
-                    hover,
-                })
-                .await
-        })
-        .with_context(|| format!("focusing view {view_id} on daemon session {session_id}"))
+        self.notify(
+            expected_daemon_id,
+            Frame::Resize {
+                session_id: proto::SessionId::new(session_id),
+                cols,
+                rows,
+            },
+        )
+        .with_context(|| format!("resizing daemon session {session_id} to {cols}x{rows}"))
     }
 
     fn open_workspace(
@@ -3476,7 +3486,6 @@ mod control_connection {
         /// What proves a frame was *not* sent: a later request that does arrive
         /// is the first thing the channel yields.
         Watched(Option<String>, std::sync::mpsc::Sender<Frame>),
-        WatchedAtGeneration(u32, std::sync::mpsc::Sender<Frame>),
     }
 
     fn ack() -> proto::HelloAck {
@@ -3715,29 +3724,6 @@ mod control_connection {
                             }
                             continue;
                         }
-                        if let Script::WatchedAtGeneration(generation, seen) = script {
-                            let mut hello_ack = ack();
-                            hello_ack.generation = generation;
-                            daemon
-                                .send(&Frame::HelloAck(hello_ack))
-                                .await
-                                .expect("sending the ack");
-                            while let Ok(frame) = daemon.recv().await {
-                                if let Frame::ListSessions { request_id } = &frame {
-                                    daemon
-                                        .send(&Frame::SessionList {
-                                            sessions: Vec::new(),
-                                            request_id: *request_id,
-                                        })
-                                        .await
-                                        .expect("answering the listing");
-                                }
-                                if seen.send(frame).is_err() {
-                                    break;
-                                }
-                            }
-                            continue;
-                        }
                         let mut hello_ack = ack();
                         let (quiet_for, frames, repeated) = match script {
                             Script::EofDuringHandshake => continue,
@@ -3751,7 +3737,6 @@ mod control_connection {
                             Script::LegacySessionList(_) => unreachable!(),
                             Script::SubscriptionSnapshot { .. } => unreachable!(),
                             Script::Watched(..) => unreachable!(),
-                            Script::WatchedAtGeneration(..) => unreachable!(),
                         };
                         daemon
                             .send(&Frame::HelloAck(hello_ack))
@@ -4207,37 +4192,19 @@ mod control_connection {
     }
 
     #[test]
-    fn focus_is_sent_only_to_a_generation_three_daemon() {
+    fn active_resize_is_sent_on_generation_two() {
         let (seen, frames) = std::sync::mpsc::channel();
-        let backend = scripted_daemon(vec![Script::WatchedAtGeneration(3, seen)]);
+        let backend = scripted_daemon(vec![Script::Watched(None, seen)]);
         backend
-            .focus_session("session-1", "view-1", true, None)
-            .expect("sending focus");
+            .resize_session("session-1", 120, 42, None)
+            .expect("sending resize");
         assert!(matches!(
-            frames.recv_timeout(Duration::from_secs(1)).expect("focus frame"),
-            Frame::FocusSession {
+            frames.recv_timeout(Duration::from_secs(1)).expect("resize frame"),
+            Frame::Resize {
                 session_id,
-                view_id,
-                hover: true,
-            } if session_id == proto::SessionId::new("session-1") && view_id == "view-1"
-        ));
-
-        let (ignored_seen, ignored_frames) = std::sync::mpsc::channel();
-        let (listed_seen, listed_frames) = std::sync::mpsc::channel();
-        let backend = scripted_daemon(vec![
-            Script::WatchedAtGeneration(2, ignored_seen),
-            Script::Watched(None, listed_seen),
-        ]);
-        backend
-            .focus_session("session-1", "view-1", false, None)
-            .expect("generation two ignores focus");
-        assert!(ignored_frames.try_recv().is_err());
-        backend.list().expect("later request still works");
-        assert!(matches!(
-            listed_frames
-                .recv_timeout(Duration::from_secs(1))
-                .expect("listing frame"),
-            Frame::ListSessions { .. }
+                cols: 120,
+                rows: 42,
+            } if session_id == proto::SessionId::new("session-1")
         ));
     }
 
@@ -4464,6 +4431,7 @@ mod control_connection {
                 .find(|pair| pair[0] == "--expected-daemon-id"),
             Some(["--expected-daemon-id".to_owned(), "daemon-a".to_owned()].as_slice()),
         );
+        assert!(!argv.contains(&"--view-id".to_owned()));
         assert!(
             !backend
                 .attach_session("s1", None)

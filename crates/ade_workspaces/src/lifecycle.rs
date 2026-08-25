@@ -2161,17 +2161,17 @@ impl WorkspaceLifecycleService {
             .attach_session(session_id, workspace.daemon_id.as_deref())
     }
 
-    pub fn focus_session(
+    pub fn resize_session(
         &self,
         workspace: &AdeWorkspace,
         session_id: &str,
-        view_id: &str,
-        hover: bool,
+        cols: u16,
+        rows: u16,
     ) -> Result<()> {
-        self.backend_for(workspace)?.focus_session(
+        self.backend_for(workspace)?.resize_session(
             session_id,
-            view_id,
-            hover,
+            cols,
+            rows,
             workspace.daemon_id.as_deref(),
         )
     }

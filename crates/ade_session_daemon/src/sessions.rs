@@ -2247,13 +2247,8 @@ impl SessionTable {
     ///
     /// **The lookup is the whole critical section and the write happens after
     /// it**: nothing that can block is done under the table lock.
-    pub async fn write(
-        &self,
-        id: &SessionId,
-        subscriber: SubscriberId,
-        bytes: &[u8],
-    ) -> TableResult<()> {
-        let (target, view_id) = {
+    pub async fn write(&self, id: &SessionId, bytes: &[u8]) -> TableResult<()> {
+        let target = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2268,16 +2263,8 @@ impl SessionTable {
                     "session {id} has exited"
                 )));
             }
-            let view_id = session
-                .view_ids
-                .iter()
-                .find(|(owner, _)| *owner == subscriber)
-                .map(|(_, view_id)| view_id.clone());
-            (live.writer.clone(), view_id)
+            live.writer.clone()
         };
-        if let Some(view_id) = view_id {
-            self.focus(id, &view_id, false).await?;
-        }
         let mut writer = target.lock().unwrap_or_else(|e| e.into_inner());
         writer
             .write_all(bytes)

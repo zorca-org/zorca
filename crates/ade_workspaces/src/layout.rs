@@ -48,7 +48,7 @@
 use crate::{
     AdeWorkspace, LayoutEvent, MissingTab, WorkspaceEvent, WorkspaceLayout,
     WorkspaceLifecycleService,
-    terminal_pane::{create_session_terminal, new_view_id, open_session_terminal},
+    terminal_pane::{create_session_terminal, open_session_terminal},
 };
 use ade_session::{LayoutDoc, LayoutNode, SplitDir, Tab};
 use anyhow::Result;
@@ -256,7 +256,6 @@ fn open_new_session_terminal_at(
         })
         .unwrap_or_else(|| ade_workspace.repository_path.clone());
     let lifecycle = crate::lifecycle_service(cx);
-    let view_id = new_view_id();
     let pane = zed_workspace.active_pane().downgrade();
     let zed_workspace = zed_workspace.weak_handle();
     // Weak across the await: a strong handle would keep the sync alive past the
@@ -309,7 +308,6 @@ fn open_new_session_terminal_at(
             &ade_workspace,
             cwd,
             argv,
-            &view_id,
             None,
             cx,
         )
@@ -711,7 +709,7 @@ fn render_layout_if_unchanged(
         // host's, set when it was created.
         let cwd = (!ade_workspace.is_remote()).then(|| ade_workspace.repository_path.clone());
         for (placeholder, session_id) in pending_terminals {
-            if let Some((argv, view_id)) = argvs.get(&session_id) {
+            if let Some(argv) = argvs.get(&session_id) {
                 let placeholder_is_open = zed_workspace
                     .read_with(cx, |zed_workspace, _| {
                         zed_workspace.pane_for(&placeholder).is_some()
@@ -726,7 +724,6 @@ fn render_layout_if_unchanged(
                     let ade_workspace = ade_workspace.clone();
                     let cwd = cwd.clone();
                     let argv = argv.clone();
-                    let view_id = view_id.clone();
                     async move |cx| {
                         let terminal_view = create_session_terminal(
                             &zed_workspace,
@@ -734,7 +731,6 @@ fn render_layout_if_unchanged(
                             &ade_workspace,
                             cwd,
                             argv,
-                            &view_id,
                             cx,
                         )
                         .await
@@ -787,13 +783,12 @@ fn attach_argvs(
     lifecycle: &WorkspaceLifecycleService,
     ade_workspace: &AdeWorkspace,
     sessions: &[String],
-) -> HashMap<String, (Vec<String>, String)> {
+) -> HashMap<String, Vec<String>> {
     let mut argvs = HashMap::with_capacity(sessions.len());
     for session in sessions {
-        let view_id = new_view_id();
         match lifecycle.attach_session_command(ade_workspace, session) {
             Ok(argv) => {
-                argvs.insert(session.clone(), (argv, view_id));
+                argvs.insert(session.clone(), argv);
             }
             Err(error) => {
                 log::warn!("cannot attach to session {session}: {error:#}");

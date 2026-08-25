@@ -149,8 +149,8 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
-    hover_callback: Option<Rc<dyn Fn(&mut Context<TerminalView>)>>,
-    hover_claim_task: Task<()>,
+    resize_callback: Option<Rc<dyn Fn(&mut Context<TerminalView>)>>,
+    hover_resize_task: Task<()>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
     workspace_id: Option<WorkspaceId>,
@@ -316,8 +316,8 @@ impl TerminalView {
             scroll_handle,
             needs_serialize: false,
             custom_title: None,
-            hover_callback: None,
-            hover_claim_task: Task::ready(()),
+            resize_callback: None,
+            hover_resize_task: Task::ready(()),
             ime_state: None,
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
@@ -425,6 +425,10 @@ impl TerminalView {
         self.terminal.read(cx).last_content().terminal_bounds
     }
 
+    pub fn view_size(&self, cx: &App) -> Option<(u16, u16)> {
+        self.terminal.read(cx).view_size()
+    }
+
     pub fn entity(&self) -> &Entity<Terminal> {
         &self.terminal
     }
@@ -445,8 +449,8 @@ impl TerminalView {
         self.custom_title.as_deref()
     }
 
-    pub fn set_hover_callback(&mut self, callback: impl Fn(&mut Context<Self>) + 'static) {
-        self.hover_callback = Some(Rc::new(callback));
+    pub fn set_resize_callback(&mut self, callback: impl Fn(&mut Context<Self>) + 'static) {
+        self.resize_callback = Some(Rc::new(callback));
     }
 
     pub fn set_custom_title(&mut self, label: Option<String>, cx: &mut Context<Self>) {
@@ -1295,6 +1299,10 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
+        if let Some(callback) = self.resize_callback.clone() {
+            callback(cx);
+        }
+
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
         }
@@ -1378,15 +1386,15 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::rename_terminal))
             .on_key_down(cx.listener(Self::key_down))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if *hovered && let Some(callback) = this.hover_callback.clone() {
-                    this.hover_claim_task = cx.spawn(async move |this, cx| {
+                if *hovered && let Some(callback) = this.resize_callback.clone() {
+                    this.hover_resize_task = cx.spawn(async move |this, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(300))
                             .await;
                         this.update(cx, |_, cx| callback(cx)).ok();
                     });
                 } else if !*hovered {
-                    this.hover_claim_task = Task::ready(());
+                    this.hover_resize_task = Task::ready(());
                 }
             }))
             .on_mouse_down(

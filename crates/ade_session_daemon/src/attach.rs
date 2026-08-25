@@ -43,12 +43,8 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
 use std::task::{Context, Poll};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use ade_session::client::{Connection, PRE_CUT_DIAGNOSIS, is_handshake_eof};
 use ade_session::framing::{ReadFrameError, bounded, rejection_frame};
@@ -96,17 +92,6 @@ const RESET_TERMINAL: &[u8] = b"\x1bc";
 /// out. It is not a real viewer request and must not shrink a shared session.
 const ZED_BOOTSTRAP_SIZE: (u16, u16) = (100, 6);
 
-static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
-
-fn fresh_view_id() -> String {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let sequence = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
-    format!("attach-{}-{time}-{sequence}", std::process::id())
-}
-
 fn is_zed_bootstrap_size(size: (u16, u16)) -> bool {
     is_zed_bootstrap_size_for(size, std::env::var_os("ZED_TERM").is_some())
 }
@@ -117,6 +102,16 @@ fn is_zed_bootstrap_size_for(size: (u16, u16), zed_term: bool) -> bool {
 
 fn initial_terminal_size() -> Option<(u16, u16)> {
     terminal_size().filter(|size| !is_zed_bootstrap_size(*size))
+}
+
+fn attach_hello(view_id: Option<&str>) -> Hello {
+    match view_id {
+        Some(_) => Hello::current(),
+        None => Hello {
+            max_generation: LEGACY_GENERATION,
+            ..Hello::current()
+        },
+    }
 }
 
 /// The two halves of a connection, back together as the one duplex stream
@@ -423,7 +418,8 @@ where
         // owns the §3.1 verification and this client does not get a second
         // opinion about it. The halves come back out unchanged.
         let mut connection = Connection::new(Duplex::new(reader, writer));
-        let error = match connection.handshake(Hello::current()).await {
+        let hello = attach_hello(config.view_id.as_deref());
+        let error = match connection.handshake(hello).await {
             Ok(ack) => {
                 if let Some(expected) = &config.expected_daemon_id
                     && let Err(error) = identity_matches(expected, ack.instance_id.as_deref())
@@ -465,28 +461,18 @@ where
     C: Fn() -> F,
     F: Future<Output = Result<(R, W)>>,
 {
-    let mut config = config;
-    config.view_id.get_or_insert_with(fresh_view_id);
     let mut stdout = Unblock::new(std::io::stdout());
-    let (mut daemon, mut writer, can_focus) =
-        connect_and_attach(&config, &connect, &mut stdout, false)
-            .await
-            .map_err(|error| error.into_initial_error(&config.session_id))?;
+    let (mut daemon, mut writer) = connect_and_attach(&config, &connect, &mut stdout, false)
+        .await
+        .map_err(|error| error.into_initial_error(&config.session_id))?;
 
     // From here the terminal belongs to the session.
     let raw = RawMode::enable();
     let (outbound, queued) = smol::channel::bounded::<QueuedFrame>(OUTBOUND_QUEUE_FRAMES);
-    let can_focus = Arc::new(AtomicBool::new(can_focus));
-    let view_id = config.view_id.clone();
     let input = smol::spawn(pump_input(outbound.clone(), config.session_id.clone()));
-    let resize = raw.is_some().then(|| {
-        smol::spawn(pump_resize(
-            outbound.clone(),
-            config.session_id.clone(),
-            view_id,
-            can_focus.clone(),
-        ))
-    });
+    let resize = raw
+        .is_some()
+        .then(|| smol::spawn(pump_resize(outbound.clone(), config.session_id.clone())));
 
     let mut generation = 0;
     let mut pending = None;
@@ -499,13 +485,12 @@ where
                 &outbound,
                 generation,
             ),
-            pump_writer(&mut writer, &queued, &mut pending, generation, &can_focus),
+            pump_writer(&mut writer, &queued, &mut pending, generation),
         )
         .await;
         match result {
             PumpResult::Ended(ending) => break Ok(ending),
             PumpResult::Reconnect => {
-                can_focus.store(false, Ordering::SeqCst);
                 generation = generation.wrapping_add(1);
                 if matches!(pending, Some(QueuedFrame::Connection { .. })) {
                     pending = None;
@@ -513,10 +498,7 @@ where
                 loop {
                     match connect_and_attach(&config, &connect, &mut stdout, true).await {
                         Ok(connection) => {
-                            let (new_daemon, new_writer, supported) = connection;
-                            daemon = new_daemon;
-                            writer = new_writer;
-                            can_focus.store(supported, Ordering::SeqCst);
+                            (daemon, writer) = connection;
                             break;
                         }
                         Err(AttachFailure::Transport(error)) => {
@@ -556,7 +538,7 @@ async fn connect_and_attach<R, W, C, F>(
     connect: &C,
     stdout: &mut Unblock<std::io::Stdout>,
     reconnecting: bool,
-) -> std::result::Result<(Connection<R>, Connection<W>, bool), AttachFailure>
+) -> std::result::Result<(Connection<R>, Connection<W>), AttachFailure>
 where
     R: AsyncRead + AsyncWrite + Unpin,
     W: AsyncRead + AsyncWrite + Unpin,
@@ -600,7 +582,7 @@ where
         reconnecting,
     )
     .await?;
-    Ok((daemon, writer, generation > LEGACY_GENERATION))
+    Ok((daemon, writer))
 }
 
 /// Wait for the attach to be answered, writing the replayed scrollback out.
@@ -704,10 +686,6 @@ impl QueuedFrame {
             Self::Persistent(_) => false,
         }
     }
-
-    fn requires_focus_capability(&self) -> bool {
-        matches!(self.frame(), Frame::FocusSession { .. })
-    }
 }
 
 enum PumpResult {
@@ -804,7 +782,6 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
     queued: &Receiver<QueuedFrame>,
     pending: &mut Option<QueuedFrame>,
     generation: u64,
-    can_focus: &AtomicBool,
 ) -> PumpResult {
     loop {
         if pending.is_none() {
@@ -813,9 +790,6 @@ async fn pump_writer<S: AsyncRead + AsyncWrite + Unpin>(
         if pending
             .as_ref()
             .is_some_and(|frame| frame.is_stale(generation))
-            || pending.as_ref().is_some_and(|frame| {
-                frame.requires_focus_capability() && !can_focus.load(Ordering::SeqCst)
-            })
         {
             *pending = None;
             continue;
@@ -859,25 +833,12 @@ async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
 /// SIGWINCH → [`Frame::Resize`]. Re-send the mounted size after Attach so a
 /// layout completed between process spawn and this pump cannot be missed.
 #[cfg(unix)]
-async fn pump_resize(
-    outbound: Sender<QueuedFrame>,
-    session_id: SessionId,
-    view_id: Option<String>,
-    can_focus: Arc<AtomicBool>,
-) {
+async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     let Some(signals) = tty::winch_signals() else {
         return;
     };
     let mut last = terminal_size();
-    if !send_size(
-        &outbound,
-        &session_id,
-        view_id.as_deref(),
-        &can_focus,
-        false,
-    )
-    .await
-    {
+    if !send_size(&outbound, &session_id).await {
         return;
     }
     let mut signals = Unblock::new(signals);
@@ -891,17 +852,8 @@ async fn pump_resize(
         if size == last {
             continue;
         }
-        let claim = last.is_some_and(|size| !is_zed_bootstrap_size(size));
         last = size;
-        if !send_size(
-            &outbound,
-            &session_id,
-            view_id.as_deref(),
-            &can_focus,
-            claim,
-        )
-        .await
-        {
+        if !send_size(&outbound, &session_id).await {
             break;
         }
     }
@@ -918,22 +870,9 @@ async fn pump_resize(
 /// same reason the pump is a task: dropping the task has to end the polling.
 /// (`smol::Timer` is disallowed workspace-wide, hence the blocking sleep.)
 #[cfg(windows)]
-async fn pump_resize(
-    outbound: Sender<QueuedFrame>,
-    session_id: SessionId,
-    view_id: Option<String>,
-    can_focus: Arc<AtomicBool>,
-) {
+async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     let mut last = terminal_size();
-    if !send_size(
-        &outbound,
-        &session_id,
-        view_id.as_deref(),
-        &can_focus,
-        false,
-    )
-    .await
-    {
+    if !send_size(&outbound, &session_id).await {
         return;
     }
     loop {
@@ -942,17 +881,8 @@ async fn pump_resize(
         if size == last {
             continue;
         }
-        let claim = last.is_some_and(|size| !is_zed_bootstrap_size(size));
         last = size;
-        if !send_size(
-            &outbound,
-            &session_id,
-            view_id.as_deref(),
-            &can_focus,
-            claim,
-        )
-        .await
-        {
+        if !send_size(&outbound, &session_id).await {
             break;
         }
     }
@@ -960,49 +890,18 @@ async fn pump_resize(
 
 /// Queue the terminal's current size. `false` means the queue is closed and the
 /// caller should stop.
-async fn send_size(
-    outbound: &Sender<QueuedFrame>,
-    session_id: &SessionId,
-    view_id: Option<&str>,
-    can_focus: &AtomicBool,
-    claim: bool,
-) -> bool {
+async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bool {
     let Some((cols, rows)) = terminal_size() else {
         return true;
     };
     if is_zed_bootstrap_size((cols, rows)) {
         return true;
     }
-    if claim && !claim_focus(outbound, session_id, view_id, can_focus).await {
-        return false;
-    }
     outbound
         .send(QueuedFrame::Persistent(Frame::Resize {
             session_id: session_id.clone(),
             cols,
             rows,
-        }))
-        .await
-        .is_ok()
-}
-
-async fn claim_focus(
-    outbound: &Sender<QueuedFrame>,
-    session_id: &SessionId,
-    view_id: Option<&str>,
-    can_focus: &AtomicBool,
-) -> bool {
-    if !can_focus.load(Ordering::SeqCst) {
-        return true;
-    }
-    let Some(view_id) = view_id else {
-        return true;
-    };
-    outbound
-        .send(QueuedFrame::Persistent(Frame::FocusSession {
-            session_id: session_id.clone(),
-            view_id: view_id.to_owned(),
-            hover: false,
         }))
         .await
         .is_ok()
@@ -1401,31 +1300,9 @@ mod handshake_tests {
     }
 
     #[test]
-    fn a_capable_resize_claims_focus() {
-        smol::block_on(async {
-            let (outbound, queued) = smol::channel::bounded(1);
-            assert!(
-                claim_focus(
-                    &outbound,
-                    &SessionId::new("s-1"),
-                    Some("view-1"),
-                    &AtomicBool::new(true),
-                )
-                .await
-            );
-            match queued.recv().await.expect("the focus claim") {
-                QueuedFrame::Persistent(Frame::FocusSession {
-                    session_id,
-                    view_id,
-                    hover,
-                }) => {
-                    assert_eq!(session_id, SessionId::new("s-1"));
-                    assert_eq!(view_id, "view-1");
-                    assert!(!hover);
-                }
-                other => panic!("expected a focus claim, got {:?}", other.frame()),
-            }
-        });
+    fn an_unnamed_view_uses_global_last_resize_wins() {
+        assert_eq!(attach_hello(None).max_generation, LEGACY_GENERATION);
+        assert!(attach_hello(Some("view-1")).max_generation > LEGACY_GENERATION);
     }
 
     /// A daemon that reports `generation` and `instance_id`, then records every
@@ -1531,8 +1408,7 @@ mod handshake_tests {
             .expect("the client attached")
     }
 
-    /// The identity tests all run at the current generation; the fence is
-    /// about *which* daemon answered, not about what it can decode.
+    /// Identity fencing is independent of the generation-two attach mode.
     fn fenced(
         expected: Option<&str>,
         actual: Option<&str>,
@@ -1540,7 +1416,7 @@ mod handshake_tests {
     ) -> (std::result::Result<(), AttachFailure>, bool) {
         let config =
             AttachConfig::tcp("unused", "s-1").with_expected_daemon_id(expected.map(str::to_owned));
-        let (attached, frames) = attach_against(config, 3, actual, reconnecting);
+        let (attached, frames) = attach_against(config, LEGACY_GENERATION, actual, reconnecting);
         (attached, frames.is_empty())
     }
 
@@ -1637,9 +1513,11 @@ mod handshake_tests {
             let address = listener.local_addr().expect("the bound port").to_string();
             let serving = smol::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("daemon A");
-                let first = scripted_daemon(stream, 3, Some("daemon-a".to_owned())).await;
+                let first =
+                    scripted_daemon(stream, LEGACY_GENERATION, Some("daemon-a".to_owned())).await;
                 let (stream, _) = listener.accept().await.expect("daemon B");
-                let second = scripted_daemon(stream, 3, Some("daemon-b".to_owned())).await;
+                let second =
+                    scripted_daemon(stream, LEGACY_GENERATION, Some("daemon-b".to_owned())).await;
                 (first, second)
             });
             let config = AttachConfig::tcp(address.clone(), "s-1")
