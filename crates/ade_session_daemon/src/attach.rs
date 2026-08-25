@@ -88,20 +88,14 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// A replay describes a fresh terminal, so re-establish that baseline first.
 const RESET_TERMINAL: &[u8] = b"\x1bc";
 
-/// Zed opens task terminals at this bootstrap size before their pane is laid
-/// out. It is not a real viewer request and must not shrink a shared session.
-const ZED_BOOTSTRAP_SIZE: (u16, u16) = (100, 6);
-
-fn is_zed_bootstrap_size(size: (u16, u16)) -> bool {
-    is_zed_bootstrap_size_for(size, std::env::var_os("ZED_TERM").is_some())
-}
-
-fn is_zed_bootstrap_size_for(size: (u16, u16), zed_term: bool) -> bool {
-    zed_term && size == ZED_BOOTSTRAP_SIZE
+fn reports_terminal_size(zed_term: bool) -> bool {
+    !zed_term
 }
 
 fn initial_terminal_size() -> Option<(u16, u16)> {
-    terminal_size().filter(|size| !is_zed_bootstrap_size(*size))
+    reports_terminal_size(std::env::var_os("ZED_TERM").is_some())
+        .then(terminal_size)
+        .flatten()
 }
 
 fn attach_hello(view_id: Option<&str>) -> Hello {
@@ -894,7 +888,7 @@ async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bo
     let Some((cols, rows)) = terminal_size() else {
         return true;
     };
-    if is_zed_bootstrap_size((cols, rows)) {
+    if !reports_terminal_size(std::env::var_os("ZED_TERM").is_some()) {
         return true;
     }
     outbound
@@ -1293,10 +1287,9 @@ mod handshake_tests {
     use super::*;
 
     #[test]
-    fn only_zeds_bootstrap_size_is_filtered() {
-        assert!(is_zed_bootstrap_size_for((100, 6), true));
-        assert!(!is_zed_bootstrap_size_for((100, 6), false));
-        assert!(!is_zed_bootstrap_size_for((100, 7), true));
+    fn zed_leaves_terminal_sizing_to_the_host_ui() {
+        assert!(!reports_terminal_size(true));
+        assert!(reports_terminal_size(false));
     }
 
     #[test]

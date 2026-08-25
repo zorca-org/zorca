@@ -3014,6 +3014,42 @@ fn resize_after_attach_repaints_at_the_new_size() {
     });
 }
 
+#[test]
+fn generation_two_resize_repaints_every_attached_viewer() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+        write_to(&mut connection, &session.id, b"shared-screen\n").await;
+        wait_for_ring(server.socket_path(), &session.id, b"shared-screen").await;
+
+        let mut first = gen2_client(server.socket_path()).await;
+        let mut second = gen2_client(server.socket_path()).await;
+        let _ = attach(&mut first, &session.id).await;
+        let _ = attach(&mut second, &session.id).await;
+
+        first
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending generation-two Resize");
+
+        for viewer in [&mut first, &mut second] {
+            match recv(viewer, "the shared resized repaint").await {
+                Frame::Output { session_id, bytes } => {
+                    assert_eq!(session_id, session.id);
+                    assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                    assert!(contains(&bytes, b"shared-screen"), "{bytes:?}");
+                }
+                other => panic!("expected resized repaint, got {other:?}"),
+            }
+        }
+    });
+}
+
 /// A focus claim that arrives before its view attaches is honored the moment
 /// the view does: the repaint comes out at the focused ask, not at the
 /// smallest sibling's ask that stood in for it while the claim was pending.

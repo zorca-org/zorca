@@ -282,7 +282,7 @@ fn request_active_resize(
         let session_id = session_id.to_owned();
         Rc::new(move |size: Option<(u16, u16)>, cx: &mut App| {
             let Some((cols, rows)) = size else {
-                return;
+                return Task::ready(());
             };
             let lifecycle = crate::lifecycle_service(cx);
             let ade_workspace = ade_workspace.clone();
@@ -294,14 +294,13 @@ fn request_active_resize(
                     log::warn!("session {session_id} could not follow the active size: {error:#}");
                 }
             })
-            .detach();
         })
     };
     terminal_view.update(cx, |terminal_view, cx| {
         let event_resize = resize.clone();
         terminal_view.set_resize_callback(move |size, cx| event_resize(size, cx));
         cx.on_focus(&focus_handle, window, move |terminal_view, _, cx| {
-            resize(terminal_view.view_size(cx), cx)
+            terminal_view.request_resize(true, cx)
         })
         .detach();
     });

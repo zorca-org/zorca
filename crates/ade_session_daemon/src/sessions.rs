@@ -785,29 +785,18 @@ impl OutputHub {
         }
     }
 
-    /// Repaint one attached viewer after its effective terminal size changes.
-    fn repaint(&mut self, session_id: &SessionId, subscriber: SubscriberId) {
+    /// Repaint every attached viewer after the shared screen changes size.
+    fn repaint(&mut self, session_id: &SessionId) {
         let Some(grid) = self.grid.as_ref() else {
             return;
         };
-        let Some(outbound) = self
-            .subscribers
-            .iter()
-            .find(|(id, _)| *id == subscriber)
-            .map(|(_, outbound)| outbound.clone())
-        else {
-            return;
-        };
         let bytes = grid.repaint();
-        if bytes.len() as u64 + ATTACH_RESERVE_BYTES > outbound.free_bytes() {
-            return;
-        }
-        if !outbound.push(Frame::Output {
-            session_id: session_id.clone(),
-            bytes,
-        }) {
-            self.subscribers.retain(|(id, _)| *id != subscriber);
-        }
+        self.subscribers.retain(|(_, outbound)| {
+            outbound.push(Frame::Output {
+                session_id: session_id.clone(),
+                bytes: bytes.clone(),
+            })
+        });
     }
 
     /// `true` if `subscriber` was actually attached here.
@@ -2287,7 +2276,7 @@ impl SessionTable {
         cols: u16,
         rows: u16,
     ) -> TableResult<()> {
-        let (effective, hub) = {
+        let (effective, hub, size_changed) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2305,15 +2294,13 @@ impl SessionTable {
                 session.cols,
                 session.rows
             );
-            if effective == (session.cols, session.rows) {
-                return Ok(());
-            }
-            (effective, session.hub.clone())
+            let size_changed = effective != (session.cols, session.rows);
+            (effective, session.hub.clone(), size_changed)
         };
-        self.apply_size(id, effective.0, effective.1).await?;
-        hub.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .repaint(id, subscriber);
+        if size_changed {
+            self.apply_size(id, effective.0, effective.1).await?;
+        }
+        hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
         Ok(())
     }
 
@@ -2323,7 +2310,19 @@ impl SessionTable {
     /// (see [`Session::sizes`]) — including on detach, where there is nothing
     /// of its to give back.
     pub async fn resize_legacy(&self, id: &SessionId, cols: u16, rows: u16) -> TableResult<()> {
-        self.apply_size(id, cols.max(1), rows.max(1)).await
+        let asked = (cols.max(1), rows.max(1));
+        let (hub, size_changed) = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
+            (session.hub.clone(), (session.cols, session.rows) != asked)
+        };
+        if size_changed {
+            self.apply_size(id, asked.0, asked.1).await?;
+        }
+        hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
+        Ok(())
     }
 
     /// Hand the pty to one view: its ask becomes the size, instead of the
@@ -2366,18 +2365,14 @@ impl SessionTable {
                 return Ok(());
             };
             let size_changed = effective != (session.cols, session.rows);
-            let repaint = (hover || !already || size_changed)
-                .then(|| owner.map(|owner| (session.hub.clone(), owner)))
-                .flatten();
+            let repaint = (hover || !already || size_changed).then(|| session.hub.clone());
             (size_changed.then_some(effective), repaint)
         };
         if let Some((cols, rows)) = resize {
             self.apply_size(id, cols, rows).await?;
         }
-        if let Some((hub, owner)) = repaint {
-            hub.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .repaint(id, owner);
+        if let Some(hub) = repaint {
+            hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
         }
         Ok(())
     }
@@ -3224,8 +3219,8 @@ mod tests {
     };
 
     use super::{
-        Activity, Outbound, OutputHub, SessionTable, StatusConfig, SubscriberId, is_shell_name,
-        login_shell_from, shell, terminal_env,
+        Activity, Outbound, OutputHub, SessionGrid, SessionTable, StatusConfig, SubscriberId,
+        is_shell_name, login_shell_from, shell, terminal_env,
     };
     #[cfg(unix)]
     use super::{KILL_GRACE, terminate_groups, wait_for_termination};
@@ -4684,6 +4679,19 @@ mod tests {
              reading"
         );
         assert!(!never_read.is_closed(), "its queue was closed anyway");
+    }
+
+    #[test]
+    fn a_repaint_drops_a_subscriber_that_cannot_accept_it() {
+        let id = SessionId::new("session-1");
+        let (outbound, _queue) = Outbound::new(512);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(120, 40)), None);
+        hub.attach(&id, SubscriberId::next(), &outbound);
+
+        hub.repaint(&id);
+
+        assert!(hub.subscribers.is_empty());
+        assert!(outbound.is_closed());
     }
 
     /// Output larger than the attach budget replays only the newest of it and

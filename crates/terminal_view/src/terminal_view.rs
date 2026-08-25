@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use task::TaskId;
 use terminal::{
@@ -77,6 +77,20 @@ fn viewport_line_for_point(point: Point, display_offset: usize) -> Option<usize>
 }
 
 const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(500);
+const RESIZE_REPEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+fn should_request_resize(
+    previous: Option<((u16, u16), Instant)>,
+    size: (u16, u16),
+    force: bool,
+    now: Instant,
+) -> bool {
+    force
+        || previous.is_none_or(|(previous_size, requested_at)| {
+            previous_size != size
+                || now.saturating_duration_since(requested_at) >= RESIZE_REPEAT_INTERVAL
+        })
+}
 
 /// Event to transmit the scroll from the element to the view
 #[derive(Clone, Debug, PartialEq)]
@@ -149,7 +163,9 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
-    resize_callback: Option<Rc<dyn Fn(Option<(u16, u16)>, &mut Context<TerminalView>)>>,
+    resize_callback: Option<Rc<dyn Fn(Option<(u16, u16)>, &mut App) -> Task<()>>>,
+    resize_request_task: Task<()>,
+    last_resize_request: Option<((u16, u16), Instant)>,
     hover_resize_task: Task<()>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
@@ -317,6 +333,8 @@ impl TerminalView {
             needs_serialize: false,
             custom_title: None,
             resize_callback: None,
+            resize_request_task: Task::ready(()),
+            last_resize_request: None,
             hover_resize_task: Task::ready(()),
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -451,9 +469,23 @@ impl TerminalView {
 
     pub fn set_resize_callback(
         &mut self,
-        callback: impl Fn(Option<(u16, u16)>, &mut Context<Self>) + 'static,
+        callback: impl Fn(Option<(u16, u16)>, &mut App) -> Task<()> + 'static,
     ) {
         self.resize_callback = Some(Rc::new(callback));
+    }
+
+    pub fn request_resize(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(size) = self.view_size(cx) else {
+            return;
+        };
+        let now = Instant::now();
+        if !should_request_resize(self.last_resize_request, size, force, now) {
+            return;
+        }
+        self.last_resize_request = Some((size, now));
+        if let Some(callback) = self.resize_callback.clone() {
+            self.resize_request_task = callback(Some(size), cx);
+        }
     }
 
     pub fn set_custom_title(&mut self, label: Option<String>, cx: &mut Context<Self>) {
@@ -1302,9 +1334,7 @@ impl TerminalView {
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
-        if let Some(callback) = self.resize_callback.clone() {
-            callback(self.view_size(cx), cx);
-        }
+        self.request_resize(false, cx);
 
         if self.process_keystroke(&event.keystroke, cx) {
             cx.stop_propagation();
@@ -1389,12 +1419,12 @@ impl Render for TerminalView {
             .on_action(cx.listener(TerminalView::rename_terminal))
             .on_key_down(cx.listener(Self::key_down))
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if *hovered && let Some(callback) = this.resize_callback.clone() {
+                if *hovered && this.resize_callback.is_some() {
                     this.hover_resize_task = cx.spawn(async move |this, cx| {
                         cx.background_executor()
                             .timer(Duration::from_millis(300))
                             .await;
-                        this.update(cx, |this, cx| callback(this.view_size(cx), cx))
+                        this.update(cx, |this, cx| this.request_resize(true, cx))
                             .ok();
                     });
                 } else if !*hovered {
@@ -2211,6 +2241,27 @@ mod tests {
     use util::rel_path::RelPath;
     use workspace::item::test::{TestItem, TestProjectItem};
     use workspace::{AppState, MultiWorkspace, SelectedEntry};
+
+    #[test]
+    fn repeated_resize_requests_are_throttled_but_focus_forces_one() {
+        let now = Instant::now();
+        let previous = Some(((80, 24), now));
+
+        assert!(!should_request_resize(
+            previous,
+            (80, 24),
+            false,
+            now + Duration::from_millis(100)
+        ));
+        assert!(should_request_resize(previous, (80, 24), true, now));
+        assert!(should_request_resize(previous, (100, 30), false, now));
+        assert!(should_request_resize(
+            previous,
+            (80, 24),
+            false,
+            now + RESIZE_REPEAT_INTERVAL
+        ));
+    }
 
     fn expected_drop_text(paths: &[PathBuf]) -> String {
         let mut text = String::new();
