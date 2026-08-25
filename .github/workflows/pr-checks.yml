@@ -23,6 +23,10 @@ jobs:
         with:
           clean: false
           persist-credentials: false
+      - name: Reset source tree
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx -e target/
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Install Linux dependencies
@@ -55,6 +59,10 @@ jobs:
         with:
           clean: false
           persist-credentials: false
+      - name: Reset source tree
+        run: |
+          git reset --hard HEAD
+          git clean -ffdx -e target/
       - name: Install MSVC Rust target
         run: |
           "C:\Program Files\Git\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
