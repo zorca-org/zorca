@@ -10,8 +10,9 @@ source for installation instructions and current project status.
 
 web
 
-The product documented by the website is a native desktop application for macOS
-and Linux. Windows is not supported.
+The product documented by the website is a native desktop application for
+Windows, Linux, and macOS. Nightly packages are available for Windows and
+Linux. macOS currently uses source builds.
 
 ## Users
 
@@ -88,13 +89,12 @@ Current capabilities:
 - Optional GitHub Copilot support
 - No required account or hosted ZOrca AI service
 
-ZOrca is pre-alpha. Breaking changes are expected. There are no packaged,
-signed releases or automatic updates yet.
+ZOrca is pre-alpha. Breaking changes are expected. Nightly packages are
+available for Windows and Linux. Automatic updates are not available.
 
-Before release, do not present packaged releases, signing, notarization,
-Homebrew distribution, automatic updates, or additional Linux formats as
-available.
-Public copy can identify Homebrew distribution as planned without a date.
+Public copy must identify nightly packages as pre-release builds. A macOS
+package is not available yet. Homebrew distribution remains planned without a
+date.
 
 The following areas are planned, not current capabilities:
 

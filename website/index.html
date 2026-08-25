@@ -204,7 +204,7 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
     <h1>All your agents. All your projects. One native workspace.</h1>
     <p class="lead">ZOrca is an Agent Development Environment that uses Zed as its foundation. Each coding agent gets a Git worktree, terminal, and diff. When you return, ZOrca restores the project and session context.</p>
     <a class="cta" href="#install">Install ZOrca</a>
-    <p class="status">Pre-alpha · Source builds for macOS and Linux · Homebrew planned</p>
+    <p class="status">Pre-alpha · Nightly builds for Windows and Linux · macOS source builds</p>
   </div>
   <figure class="hero-shot">
     <img src="zorca-workspace-800.webp" srcset="zorca-workspace-800.webp 800w, zorca-workspace.webp 1600w" sizes="(max-width:850px) calc(100vw - 2rem), 800px" width="1600" height="1041" alt="ZOrca showing project worktrees, an agent terminal, and repository files" fetchpriority="high" onload="this.parentElement.classList.add('loaded')">
@@ -264,8 +264,8 @@ FORM: Multica-inspired product storytelling with ZOrca content and identity; app
 
   <section class="section install" id="install">
     <div class="wrap install-grid">
-      <div><h2>Install ZOrca.</h2><p>The current release uses source builds for macOS and Linux. The project plans Homebrew support.</p><div class="terminal" aria-label="Source installation commands"><span class="dim"># macOS and Linux</span><span>git clone https://github.com/zorca-org/zorca.git</span><span>cd zorca</span><span class="dim"># Linux only</span><span>./script/linux</span><span>./script/download-wasi-sdk</span><span class="dim"># Build and launch</span><span>cargo run -p zed</span></div><a class="more" href="https://github.com/zorca-org/zorca#install">Read the full build instructions</a></div>
-      <div class="facts"><div class="fact"><strong>Pre-alpha</strong>Expect breaking changes.</div><div class="fact"><strong>No packaged release yet</strong>Packaged and signed releases are not currently available.</div><div class="fact"><strong>macOS and Linux</strong>Windows is not supported.</div><div class="fact"><strong>Independent and open source</strong>GPL-3.0-or-later. Not affiliated with Zed Industries or Stably AI.</div></div>
+      <div><h2>Install ZOrca.</h2><p>Download nightly builds for Windows and Linux from <a href="https://github.com/zorca-org/zorca/releases">GitHub Releases</a>. macOS currently uses a source build.</p><div class="terminal" aria-label="Source installation commands"><span class="dim"># Clone for macOS or Linux</span><span>git clone https://github.com/zorca-org/zorca.git</span><span>cd zorca</span><span class="dim"># macOS: build and install</span><span>./script/bundle-mac -i</span><span class="dim"># Linux: build and install</span><span>./script/linux</span><span>./script/download-wasi-sdk</span><span>./script/install-linux</span></div><a class="more" href="https://github.com/zorca-org/zorca#install">Read the full install instructions</a></div>
+      <div class="facts"><div class="fact"><strong>Pre-alpha</strong>Expect breaking changes.</div><div class="fact"><strong>Nightly builds</strong>Windows and Linux packages are available.</div><div class="fact"><strong>macOS source build</strong>A macOS package is not available yet.</div><div class="fact"><strong>Independent and open source</strong>GPL-3.0-or-later. Not affiliated with Zed Industries or Stably AI.</div></div>
     </div>
   </section>
 </main>

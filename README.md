@@ -18,7 +18,7 @@
 <p align="center">
   <a href="./LICENSE-GPL"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-304CFF" alt="GPL-3.0-or-later" /></a>
   <a href="#project-status"><img src="https://img.shields.io/badge/status-pre--alpha-FF654B" alt="Pre-alpha" /></a>
-  <a href="#install"><img src="https://img.shields.io/badge/platforms-macOS%20%C2%B7%20Linux-713CFF" alt="macOS and Linux" /></a>
+  <a href="#install"><img src="https://img.shields.io/badge/platforms-Windows%20%C2%B7%20Linux%20%C2%B7%20macOS-713CFF" alt="Windows, Linux, and macOS" /></a>
   <a href="https://github.com/zed-industries/zed"><img src="https://img.shields.io/badge/built%20on-Zed-071833" alt="Built on Zed" /></a>
 </p>
 
@@ -118,38 +118,69 @@ ZOrca also includes these features:
 ## Install
 
 > [!NOTE]
-> ZOrca is pre-alpha. It does not provide packaged or signed releases. The
-> source supports builds on macOS and Linux. The project plans Homebrew support.
+> ZOrca is pre-alpha. Nightly builds can change without notice. Automatic
+> updates are not available.
+
+### Nightly builds
+
+[GitHub Releases](https://github.com/zorca-org/zorca/releases) provides nightly
+builds for Windows and Linux. A macOS nightly build is not available yet.
+
+On Windows, download `ZOrca-Nightly-x86_64.exe`. Then run the installer.
+
+On Linux, download `zorca-linux-x86_64.tar.gz`. Then install it with the
+repository installer:
+
+```sh
+git clone https://github.com/zorca-org/zorca.git
+cd zorca
+ZORCA_CHANNEL=nightly \
+ZORCA_BUNDLE_PATH="$HOME/Downloads/zorca-linux-x86_64.tar.gz" \
+./script/install.sh
+```
+
+If the archive is in a different directory, change `ZORCA_BUNDLE_PATH`.
+
+### Build from source
+
+Clone the repository before you run the platform commands:
+
+```sh
+git clone https://github.com/zorca-org/zorca.git
+cd zorca
+```
 
 ### macOS
 
 Install the prerequisites from the [macOS development guide from Zed](https://zed.dev/docs/development/macos).
 
-Then run these commands:
+Build and install ZOrca in `/Applications`:
 
 ```sh
-git clone https://github.com/zorca-org/zorca.git
-cd zorca
-cargo zorca
+./script/bundle-mac -i
 ```
 
-Build a `ZOrca.app` bundle with this command:
+For development, build and run ZOrca with Cargo:
 
 ```sh
-script/bundle-mac
+cargo zorca
 ```
 
 ### Linux
 
 Install the prerequisites from the [Linux development guide from Zed](https://zed.dev/docs/development/linux).
 
-Then run these commands:
+Install the build dependencies. Then build and install ZOrca in `~/.local`:
 
 ```sh
-git clone https://github.com/zorca-org/zorca.git
-cd zorca
 ./script/linux
 ./script/download-wasi-sdk
+./script/install-linux
+```
+
+For development, build and run ZOrca with Cargo:
+
+```sh
 cargo zorca
 ```
 
@@ -205,12 +236,13 @@ changes that also apply to Zed.
 
 ## Project status
 
-ZOrca is pre-alpha. You must build ZOrca from source. Breaking changes can occur.
+ZOrca is pre-alpha. Nightly packages are available for Windows and Linux.
+macOS supports source builds. Breaking changes can occur.
 
 The current release has these limits:
 
-- ZOrca does not provide signed releases or automatic updates.
-- ZOrca does not support Windows.
+- ZOrca does not provide automatic updates.
+- ZOrca does not provide a macOS package yet.
 - ZOrca does not provide fleet orchestration or scheduled automation.
 
 ZOrca is an independent hard fork. Zed Industries and Stably AI do not endorse
