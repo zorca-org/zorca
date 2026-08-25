@@ -5208,19 +5208,53 @@ impl Sidebar {
                         });
                         let recovery_sidebar = sidebar.clone();
                         let recovery_workspace = workspace.clone();
+                        let close_scope = recovery_scope.clone();
                         let menu =
                             menu.separator()
                                 .entry("Close Workspace", None, move |window, cx| {
                                     let Some(workspace) = workspace.upgrade() else {
                                         return;
                                     };
-                                    multi_workspace
-                                        .update(cx, |multi_workspace, cx| {
-                                            multi_workspace
-                                                .close_workspace(&workspace, window, cx)
-                                                .detach_and_log_err(cx);
+                                    let cleanup =
+                                        close_scope.as_ref().map(|(worktree_root, ade_host)| {
+                                            ade_workspaces::kill_workspace_sessions(
+                                                &workspace,
+                                                worktree_root,
+                                                ade_host.as_deref(),
+                                                cx,
+                                            )
+                                        });
+                                    let multi_workspace = multi_workspace.clone();
+                                    window
+                                        .spawn(cx, async move |cx| {
+                                            if let Some(cleanup) = cleanup
+                                                && let Err(error) = cleanup.await
+                                            {
+                                                let detail = format!("{error:#}");
+                                                let prompt = cx.update(|window, cx| {
+                                                    window.prompt(
+                                                        gpui::PromptLevel::Critical,
+                                                        "Could not close workspace",
+                                                        Some(&detail),
+                                                        &["OK"],
+                                                        cx,
+                                                    )
+                                                })?;
+                                                prompt.await.log_err();
+                                                return anyhow::Ok(());
+                                            }
+
+                                            let close = multi_workspace.update_in(
+                                                cx,
+                                                |multi_workspace, window, cx| {
+                                                    multi_workspace
+                                                        .close_workspace(&workspace, window, cx)
+                                                },
+                                            )?;
+                                            close.await?;
+                                            anyhow::Ok(())
                                         })
-                                        .ok();
+                                        .detach_and_log_err(cx);
                                 });
                         menu.when_some(recovery_scope, |menu, (worktree_root, ade_host)| {
                             menu.entry("Kill and Recreate Sessions…", None, move |window, cx| {

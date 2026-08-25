@@ -25,7 +25,8 @@ mod workspace_sidebar;
 mod workspace_view;
 
 pub use attach::{
-    can_reset_workspace_sessions, kill_and_recreate_workspace_sessions, open_workspace_session,
+    can_reset_workspace_sessions, kill_and_recreate_workspace_sessions, kill_workspace_sessions,
+    open_workspace_session,
 };
 pub use connect::{destination_for, open_connection_workspace};
 pub use create_workspace_modal::{OnWorkspaceCreated, open_create_workspace_modal};

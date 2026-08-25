@@ -199,6 +199,26 @@ pub fn can_reset_workspace_sessions(
         .is_some()
 }
 
+/// Kills every persistent terminal session for the exact worktree shown by
+/// this window, so closing it cannot leave an agent process behind.
+pub fn kill_workspace_sessions(
+    zed_workspace: &Entity<Workspace>,
+    repository_path: &Path,
+    remote_host: Option<&str>,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    let Some(id) =
+        bound_workspace_for_worktree(zed_workspace.entity_id(), repository_path, remote_host, cx)
+            .cloned()
+    else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "this worktree is not the persistent workspace attached to this window"
+        )));
+    };
+    let lifecycle = crate::lifecycle_service(cx);
+    cx.background_spawn(async move { lifecycle.kill_workspace_session(&id).await.map(|_| ()) })
+}
+
 /// Kills every persistent session in the workspace shown by this window and
 /// attaches one fresh session without restarting the host daemon.
 ///
@@ -484,9 +504,19 @@ mod tests {
     };
     use anyhow::bail;
     use gpui::{TestAppContext, VisualTestContext};
-    use std::{path::Path, sync::Arc};
+    use std::{
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
-    struct MissingLayoutBackend;
+    #[derive(Default)]
+    struct MissingLayoutBackend {
+        session_exists: bool,
+        kill_count: AtomicUsize,
+    }
 
     impl SessionBackend for MissingLayoutBackend {
         fn create(&self, _spec: &SessionSpec, _expected: Option<&str>) -> Result<SessionId> {
@@ -498,7 +528,7 @@ mod tests {
         }
 
         fn exists(&self, _id: &SessionId, _expected: Option<&str>) -> Result<bool> {
-            Ok(false)
+            Ok(self.session_exists)
         }
 
         fn attach(&self, _spec: &SessionSpec, _expected: Option<&str>) -> Result<Attached> {
@@ -510,6 +540,7 @@ mod tests {
         }
 
         fn kill(&self, _id: &SessionId, _expected: Option<&str>) -> Result<()> {
+            self.kill_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -535,6 +566,14 @@ mod tests {
         name: &'static str,
         cx: &mut TestAppContext,
     ) -> (Entity<Workspace>, AdeWorkspace, VisualTestContext) {
+        test_window_with_backend(name, Arc::new(MissingLayoutBackend::default()), cx).await
+    }
+
+    async fn test_window_with_backend(
+        name: &'static str,
+        backend: Arc<dyn SessionBackend>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<Workspace>, AdeWorkspace, VisualTestContext) {
         cx.update(|cx| {
             let settings = settings::SettingsStore::test(cx);
             cx.set_global(settings);
@@ -555,10 +594,7 @@ mod tests {
             .create_workspace(ade_workspace.clone())
             .await
             .expect("test workspace should be registered");
-        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(
-            registry,
-            Arc::new(MissingLayoutBackend),
-        ));
+        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(registry, backend));
         window.update(|_, cx| cx.set_global(GlobalLifecycleService(lifecycle)));
 
         (workspace, ade_workspace, window.clone())
@@ -649,6 +685,53 @@ mod tests {
         assert!(!window.update(|_, cx| {
             can_reset_workspace_sessions(&workspace, Path::new("/repo/sibling"), None, cx)
         }));
+    }
+
+    #[gpui::test]
+    async fn closing_a_bound_workspace_kills_its_persistent_sessions(cx: &mut TestAppContext) {
+        let backend = Arc::new(MissingLayoutBackend {
+            session_exists: true,
+            ..Default::default()
+        });
+        let (workspace, ade_workspace, mut window) = test_window_with_backend(
+            "closing_bound_workspace_kills_sessions",
+            backend.clone(),
+            cx,
+        )
+        .await;
+        let session_id = ade_workspace.daemon_workspace_id();
+        let lifecycle = window.update(|_, cx| crate::lifecycle_service(cx));
+        lifecycle
+            .registry()
+            .update_terminal_session_id(ade_workspace.id.clone(), Some(session_id.clone()))
+            .await
+            .expect("the test session should be recorded");
+
+        let bind = window.update(|window, cx| {
+            window.spawn(cx, {
+                let workspace = workspace.downgrade();
+                let ade_workspace = ade_workspace.clone();
+                async move |cx| name_window_after_workspace(&workspace, &ade_workspace, cx)
+            })
+        });
+        bind.await.expect("the workspace should bind");
+
+        let cleanup = window
+            .update(|_, cx| kill_workspace_sessions(&workspace, Path::new("/repo"), None, cx));
+        cleanup
+            .await
+            .expect("the persistent session should be killed");
+
+        assert_eq!(backend.kill_count.load(Ordering::SeqCst), 1);
+        let persisted = lifecycle
+            .registry()
+            .get_workspace(ade_workspace.id)
+            .expect("the test workspace should remain readable")
+            .expect("closing must keep the workspace record");
+        assert_eq!(
+            persisted.terminal_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
     }
 
     #[gpui::test]

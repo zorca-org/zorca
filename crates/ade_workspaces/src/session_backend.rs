@@ -481,8 +481,7 @@ pub trait SessionBackend: Send + Sync {
     fn attach(&self, spec: &SessionSpec, expected_daemon_id: Option<&str>) -> Result<Attached>;
 
     /// Drops every client attached to the session. The session and everything
-    /// running in it keep going: this is what closing means, per the invariant
-    /// that closing detaches and never kills.
+    /// running in it keep going.
     ///
     /// Not in the daemon sketch, but load-bearing today. Detaching a session
     /// nobody is attached to is a no-op, not an error.
