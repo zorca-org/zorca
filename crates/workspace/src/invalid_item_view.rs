@@ -115,13 +115,13 @@ impl InvalidItemView {
         .detach_and_log_err(cx);
     }
 
-    fn play_remote_video(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn play_remote_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_downloading {
             return;
         }
 
         let Some(file_name) = self.abs_path.file_name() else {
-            self.download_message = Some("Could not determine the video file name".into());
+            self.download_message = Some("Could not determine the media file name".into());
             cx.notify();
             return;
         };
@@ -175,7 +175,7 @@ impl InvalidItemView {
                 this.is_downloading = false;
                 this.download_message = match result {
                     Ok(()) => None,
-                    Err(error) => Some(format!("Could not play video: {error:#}").into()),
+                    Err(error) => Some(format!("Could not play media: {error:#}").into()),
                 };
                 cx.notify();
             })?;
@@ -185,13 +185,29 @@ impl InvalidItemView {
     }
 }
 
-fn is_video_file(path: &Path) -> bool {
+fn is_media_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "avi" | "m4v" | "mkv" | "mov" | "mp4" | "webm" | "wmv"
+                "aac"
+                    | "avi"
+                    | "flac"
+                    | "m4a"
+                    | "m4v"
+                    | "mka"
+                    | "mkv"
+                    | "mov"
+                    | "mp3"
+                    | "mp4"
+                    | "ogg"
+                    | "opus"
+                    | "wav"
+                    | "webm"
+                    | "wma"
+                    | "wmv"
+                    | "wv"
             )
         })
 }
@@ -272,14 +288,14 @@ impl Render for InvalidItemView {
                                     h_flex()
                                         .gap_2()
                                         .justify_center()
-                                        .when(is_video_file(&self.abs_path), |buttons| {
+                                        .when(is_media_file(&self.abs_path), |buttons| {
                                             buttons.child(
                                                 Button::new(
-                                                    "play-remote-video",
+                                                    "play-remote-media",
                                                     "Play in Default App",
                                                 )
                                                 .on_click(cx.listener(|this, _, window, cx| {
-                                                    this.play_remote_video(window, cx);
+                                                    this.play_remote_media(window, cx);
                                                 }))
                                                 .disabled(self.is_downloading)
                                                 .loading(self.is_downloading)
@@ -308,7 +324,7 @@ impl Render for InvalidItemView {
 
 #[cfg(test)]
 mod tests {
-    use super::{InvalidItemView, is_video_file};
+    use super::{InvalidItemView, is_media_file};
     use anyhow::anyhow;
     use fs::FakeFs;
     use gpui::TestAppContext;
@@ -317,10 +333,11 @@ mod tests {
     use util::rel_path::rel_path;
 
     #[test]
-    fn identifies_video_files_case_insensitively() {
-        assert!(is_video_file(Path::new("demo.MP4")));
-        assert!(is_video_file(Path::new("demo.webm")));
-        assert!(!is_video_file(Path::new("demo.png")));
+    fn identifies_media_files_case_insensitively() {
+        assert!(is_media_file(Path::new("demo.MP4")));
+        assert!(is_media_file(Path::new("demo.MP3")));
+        assert!(is_media_file(Path::new("demo.flac")));
+        assert!(!is_media_file(Path::new("demo.png")));
     }
 
     #[gpui::test]
