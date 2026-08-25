@@ -80,9 +80,6 @@ const DRAIN_CHUNK_BYTES: usize = 8192;
 #[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(1);
 
-/// How long after input a hover claim keeps yielding.
-const TYPING_HOLD: Duration = Duration::from_secs(3);
-
 /// The byte an agent sends when it wants a human: `BEL`, 0x07.
 const BELL: u8 = 0x07;
 
@@ -788,6 +785,20 @@ impl OutputHub {
         }
     }
 
+    /// Repaint every attached viewer after the shared screen changes size.
+    fn repaint(&mut self, session_id: &SessionId) {
+        let Some(grid) = self.grid.as_ref() else {
+            return;
+        };
+        let bytes = grid.repaint();
+        self.subscribers.retain(|(_, outbound)| {
+            outbound.push(Frame::Output {
+                session_id: session_id.clone(),
+                bytes: bytes.clone(),
+            })
+        });
+    }
+
     /// `true` if `subscriber` was actually attached here.
     fn detach(&mut self, subscriber: SubscriberId) -> bool {
         let before = self.subscribers.len();
@@ -862,8 +873,6 @@ struct Session {
     /// does; view ids are never reused, so a claim that never resolves is inert
     /// rather than wrong.
     focused_view: Option<String>,
-    /// When a client last wrote input, so hover claims can yield to a typist.
-    last_input: Option<Instant>,
 }
 
 impl Session {
@@ -1099,7 +1108,6 @@ impl SessionTable {
                     sizes: Vec::new(),
                     view_ids: Vec::new(),
                     focused_view: None,
-                    last_input: None,
                 },
             );
         }
@@ -1450,7 +1458,6 @@ impl SessionTable {
                     sizes: Vec::new(),
                     view_ids: Vec::new(),
                     focused_view: None,
-                    last_input: None,
                 },
             );
         (info, hub, activity)
@@ -2235,7 +2242,6 @@ impl SessionTable {
             let session = sessions
                 .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
-            session.last_input = Some(Instant::now());
             let Some(live) = session.live.as_ref() else {
                 return Err(TableError::invalid_argument(format!(
                     "session {id} was lost when the daemon restarted"
@@ -2270,7 +2276,7 @@ impl SessionTable {
         cols: u16,
         rows: u16,
     ) -> TableResult<()> {
-        let effective = {
+        let (effective, hub, size_changed) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
@@ -2288,12 +2294,14 @@ impl SessionTable {
                 session.cols,
                 session.rows
             );
-            if effective == (session.cols, session.rows) {
-                return Ok(());
-            }
-            effective
+            let size_changed = effective != (session.cols, session.rows);
+            (effective, session.hub.clone(), size_changed)
         };
-        self.apply_size(id, effective.0, effective.1).await
+        if size_changed {
+            self.apply_size(id, effective.0, effective.1).await?;
+        }
+        hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
+        Ok(())
     }
 
     /// The generation-2 resize: last request wins, applied straight to the pty.
@@ -2302,7 +2310,19 @@ impl SessionTable {
     /// (see [`Session::sizes`]) — including on detach, where there is nothing
     /// of its to give back.
     pub async fn resize_legacy(&self, id: &SessionId, cols: u16, rows: u16) -> TableResult<()> {
-        self.apply_size(id, cols.max(1), rows.max(1)).await
+        let asked = (cols.max(1), rows.max(1));
+        let (hub, size_changed) = {
+            let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
+            (session.hub.clone(), (session.cols, session.rows) != asked)
+        };
+        if size_changed {
+            self.apply_size(id, asked.0, asked.1).await?;
+        }
+        hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
+        Ok(())
     }
 
     /// Hand the pty to one view: its ask becomes the size, instead of the
@@ -2313,36 +2333,23 @@ impl SessionTable {
     /// view nothing has attached with yet, or one that has not asked, leaves
     /// the minimum standing until it does.
     ///
-    /// `hover` claims are declined while the session was typed into recently
-    /// and some other view already holds the claim, so a stray mouse-over
-    /// cannot steal size from a typist.
-    ///
     /// Same lock discipline as [`Self::resize`], and for the same reason: the
     /// decision is made under the table lock, the pty call is made after it.
     pub async fn focus(&self, id: &SessionId, view_id: &str, hover: bool) -> TableResult<()> {
-        let effective = {
+        let (resize, repaint) = {
             let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             let session = sessions
                 .get_mut(id)
                 .ok_or_else(|| TableError::not_found(format!("no such session {id}")))?;
-            if hover
-                && session
-                    .last_input
-                    .is_some_and(|t| t.elapsed() < TYPING_HOLD)
-                && session.focused_view.as_deref() != Some(view_id)
-            {
-                log::info!(
-                    "session {id} hover claim by view {view_id} deferred: the session is being typed into"
-                );
-                return Ok(());
-            }
             let already = session.focused_view.as_deref() == Some(view_id);
             session.focused_view = Some(view_id.to_owned());
-            let view_ask = session
+            let owner = session
                 .view_ids
                 .iter()
                 .find(|(_, id)| id == view_id)
-                .and_then(|(owner, _)| session.sizes.iter().find(|(who, _)| who == owner))
+                .map(|(owner, _)| *owner);
+            let view_ask = owner
+                .and_then(|owner| session.sizes.iter().find(|(who, _)| *who == owner))
                 .map(|(_, size)| *size);
             let effective = session.effective_size();
             // Repeated claims from the size owner stay quiet; anything that
@@ -2357,12 +2364,17 @@ impl SessionTable {
             let Some(effective) = effective else {
                 return Ok(());
             };
-            if effective == (session.cols, session.rows) {
-                return Ok(());
-            }
-            effective
+            let size_changed = effective != (session.cols, session.rows);
+            let repaint = (hover || !already || size_changed).then(|| session.hub.clone());
+            (size_changed.then_some(effective), repaint)
         };
-        self.apply_size(id, effective.0, effective.1).await
+        if let Some((cols, rows)) = resize {
+            self.apply_size(id, cols, rows).await?;
+        }
+        if let Some(hub) = repaint {
+            hub.lock().unwrap_or_else(|e| e.into_inner()).repaint(id);
+        }
+        Ok(())
     }
 
     /// Resize the screen, then the pty, and remember the new size.
@@ -3207,8 +3219,8 @@ mod tests {
     };
 
     use super::{
-        Activity, Outbound, OutputHub, SessionTable, StatusConfig, SubscriberId, is_shell_name,
-        login_shell_from, shell, terminal_env,
+        Activity, Outbound, OutputHub, SessionGrid, SessionTable, StatusConfig, SubscriberId,
+        is_shell_name, login_shell_from, shell, terminal_env,
     };
     #[cfg(unix)]
     use super::{KILL_GRACE, terminate_groups, wait_for_termination};
@@ -4667,6 +4679,19 @@ mod tests {
              reading"
         );
         assert!(!never_read.is_closed(), "its queue was closed anyway");
+    }
+
+    #[test]
+    fn a_repaint_drops_a_subscriber_that_cannot_accept_it() {
+        let id = SessionId::new("session-1");
+        let (outbound, _queue) = Outbound::new(512);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(120, 40)), None);
+        hub.attach(&id, SubscriberId::next(), &outbound);
+
+        hub.repaint(&id);
+
+        assert!(hub.subscribers.is_empty());
+        assert!(outbound.is_closed());
     }
 
     /// Output larger than the attach budget replays only the newest of it and

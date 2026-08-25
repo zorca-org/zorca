@@ -26,11 +26,11 @@
 //! - **The terminal is restored however it ends.** `RawMode` restores what it
 //!   saved from `Drop`, which covers the error paths and a panic alike.
 //!
-//! One connection, one writer: [`Frame::Write`] and [`Frame::Resize`] are
-//! queued on a channel and written by a single task, because two tasks writing
-//! frames to one stream could interleave a length prefix with somebody else's
-//! payload. The connect hands back the two halves already separated — on a
-//! socket, two clones of one fd.
+//! One connection, one writer: input, focus and resize frames are queued on a
+//! channel and written by a single task, because two tasks writing one stream
+//! could interleave a length prefix with somebody else's payload. The connect
+//! hands back the two halves already separated — on a socket, two clones of one
+//! fd.
 //!
 //! Everything above is platform-neutral, and so is the code for it. Only the
 //! local terminal is not: a Unix tty is termios plus SIGWINCH ([`tty`]), a
@@ -87,6 +87,26 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// A replay describes a fresh terminal, so re-establish that baseline first.
 const RESET_TERMINAL: &[u8] = b"\x1bc";
+
+fn reports_terminal_size(zed_term: bool) -> bool {
+    !zed_term
+}
+
+fn initial_terminal_size() -> Option<(u16, u16)> {
+    reports_terminal_size(std::env::var_os("ZED_TERM").is_some())
+        .then(terminal_size)
+        .flatten()
+}
+
+fn attach_hello(view_id: Option<&str>) -> Hello {
+    match view_id {
+        Some(_) => Hello::current(),
+        None => Hello {
+            max_generation: LEGACY_GENERATION,
+            ..Hello::current()
+        },
+    }
+}
 
 /// The two halves of a connection, back together as the one duplex stream
 /// [`Connection::handshake`] needs. A join, not an adapter: reads go to the
@@ -392,7 +412,8 @@ where
         // owns the §3.1 verification and this client does not get a second
         // opinion about it. The halves come back out unchanged.
         let mut connection = Connection::new(Duplex::new(reader, writer));
-        let error = match connection.handshake(Hello::current()).await {
+        let hello = attach_hello(config.view_id.as_deref());
+        let error = match connection.handshake(hello).await {
             Ok(ack) => {
                 if let Some(expected) = &config.expected_daemon_id
                     && let Err(error) = identity_matches(expected, ack.instance_id.as_deref())
@@ -521,7 +542,7 @@ where
     let (reader, writer, generation) = handshaken(config, connect, !reconnecting).await?;
     let mut daemon = Connection::new(reader);
     let mut writer = Connection::new(writer);
-    if let Some((cols, rows)) = terminal_size() {
+    if let Some((cols, rows)) = initial_terminal_size() {
         writer
             .send(&Frame::Resize {
                 session_id: config.session_id.clone(),
@@ -803,12 +824,17 @@ async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     }
 }
 
-/// SIGWINCH → [`Frame::Resize`]. The initial size is sent before Attach.
+/// SIGWINCH → [`Frame::Resize`]. Re-send the mounted size after Attach so a
+/// layout completed between process spawn and this pump cannot be missed.
 #[cfg(unix)]
 async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     let Some(signals) = tty::winch_signals() else {
         return;
     };
+    let mut last = terminal_size();
+    if !send_size(&outbound, &session_id).await {
+        return;
+    }
     let mut signals = Unblock::new(signals);
     let mut buffer = [0u8; 64];
     loop {
@@ -816,6 +842,11 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
+        let size = terminal_size();
+        if size == last {
+            continue;
+        }
+        last = size;
         if !send_size(&outbound, &session_id).await {
             break;
         }
@@ -823,7 +854,7 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
 }
 
 /// A changed console size → [`Frame::Resize`]. Windows has no SIGWINCH, so the
-/// size is polled instead; the initial size is sent before Attach.
+/// size is polled instead. Re-send the mounted size after Attach too.
 ///
 /// Only *changes* are sent. A `Resize` costs the daemon a `TIOCSWINSZ` and the
 /// session a SIGWINCH, so resending the same size five times a second would
@@ -835,6 +866,9 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
 #[cfg(windows)]
 async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     let mut last = terminal_size();
+    if !send_size(&outbound, &session_id).await {
+        return;
+    }
     loop {
         smol::unblock(|| std::thread::sleep(RESIZE_POLL)).await;
         let size = terminal_size();
@@ -854,6 +888,9 @@ async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bo
     let Some((cols, rows)) = terminal_size() else {
         return true;
     };
+    if !reports_terminal_size(std::env::var_os("ZED_TERM").is_some()) {
+        return true;
+    }
     outbound
         .send(QueuedFrame::Persistent(Frame::Resize {
             session_id: session_id.clone(),
@@ -1249,6 +1286,18 @@ mod handshake_tests {
 
     use super::*;
 
+    #[test]
+    fn zed_leaves_terminal_sizing_to_the_host_ui() {
+        assert!(!reports_terminal_size(true));
+        assert!(reports_terminal_size(false));
+    }
+
+    #[test]
+    fn an_unnamed_view_uses_global_last_resize_wins() {
+        assert_eq!(attach_hello(None).max_generation, LEGACY_GENERATION);
+        assert!(attach_hello(Some("view-1")).max_generation > LEGACY_GENERATION);
+    }
+
     /// A daemon that reports `generation` and `instance_id`, then records every
     /// frame through the attach. A refused client returns an empty list.
     async fn scripted_daemon(
@@ -1352,8 +1401,7 @@ mod handshake_tests {
             .expect("the client attached")
     }
 
-    /// The identity tests all run at the current generation; the fence is
-    /// about *which* daemon answered, not about what it can decode.
+    /// Identity fencing is independent of the generation-two attach mode.
     fn fenced(
         expected: Option<&str>,
         actual: Option<&str>,
@@ -1361,7 +1409,7 @@ mod handshake_tests {
     ) -> (std::result::Result<(), AttachFailure>, bool) {
         let config =
             AttachConfig::tcp("unused", "s-1").with_expected_daemon_id(expected.map(str::to_owned));
-        let (attached, frames) = attach_against(config, 3, actual, reconnecting);
+        let (attached, frames) = attach_against(config, LEGACY_GENERATION, actual, reconnecting);
         (attached, frames.is_empty())
     }
 
@@ -1458,9 +1506,11 @@ mod handshake_tests {
             let address = listener.local_addr().expect("the bound port").to_string();
             let serving = smol::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("daemon A");
-                let first = scripted_daemon(stream, 3, Some("daemon-a".to_owned())).await;
+                let first =
+                    scripted_daemon(stream, LEGACY_GENERATION, Some("daemon-a".to_owned())).await;
                 let (stream, _) = listener.accept().await.expect("daemon B");
-                let second = scripted_daemon(stream, 3, Some("daemon-b".to_owned())).await;
+                let second =
+                    scripted_daemon(stream, LEGACY_GENERATION, Some("daemon-b".to_owned())).await;
                 (first, second)
             });
             let config = AttachConfig::tcp(address.clone(), "s-1")

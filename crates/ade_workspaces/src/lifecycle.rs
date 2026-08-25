@@ -2161,6 +2161,21 @@ impl WorkspaceLifecycleService {
             .attach_session(session_id, workspace.daemon_id.as_deref())
     }
 
+    pub fn resize_session(
+        &self,
+        workspace: &AdeWorkspace,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<()> {
+        self.backend_for(workspace)?.resize_session(
+            session_id,
+            cols,
+            rows,
+            workspace.daemon_id.as_deref(),
+        )
+    }
+
     /// The workspace's layout as the backend holds it, with the revision that
     /// guards the next write.
     ///

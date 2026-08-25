@@ -997,6 +997,7 @@ impl TerminalBuilder {
                 terminal_bounds,
                 ..Default::default()
             },
+            view_bounds: Some(terminal_bounds),
             last_mouse: None,
             mouse_down_position: None,
             matches: Vec::new(),
@@ -1267,6 +1268,7 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
+                view_bounds: None,
                 last_mouse: None,
                 mouse_down_position: None,
                 matches: Vec::new(),
@@ -1475,6 +1477,7 @@ pub struct Terminal {
     mouse_down_position: Option<GpuiPoint<Pixels>>,
     pub matches: Vec<Range>,
     pub last_content: Content,
+    view_bounds: Option<TerminalBounds>,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -2027,6 +2030,7 @@ impl Terminal {
     /// The first measured size must still replace the debug-size PTY that a
     /// restored terminal starts with before its pane can receive focus.
     pub fn set_view_size(&mut self, new_bounds: TerminalBounds, view_is_focused: bool) {
+        self.view_bounds = Some(normalize_terminal_bounds(new_bounds));
         if !view_is_focused
             && self.is_ade_session()
             && self.last_content.terminal_bounds != TerminalBounds::default()
@@ -2034,6 +2038,11 @@ impl Terminal {
             return;
         }
         self.set_size(new_bounds);
+    }
+
+    pub fn view_size(&self) -> Option<(u16, u16)> {
+        self.view_bounds
+            .map(|bounds| (bounds.num_columns() as u16, bounds.num_lines() as u16))
     }
 
     /// Write the Input payload to the PTY, if applicable.
@@ -4404,6 +4413,7 @@ mod tests {
         terminal.set_view_size(background_bounds, false);
         assert!(terminal.events.is_empty());
         assert_eq!(terminal.last_content.terminal_bounds, base_bounds);
+        assert_eq!(terminal.view_size(), Some((8, 10)));
 
         terminal.focus_out();
         terminal.focus_in();

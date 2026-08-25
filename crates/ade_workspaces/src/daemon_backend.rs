@@ -521,14 +521,36 @@ impl DaemonBackend {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    fn notify(&self, expected_daemon_id: Option<&str>, frame: Frame) -> Result<()> {
+        let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
+        let outcome = smol::block_on(async {
+            if slot.as_ref().is_some_and(|control| {
+                !identity_admits(expected_daemon_id, control.instance_id.as_deref())
+            }) {
+                *slot = None;
+                self.endpoint.on_connection_lost();
+            }
+            let control = match slot.as_mut() {
+                Some(control) => control,
+                None => slot.insert(self.endpoint.connect().await?),
+            };
+            if !identity_admits(expected_daemon_id, control.instance_id.as_deref()) {
+                bail!("the terminal view belongs to another daemon");
+            }
+            control.connection.send(&frame).await
+        });
+        if outcome.is_err() {
+            *slot = None;
+            self.endpoint.on_connection_lost();
+        }
+        outcome
+    }
+
     /// Replace this host's daemon binary now, because a human asked for it.
     ///
-    /// The connect-time upgrade ([`HostLink::upgrade_if_stale`]) only fires
-    /// when a connect happens to catch the daemon both stale and expendable,
-    /// which on a host somebody actually works on may never happen. This is
-    /// the way through: it re-probes rather than trusting the cached
-    /// "already ensured", and it answers with what it found instead of
-    /// warning into the log.
+    /// This is the only path that compares, replaces, or builds a daemon that
+    /// is already installed. Ordinary connections use the running compatible
+    /// daemon immediately.
     ///
     /// Remote hosts only. The local daemon ships inside the app and is
     /// replaced when the app is.
@@ -957,6 +979,24 @@ impl SessionBackend for DaemonBackend {
         expected_daemon_id: Option<&str>,
     ) -> Result<Vec<String>> {
         Ok(self.session_argv(&proto::SessionId::new(session_id), expected_daemon_id))
+    }
+
+    fn resize_session(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+        expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        self.notify(
+            expected_daemon_id,
+            Frame::Resize {
+                session_id: proto::SessionId::new(session_id),
+                cols,
+                rows,
+            },
+        )
+        .with_context(|| format!("resizing daemon session {session_id} to {cols}x{rows}"))
     }
 
     fn open_workspace(
@@ -1902,7 +1942,7 @@ impl Endpoint {
     /// a fresh `--stdio-proxy` child locally, a fresh socket or loopback
     /// connect behind a forward.
     async fn connect(&self) -> Result<Control> {
-        if let Transport::Forwarded(link) = &self.transport {
+        let freshness_probe = if let Transport::Forwarded(link) = &self.transport {
             // Blocking, deliberately: `--ensure` and the forward are one
             // short ssh command and one process spawn, and bringing a
             // host's single connection up is rare and strictly sequential.
@@ -1912,11 +1952,16 @@ impl Endpoint {
             // put a second ssh round trip inside a 200ms window to answer a
             // question — is this daemon pre-cut — that `--ensure` cannot
             // answer anyway.
-            link.ensure_ready()?;
-        }
-        let (connection, ack) = handshaken(|| self.open()).await?;
+            link.ensure_ready()?.map(|line| (Arc::clone(link), line))
+        } else {
+            None
+        };
+        let (connection, ack) = handshaken(|| self.open(), control_hello()).await?;
         // Shared for observation only; requests use `Control::instance_id`.
         *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id.clone();
+        if let Some((link, ensure_line)) = freshness_probe {
+            link.note_prebuilt_freshness(&ensure_line);
+        }
         Ok(Control {
             connection,
             instance_id: ack.instance_id,
@@ -2007,7 +2052,7 @@ impl Endpoint {
 /// diagnosed. Anything else is an *answer*: a generation outside this client's
 /// range, an explicit error frame, a spawn that failed. Retrying an answer
 /// would just get it twice.
-async fn handshaken<C, F>(open: C) -> Result<(DaemonConnection, proto::HelloAck)>
+async fn handshaken<C, F>(open: C, hello: Hello) -> Result<(DaemonConnection, proto::HelloAck)>
 where
     C: Fn() -> F,
     F: Future<Output = Result<DaemonConnection>>,
@@ -2015,7 +2060,7 @@ where
     let mut retried = false;
     loop {
         let mut connection = open().await?;
-        let error = match connection.handshake().await {
+        let error = match connection.handshake(hello.clone()).await {
             Ok(ack) => return Ok((connection, ack)),
             Err(error) => error,
         };
@@ -2266,40 +2311,12 @@ struct RemotePaths {
     state_dir: String,
 }
 
-/// What the `--ensure` line says beyond "a daemon is listening".
-///
-/// The line is `ade-daemon <version>` followed by optional `key=value` tokens
-/// a newer daemon appends: `hash=<hex sha256 of its binary>` and
-/// `upgrade_ready=<bool>`. Absent tokens decode to the conservative reading —
-/// no hash means a legacy daemon nothing may touch, and readiness defaults to
-/// `false` for the same reason.
-#[derive(Debug, PartialEq, Eq)]
-struct EnsureReport {
-    /// The daemon's binary identity, and the *only* thing that can say whether
-    /// the host is behind: the version on the same line is `ade_session`'s
-    /// crate version, pinned like every crate in this workspace, so comparing
-    /// versions would be comparing a constant with itself.
-    hash: Option<String>,
-    upgrade_ready: bool,
-}
-
-impl EnsureReport {
-    fn parse(line: &str) -> Self {
-        let mut report = Self {
-            hash: None,
-            upgrade_ready: false,
-        };
-        for token in line.split_whitespace() {
-            if let Some(value) = token.strip_prefix("hash=") {
-                if !value.is_empty() {
-                    report.hash = Some(value.to_owned());
-                }
-            } else if let Some(value) = token.strip_prefix("upgrade_ready=") {
-                report.upgrade_ready = value == "true";
-            }
-        }
-        report
-    }
+/// Binary identity from an `ade-daemon --ensure` line. The version cannot
+/// answer freshness because every workspace crate shares the same version.
+fn daemon_hash(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find_map(|token| token.strip_prefix("hash=").filter(|hash| !hash.is_empty()))
+        .map(str::to_owned)
 }
 
 /// One remote host's single ssh connection, and everything needed to bring it
@@ -2315,10 +2332,9 @@ struct HostLink {
     /// `FRESHNESS_UNKNOWN` until a hash comparison says otherwise, and still
     /// that for a daemon too old to report a hash at all.
     ///
-    /// Written only by [`HostLink::note_hash_verdict`], from the two places
-    /// that compare the host's binary against ours: the connect-time pass and
-    /// the operator's own upgrade. Read by the sidebar, to decide whether to
-    /// offer that upgrade.
+    /// Written only by [`HostLink::note_hash_verdict`], after comparing a
+    /// configured prebuilt binary or completing the operator's own upgrade.
+    /// Read by the sidebar, to decide whether to offer that upgrade.
     ///
     /// **Deliberately not in [`HostLinkState`], and deliberately lock-free.**
     /// That mutex is held across `--ensure`, ssh round trips and a possible
@@ -2425,7 +2441,7 @@ impl HostLink {
     ///
     /// Idempotent and cheap on the happy path: a live forward that has already
     /// ensured its daemon costs one `waitpid` and nothing else.
-    fn ensure_ready(&self) -> Result<()> {
+    fn ensure_ready(&self) -> Result<Option<String>> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
 
         let forward_alive = state
@@ -2433,7 +2449,7 @@ impl HostLink {
             .as_mut()
             .is_some_and(ade_session::HostForward::is_alive);
         if forward_alive && state.daemon_ensured {
-            return Ok(());
+            return Ok(None);
         }
 
         let paths = match state.paths.clone() {
@@ -2445,11 +2461,14 @@ impl HostLink {
             }
         };
 
-        if !state.daemon_ensured {
-            let version = self.ensure_daemon(&paths)?;
+        let ensure_line = if !state.daemon_ensured {
+            let version = self.ensure_installed(&paths)?;
             log::debug!("{} is running {version}", self.host.destination);
             state.daemon_ensured = true;
-        }
+            Some(version)
+        } else {
+            None
+        };
 
         if !forward_alive {
             // Dropped before the replacement is spawned, so a host never
@@ -2462,7 +2481,7 @@ impl HostLink {
                     })?,
             );
         }
-        Ok(())
+        Ok(ensure_line)
     }
 
     /// Start the host's daemon, deploying the binary first if the host has
@@ -2478,31 +2497,11 @@ impl HostLink {
     /// upload, something is wrong with the *binary* — wrong triple, noexec
     /// mount — and looping would only build it again.
     ///
-    /// One more thing rides the ensure line: **binary identity**. A daemon
-    /// that reports its hash and declares itself upgrade-ready (nothing held
-    /// but tombstones and idle shells) is compared against the binary this
-    /// client would deploy, and on a mismatch it is asked to exit
-    /// ([`Frame::Shutdown`]), replaced, and ensured again — see
-    /// [`Self::upgrade_if_stale`]. A daemon holding a session with work in it,
-    /// or one too old to report a hash, is left exactly where it was; the way
-    /// past that is the operator's own "upgrade host daemon"
-    /// ([`Self::upgrade_on_demand`]), which forces the exit rather than asking
-    /// politely.
-    fn ensure_daemon(&self, paths: &RemotePaths) -> Result<String> {
-        let line = self.ensure_installed(paths)?;
-        if self.upgrade_if_stale(paths, &line) {
-            // The daemon that reported the line is gone and fresh bytes are
-            // at `paths.bin`; this `--ensure` is the one that starts them.
-            return self.ensure_after_upgrade(paths);
-        }
-        Ok(line)
-    }
-
     /// Record what a hash comparison proved: the host's daemon is, or is not,
     /// running the bytes this client would deploy.
     ///
     /// The only signal there is. The version on the `--ensure` line cannot
-    /// answer this — see [`EnsureReport::hash`].
+    /// answer this — only the hash on the ensure line can.
     ///
     /// A verdict that repeats the one already held is dropped: announcing it
     /// costs a repaint of every sidebar in the process, and a reconnect that
@@ -2534,6 +2533,29 @@ impl HostLink {
     /// See [`SessionBackend::observe_daemon_freshness`].
     fn observe_daemon_freshness(&self, observer: DaemonFreshnessObserver) {
         self.freshness_observers.add(observer);
+    }
+
+    /// Compare only a caller-supplied daemon binary, after the connection is
+    /// usable. With no override there is no cheap freshness question, so the
+    /// answer remains unknown until the operator asks for an upgrade.
+    fn note_prebuilt_freshness(&self, ensure_line: &str) {
+        let Some(remote_hash) = daemon_hash(ensure_line) else {
+            return;
+        };
+        let Some(path) = std::env::var_os(ade_session::DAEMON_BINARY_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        match std::fs::read(&path) {
+            Ok(binary) => self.note_hash_verdict(ade_session::sha256_hex(&binary) != remote_hash),
+            Err(error) => log::warn!(
+                "{}: cannot read the configured daemon binary at {}: {error}",
+                self.host.destination,
+                path.display()
+            ),
+        }
     }
 
     /// One `--ensure` over ssh, and nothing else. The raw question: is a daemon
@@ -2579,28 +2601,19 @@ impl HostLink {
         }
     }
 
-    /// Upgrade this host's daemon because a human asked for it, rather than
-    /// because a connect happened to find it both stale and idle.
+    /// Upgrade this host's daemon because a human asked for it.
     ///
-    /// Deliberately not [`Self::ensure_daemon`]: that one swallows the whole
-    /// decision into a `bool` nobody sees, and short-circuits on
-    /// `daemon_ensured` so a second click would do nothing at all. This always
-    /// re-runs the probe and answers with what it found, because the operator
-    /// clicked a button and is owed a sentence about it.
+    /// This always re-runs the probe and answers with what it found, because
+    /// the operator clicked a button and is owed a sentence about it.
     ///
-    /// Errors here are *reported*, not warned away: an upgrade nobody asked
-    /// for must never fail a connection, but one somebody asked for must never
-    /// fail silently.
+    /// Errors here are reported rather than warned away: an explicit upgrade
+    /// must never fail silently.
     ///
-    /// `upgrade_ready` is deliberately not consulted: the click is the
-    /// consent, and the shutdown goes out forced. A daemon that would have
-    /// declined is upgraded over, its sessions coming back as lost rows the
-    /// reconcile pass recreates — which is what the operator asked for by
-    /// clicking a button whose whole purpose is the way past a busy daemon.
+    /// The click is consent for a forced shutdown. Live sessions come back as
+    /// lost rows that the reconcile pass recreates.
     fn upgrade_on_demand(&self) -> Result<DaemonUpgradeOutcome> {
         // `ensure_ready` uses this same host-wide guard, so endpoint clones,
-        // automatic upgrades and repeated clicks cannot overlap shutdown or
-        // deployment.
+        // repeated clicks cannot overlap shutdown or deployment.
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let paths = match state.paths.clone() {
             Some(paths) => paths,
@@ -2611,83 +2624,21 @@ impl HostLink {
             }
         };
         let line = self.ensure_installed(&paths)?;
-        let report = EnsureReport::parse(&line);
-        let Some(remote_hash) = report.hash else {
+        let Some(remote_hash) = daemon_hash(&line) else {
             bail!(
                 "the daemon on {} predates binary identity and cannot be upgraded in place; \
                  stop it by hand",
                 self.host.destination
             );
         };
-        let outcome = self.upgrade_to_local_binary(&paths, &remote_hash, true)?;
+        let outcome = self.upgrade_to_local_binary(&paths, &remote_hash)?;
         if outcome == DaemonUpgradeOutcome::Upgraded {
             self.ensure_after_upgrade(&paths)?;
         }
         Ok(outcome)
     }
 
-    /// Upgrade the host's daemon in place if — and only if — it is provably
-    /// stale and provably holding nothing. `true` means it was replaced and
-    /// `--ensure` must run again.
-    ///
-    /// Every failure inside is a `warn` and `false`, never an error: a stale
-    /// daemon is a perfectly usable daemon, and the connection it serves must
-    /// not fail because an upgrade attempt did.
-    fn upgrade_if_stale(&self, paths: &RemotePaths, ensure_line: &str) -> bool {
-        let report = EnsureReport::parse(ensure_line);
-        let Some(remote_hash) = report.hash else {
-            log::debug!(
-                "{}: daemon predates binary identity; leaving it alone",
-                self.host.destination
-            );
-            return false;
-        };
-        if !report.upgrade_ready {
-            // Holding a session with work in it, or an exited session's last
-            // screen. Never disturbed on a connect — the operator's own
-            // "upgrade host daemon" is the way through, and it says so.
-            // Asked anyway, though nothing is done about it here: this is
-            // precisely the host whose only way forward is the operator's own
-            // upgrade button, and that button is drawn only for a daemon known
-            // to be stale.
-            match self.local_binary() {
-                Ok((_, local_hash)) => self.note_hash_verdict(local_hash != remote_hash),
-                Err(error) => log::warn!(
-                    "{}: cannot tell whether the daemon is behind: {error:#}",
-                    self.host.destination
-                ),
-            }
-
-            //
-            // Said out loud, and at `info` like the deploy lines below, because
-            // the silent version of this is indistinguishable from a broken
-            // cross-compile: no build is attempted, so the log shows *nothing*
-            // for the host, and the operator concludes the toolchain failed
-            // rather than that the daemon declined. Once per host per connect.
-            log::info!(
-                "{}: daemon runs build {}… and holds sessions with work in them; \
-                 leaving it alone — \"upgrade host daemon\" forces it",
-                self.host.destination,
-                // `get`, not a byte slice: the hash is remote input, and a
-                // multi-byte char straddling offset 12 would panic here.
-                remote_hash.get(..12).unwrap_or(&remote_hash),
-            );
-            return false;
-        }
-        match self.upgrade_to_local_binary(paths, &remote_hash, false) {
-            Ok(outcome) => outcome == DaemonUpgradeOutcome::Upgraded,
-            Err(err) => {
-                log::warn!(
-                    "{}: daemon upgrade attempt failed; staying on the running daemon: {err:#}",
-                    self.host.destination
-                );
-                false
-            }
-        }
-    }
-
-    /// This client's own daemon binary for the host's platform, with its hash
-    /// — what every "is the host behind?" question is answered against.
+    /// This client's own daemon binary for the host's platform, with its hash.
     ///
     /// One ssh round trip for the platform and one `daemon_binary`, which is a
     /// cargo build that is a no-op unless the daemon's sources changed. Never
@@ -2711,19 +2662,12 @@ impl HostLink {
     /// The build ([`ade_session::daemon_binary`]) is the expensive step, and
     /// the hash comparison cannot happen without it — so a daemon already
     /// running these bytes answers [`DaemonUpgradeOutcome::UpToDate`] and is
-    /// never disturbed, whatever `force` says. Cargo makes the repeat of that
-    /// build a no-op; only the first call after an edit pays anything.
-    ///
-    /// `force` reaches exactly one place: the [`Frame::Shutdown`] this sends.
-    /// The connect-time caller passes `false` and has already checked
-    /// readiness itself, so a daemon that changed its mind in between declines
-    /// and the attempt is abandoned — as it should be, nobody asked for it.
-    /// The operator's own click passes `true` and is never declined.
+    /// never disturbed. Cargo makes the repeat of that build a no-op; only the
+    /// first call after an edit pays anything.
     fn upgrade_to_local_binary(
         &self,
         paths: &RemotePaths,
         remote_hash: &str,
-        force: bool,
     ) -> Result<DaemonUpgradeOutcome> {
         let (binary, local_hash) = self.local_binary()?;
         self.note_hash_verdict(local_hash != remote_hash);
@@ -2736,14 +2680,13 @@ impl HostLink {
             return Ok(DaemonUpgradeOutcome::UpToDate);
         }
         log::info!(
-            "{}: daemon runs build {}…, this client would deploy {}…; upgrading{}",
+            "{}: daemon runs build {}…, this client would deploy {}…; upgrading (forced)",
             self.host.destination,
             // Same reason as the decline log: remote input, `get` or panic.
             remote_hash.get(..12).unwrap_or(remote_hash),
             &local_hash[..12],
-            if force { " (forced)" } else { "" },
         );
-        self.request_shutdown(paths, force)
+        self.request_shutdown(paths)
             .context("asking the daemon to exit for the upgrade")?;
         let config = ade_session::DeployConfig::new(binary, ade_session::daemon_version())
             .with_bin_path(paths.bin.clone())
@@ -2769,20 +2712,13 @@ impl HostLink {
     /// One short-lived protocol channel — `ssh <host> <bin> --stdio-proxy` —
     /// carrying exactly a handshake and a [`Frame::Shutdown`].
     ///
-    /// Unforced, the daemon re-checks the shutdown condition itself; an
-    /// [`Frame::Error`] back means it is no longer safe (a session with work in
-    /// it appeared) and the upgrade is abandoned. `force` — the operator's own
-    /// click — skips that check on the daemon side, so the only answer left is
-    /// the ack or a dead channel.
-    ///
     /// A *pre-cut* daemon cannot receive [`Frame::Shutdown`] at all: the
     /// handshake it would ride is exactly what the cut broke, so it fails with
     /// [`PRE_CUT_DIAGNOSIS`] — and a forced shutdown, whose whole purpose is
     /// replacing such daemons, falls back to terminating the process out of
-    /// band ([`Self::kill_pre_cut_daemon`]). Only forced: the unforced
-    /// connect-time path keeps propagating the diagnosis, because nothing
-    /// without a human's click may hard-kill a daemon.
-    fn request_shutdown(&self, paths: &RemotePaths, force: bool) -> Result<()> {
+    /// band ([`Self::kill_pre_cut_daemon`]). This is reached only after an
+    /// operator-requested upgrade.
+    fn request_shutdown(&self, paths: &RemotePaths) -> Result<()> {
         let remote = vec![
             paths.bin.clone(),
             "--stdio-proxy".to_owned(),
@@ -2799,15 +2735,18 @@ impl HostLink {
             // a pre-cut daemon is exactly the host an upgrade is aimed at, so
             // the forced path treats the diagnosis as its cue to act rather
             // than a sentence to report.
-            let mut connection = match handshaken(|| async {
-                Ok(DaemonConnection::Proxied(
-                    ChildConnection::spawn(&argv).context("spawning the shutdown channel")?,
-                ))
-            })
+            let mut connection = match handshaken(
+                || async {
+                    Ok(DaemonConnection::Proxied(
+                        ChildConnection::spawn(&argv).context("spawning the shutdown channel")?,
+                    ))
+                },
+                control_hello(),
+            )
             .await
             {
                 Ok((connection, _ack)) => connection,
-                Err(error) if force && is_incompatible_daemon(&error) => {
+                Err(error) if is_incompatible_daemon(&error) => {
                     return self.kill_pre_cut_daemon(paths);
                 }
                 Err(error) => {
@@ -2816,7 +2755,7 @@ impl HostLink {
             };
             connection
                 .send(&Frame::Shutdown {
-                    force,
+                    force: true,
                     request_id: Some(1),
                 })
                 .await
@@ -3017,17 +2956,17 @@ enum DaemonConnection {
     Tcp(ade_session::Connection<smol::net::TcpStream>),
 }
 
+fn control_hello() -> Hello {
+    // Control operations still use generation-2 create semantics. View focus
+    // uses its own short-lived generation-3 connection.
+    Hello {
+        max_generation: proto::MIN_GENERATION,
+        ..Hello::current()
+    }
+}
+
 impl DaemonConnection {
-    async fn handshake(&mut self) -> Result<proto::HelloAck> {
-        // Pinned at generation 2: this client still implements gen-2 semantics
-        // (auto-created workspaces, the combined create), while the crate can
-        // already speak 3. Announcing 3 would have the daemon hold it to the
-        // gen-3 meanings. The registry client that speaks 3 is the next commit,
-        // and it removes this pin.
-        let hello = Hello {
-            max_generation: proto::MIN_GENERATION,
-            ..Hello::current()
-        };
+    async fn handshake(&mut self, hello: Hello) -> Result<proto::HelloAck> {
         let ack = match self {
             Self::Proxied(connection) => connection.handshake(hello.clone()).await,
             #[cfg(unix)]
@@ -4253,6 +4192,23 @@ mod control_connection {
     }
 
     #[test]
+    fn active_resize_is_sent_on_generation_two() {
+        let (seen, frames) = std::sync::mpsc::channel();
+        let backend = scripted_daemon(vec![Script::Watched(None, seen)]);
+        backend
+            .resize_session("session-1", 120, 42, None)
+            .expect("sending resize");
+        assert!(matches!(
+            frames.recv_timeout(Duration::from_secs(1)).expect("resize frame"),
+            Frame::Resize {
+                session_id,
+                cols: 120,
+                rows: 42,
+            } if session_id == proto::SessionId::new("session-1")
+        ));
+    }
+
+    #[test]
     fn a_successful_handshake_remembers_the_daemons_identity() {
         let backend = listed(scripted_daemon(vec![identity_listing(
             Some("host-instance-1"),
@@ -4475,6 +4431,7 @@ mod control_connection {
                 .find(|pair| pair[0] == "--expected-daemon-id"),
             Some(["--expected-daemon-id".to_owned(), "daemon-a".to_owned()].as_slice()),
         );
+        assert!(!argv.contains(&"--view-id".to_owned()));
         assert!(
             !backend
                 .attach_session("s1", None)
@@ -4759,52 +4716,35 @@ mod control_connection {
 }
 
 #[cfg(test)]
-mod ensure_report_tests {
-    use super::EnsureReport;
+mod daemon_hash_tests {
+    use super::daemon_hash;
 
     /// A daemon from before binary identity: two tokens, nothing else. The
-    /// conservative reading — no hash, not ready — is what keeps the upgrade
-    /// path away from it.
+    /// missing hash is what keeps the upgrade path away from it.
     #[test]
     fn a_legacy_ensure_line_reads_as_untouchable() {
-        let report = EnsureReport::parse("ade-daemon 0.1.0");
+        assert_eq!(daemon_hash("ade-daemon 0.1.0"), None);
+    }
+
+    #[test]
+    fn a_full_ensure_line_carries_the_hash() {
+        let hash = "ab".repeat(32);
         assert_eq!(
-            report,
-            EnsureReport {
-                hash: None,
-                upgrade_ready: false
-            }
+            daemon_hash(&format!(
+                "ade-daemon 0.1.0 hash={} upgrade_ready=true",
+                hash
+            )),
+            Some(hash)
         );
-    }
-
-    #[test]
-    fn a_full_ensure_line_carries_hash_and_readiness() {
-        let report = EnsureReport::parse(&format!(
-            "ade-daemon 0.1.0 hash={} upgrade_ready=true",
-            "ab".repeat(32)
-        ));
-        assert_eq!(report.hash.as_deref(), Some("ab".repeat(32).as_str()));
-        assert!(report.upgrade_ready);
-    }
-
-    #[test]
-    fn a_busy_daemon_reports_not_ready() {
-        let report = EnsureReport::parse("ade-daemon 0.1.0 hash=abc123 upgrade_ready=false");
-        assert_eq!(report.hash.as_deref(), Some("abc123"));
-        assert!(!report.upgrade_ready);
     }
 
     /// Unknown tokens are someone newer talking; they must never break the
     /// parse, and an empty hash value counts as no hash at all.
     #[test]
     fn stray_and_empty_tokens_are_ignored() {
-        let report = EnsureReport::parse("ade-daemon 0.1.0 hash= upgrade_ready=true fleet=blue");
         assert_eq!(
-            report,
-            EnsureReport {
-                hash: None,
-                upgrade_ready: true
-            }
+            daemon_hash("ade-daemon 0.1.0 hash= upgrade_ready=true fleet=blue"),
+            None
         );
     }
 }

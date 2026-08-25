@@ -2972,6 +2972,84 @@ fn attach_repaints_at_the_last_resized_size() {
     });
 }
 
+/// A terminal can attach before its real pane size is known. When that pane
+/// later resizes, it must receive a repaint at the corrected size instead of
+/// keeping the tiny initial screen until the child happens to redraw.
+#[test]
+fn resize_after_attach_repaints_at_the_new_size() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut connection,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+
+        let mut viewer = client(server.socket_path()).await;
+        let _ = attach(&mut viewer, &session.id).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending Resize");
+
+        match recv(&mut viewer, "the resized repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                assert!(!contains(&bytes, b"\x1b[9;1H"), "{bytes:?}");
+                assert!(contains(&bytes, b"line12"), "{bytes:?}");
+            }
+            other => panic!("expected resized repaint, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn generation_two_resize_repaints_every_attached_viewer() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut connection = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut connection, dir.path()).await;
+        write_to(&mut connection, &session.id, b"shared-screen\n").await;
+        wait_for_ring(server.socket_path(), &session.id, b"shared-screen").await;
+
+        let mut first = gen2_client(server.socket_path()).await;
+        let mut second = gen2_client(server.socket_path()).await;
+        let _ = attach(&mut first, &session.id).await;
+        let _ = attach(&mut second, &session.id).await;
+
+        first
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending generation-two Resize");
+
+        for viewer in [&mut first, &mut second] {
+            match recv(viewer, "the shared resized repaint").await {
+                Frame::Output { session_id, bytes } => {
+                    assert_eq!(session_id, session.id);
+                    assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                    assert!(contains(&bytes, b"shared-screen"), "{bytes:?}");
+                }
+                other => panic!("expected resized repaint, got {other:?}"),
+            }
+        }
+    });
+}
+
 /// A focus claim that arrives before its view attaches is honored the moment
 /// the view does: the repaint comes out at the focused ask, not at the
 /// smallest sibling's ask that stood in for it while the claim was pending.
@@ -3036,6 +3114,142 @@ fn a_focus_claim_resolved_by_attach_repaints_at_the_focused_ask() {
             ),
             other => panic!("expected Replay, got {other:?}"),
         }
+    });
+}
+
+/// A view that takes focus after both clients attached receives the corrected
+/// screen immediately, without waiting for another local resize.
+#[test]
+fn a_focus_change_repaints_the_new_owner() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut sibling = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut sibling, dir.path()).await;
+        for line in 1..=12 {
+            write_to(
+                &mut sibling,
+                &session.id,
+                format!("line{line}\n").as_bytes(),
+            )
+            .await;
+        }
+        wait_for_ring(server.socket_path(), &session.id, b"line12").await;
+        sibling
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 8,
+            })
+            .await
+            .expect("sending the sibling size");
+        let _ = list(&mut sibling).await;
+
+        let mut viewer = client(server.socket_path()).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sending the viewer size");
+        viewer
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-tall".to_owned()),
+                request_id: Some(32),
+            })
+            .await
+            .expect("sending Attach");
+        match recv(&mut viewer, "Replay").await {
+            Frame::Replay { bytes, .. } => assert!(
+                !contains(&bytes, b"\x1b[12;1H"),
+                "the unfocused viewer starts at the sibling's size: {bytes:?}"
+            ),
+            other => panic!("expected Replay, got {other:?}"),
+        }
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-tall".to_owned(),
+                hover: false,
+            })
+            .await
+            .expect("sending FocusSession");
+        match recv(&mut viewer, "the focused repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+                assert!(contains(&bytes, b"\x1b[12;1H"), "{bytes:?}");
+            }
+            other => panic!("expected focused repaint, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn an_equal_size_focus_change_still_repaints_the_new_owner() {
+    let (dir, server) = server();
+    smol::block_on(async {
+        let mut sibling = client(server.socket_path()).await;
+        let session = cat_session(&server, &mut sibling, dir.path()).await;
+        sibling
+            .send(&Frame::Write {
+                session_id: session.id.clone(),
+                bytes: b"\x1b[<35;1;1M\n".to_vec(),
+            })
+            .await
+            .expect("sending a mouse report");
+        wait_for_ring(server.socket_path(), &session.id, b"[<35;1;1M").await;
+
+        let mut viewer = client(server.socket_path()).await;
+        viewer
+            .send(&Frame::Resize {
+                session_id: session.id.clone(),
+                cols: 80,
+                rows: 24,
+            })
+            .await
+            .expect("sending the viewer size");
+        viewer
+            .send(&Frame::Attach {
+                session_id: session.id.clone(),
+                view_id: Some("view-equal".to_owned()),
+                request_id: Some(33),
+            })
+            .await
+            .expect("attaching the viewer");
+        let _ = recv(&mut viewer, "Replay").await;
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-equal".to_owned(),
+                hover: true,
+            })
+            .await
+            .expect("focusing the equal-size viewer");
+        match recv(&mut viewer, "the equal-size repaint").await {
+            Frame::Output { session_id, bytes } => {
+                assert_eq!(session_id, session.id);
+                assert!(contains(&bytes, b"\x1b[?2026h"), "{bytes:?}");
+            }
+            other => panic!("expected focused repaint, got {other:?}"),
+        }
+
+        viewer
+            .send(&Frame::FocusSession {
+                session_id: session.id.clone(),
+                view_id: "view-equal".to_owned(),
+                hover: true,
+            })
+            .await
+            .expect("hovering the owning viewer again");
+        assert!(matches!(
+            recv(&mut viewer, "the repeated hover repaint").await,
+            Frame::Output { .. }
+        ));
     });
 }
 

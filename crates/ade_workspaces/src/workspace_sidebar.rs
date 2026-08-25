@@ -1191,8 +1191,11 @@ mod tests {
         status: WorkspaceStatus,
         state: SessionState,
     ) -> WorkspaceEntry {
-        let mut workspace =
-            AdeWorkspace::new(name, project_id, PathBuf::from("/repos").join(project_id));
+        let mut workspace = AdeWorkspace::new(
+            name,
+            project_id,
+            PathBuf::from(format!("/repos/{project_id}")),
+        );
         workspace.status = status;
         WorkspaceEntry::Persisted(workspace, state)
     }

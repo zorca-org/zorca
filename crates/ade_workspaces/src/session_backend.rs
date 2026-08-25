@@ -542,6 +542,17 @@ pub trait SessionBackend: Send + Sync {
         bail!("this session backend has no sessions of its own to attach to")
     }
 
+    /// Resize the shared session PTY to the active terminal view.
+    fn resize_session(
+        &self,
+        _session_id: &str,
+        _cols: u16,
+        _rows: u16,
+        _expected_daemon_id: Option<&str>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// The workspace's stored layout and the revision guarding the next write.
     ///
     /// Errors — including "no such workspace" — mean the caller has nothing to
