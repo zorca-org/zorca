@@ -220,6 +220,13 @@ fn upload_script(remote_path: &str) -> String {
 /// remote shell says about a daemon binary that is not installed.
 pub const EXIT_NOT_FOUND: i32 = 127;
 
+/// Exit status a POSIX shell reports for "found but not executable".
+const EXIT_NOT_EXECUTABLE: i32 = 126;
+
+fn is_nothing_runnable(exit_code: i32) -> bool {
+    exit_code == EXIT_NOT_FOUND || exit_code == EXIT_NOT_EXECUTABLE
+}
+
 /// What [`ensure_remote_daemon`] found.
 ///
 /// "Not installed" is an *outcome* and not an error, because it is the one
@@ -234,9 +241,7 @@ pub const EXIT_NOT_FOUND: i32 = 127;
 pub enum EnsureOutcome {
     /// A daemon is listening. Carries the version line it printed.
     Listening(String),
-    /// Nothing runnable is at `bin_path` — the remote shell answered
-    /// [`EXIT_NOT_FOUND`]. Nothing was started, and nothing was installed:
-    /// this function never writes to a host.
+    /// Nothing runnable is at `bin_path`. This function never writes to a host.
     NotInstalled,
 }
 
@@ -261,7 +266,7 @@ pub fn ensure_remote_daemon(
         "--state-dir".to_owned(),
         state_dir.to_owned(),
     ])?;
-    if output.exit_code == EXIT_NOT_FOUND {
+    if is_nothing_runnable(output.exit_code) {
         log::debug!(
             "no ade-daemon at {bin_path} on {}; it can be deployed",
             host.destination
@@ -1036,6 +1041,14 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn nothing_runnable_covers_both_shell_exit_codes_and_nothing_else() {
+        assert!(is_nothing_runnable(EXIT_NOT_EXECUTABLE));
+        assert!(is_nothing_runnable(EXIT_NOT_FOUND));
+        assert!(!is_nothing_runnable(0));
+        assert!(!is_nothing_runnable(1));
     }
 
     #[test]

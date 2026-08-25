@@ -186,6 +186,10 @@ pub async fn ensure(config: ProxyConfig) -> Result<String> {
     if let Some(ready) = ack.upgrade_ready {
         line.push_str(&format!(" upgrade_ready={ready}"));
     }
+    // Lets the client validate a prebuilt daemon without another ssh round trip.
+    if let Some(platform) = ade_session::HostPlatform::current() {
+        line.push_str(&format!(" platform={}", platform.target_triple()));
+    }
     // The window this daemon serves, before any handshake has been attempted:
     // a client whose own window is entirely below it must refuse to deploy
     // over these bytes rather than downgrade a daemon it cannot talk to.
