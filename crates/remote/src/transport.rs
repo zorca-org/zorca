@@ -21,6 +21,19 @@ pub mod ssh;
 pub mod wsl;
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
+fn remote_server_target_dir(
+    cargo_target_dir: Option<&std::ffi::OsStr>,
+    root: &std::path::Path,
+) -> std::path::PathBuf {
+    let base = match cargo_target_dir.filter(|dir| !dir.is_empty()) {
+        Some(dir) if std::path::Path::new(dir).is_absolute() => dir.into(),
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
+    base.join("remote_server")
+}
+
+#[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
 fn running_status(status: &str, elapsed: std::time::Duration) -> String {
     let seconds = elapsed.as_secs();
     let elapsed = if seconds < 60 {
@@ -395,24 +408,26 @@ async fn build_remote_server_from_source(
             rust_flags.push_str(&format!(" -C link-arg=-L{path}"));
         }
     }
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    let target_dir =
+        remote_server_target_dir(std::env::var_os("CARGO_TARGET_DIR").as_deref(), root);
     if platform.arch.as_str() == std::env::consts::ARCH
         && platform.os.as_str() == std::env::consts::OS
     {
         log::info!("building remote server binary from source");
         run_cmd(
             new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .current_dir(root)
                 .args([
                     "build",
                     "--package",
                     "remote_server",
                     "--features",
                     "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
                 ])
+                .arg("--target-dir")
+                .arg(&target_dir)
+                .args(["--target", &triple])
                 .env("RUSTFLAGS", &rust_flags),
             "Building remote server binary from source",
             delegate,
@@ -458,18 +473,17 @@ async fn build_remote_server_from_source(
         log::info!("building remote binary from source for {triple} with Zig");
         run_cmd(
             new_command("cargo")
-                .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+                .current_dir(root)
                 .args([
                     "zigbuild",
                     "--package",
                     "remote_server",
                     "--features",
                     "debug-embed",
-                    "--target-dir",
-                    "target/remote_server",
-                    "--target",
-                    &triple,
                 ])
+                .arg("--target-dir")
+                .arg(&target_dir)
+                .args(["--target", &triple])
                 .env("RUSTFLAGS", &rust_flags),
             &status,
             delegate,
@@ -477,9 +491,7 @@ async fn build_remote_server_from_source(
         )
         .await?;
     };
-    let bin_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
-        .join("target")
-        .join("remote_server")
+    let bin_path = target_dir
         .join(&triple)
         .join("debug")
         .join("remote_server")
@@ -562,6 +574,25 @@ mod tests {
                 std::time::Duration::from_secs(125)
             ),
             "Running (2m 5s elapsed): Building remote binary"
+        );
+    }
+
+    #[test]
+    fn remote_server_target_dir_follows_cargo_target_dir() {
+        let root = std::path::Path::new("workspace");
+        assert_eq!(
+            remote_server_target_dir(None, root),
+            root.join("target/remote_server")
+        );
+        assert_eq!(
+            remote_server_target_dir(Some(std::ffi::OsStr::new("cache")), root),
+            root.join("cache/remote_server")
+        );
+
+        let absolute = std::env::temp_dir().join("cargo-target");
+        assert_eq!(
+            remote_server_target_dir(Some(absolute.as_os_str()), root),
+            absolute.join("remote_server")
         );
     }
 
