@@ -84,7 +84,9 @@ pub use proto::{
     MAX_GENERATION, MIN_GENERATION, SessionId, SessionInfo, SessionStatus, SplitDir, Tab,
     WorkspaceInfo, effective_capabilities, error_code, select_generation, validate_capabilities,
 };
-pub use source::{DAEMON_BINARY_ENV, HostOs, HostPlatform, daemon_binary};
+pub use source::{
+    DAEMON_BINARY_ENV, HostOs, HostPlatform, daemon_binary, daemon_binary_matches_platform,
+};
 pub use ssh::{
     EnsureOutcome, HostForward, LOOPBACK_ADDRESS, LocalEndpoint, SSH_BASE_FLAGS, SshHost,
     ensure_remote_daemon,
