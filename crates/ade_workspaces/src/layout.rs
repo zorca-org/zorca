@@ -235,7 +235,8 @@ pub fn open_agent_terminal(
     }
     // A preset can reach an SSH workspace before its layout owner is ready.
     // Never run the agent in a throwaway PTY while that connection is attaching.
-    crate::connect::open_connection_workspace(zed_workspace, window, cx).then(|| {
+    crate::connect::open_connection_workspace(zed_workspace, window, cx);
+    crate::connect::connection_is_in_flight(cx.entity().entity_id(), cx).then(|| {
         Task::ready(Err(anyhow::anyhow!(
             "Persistent terminals are still connecting. Start the agent again once the project is ready."
         )))
@@ -719,7 +720,7 @@ fn render_layout_if_unchanged(
                 };
                 let terminal_id = terminal.item_id();
                 destination.update(cx, |pane, cx| {
-                    pane.add_item(terminal, false, false, Some(index), window, cx);
+                    pane.restore_item(terminal, true, Some(index), window, cx);
                     pane.remove_item(placeholder.entity_id(), false, false, window, cx);
                 });
                 source.update(cx, |pane, cx| {
@@ -730,7 +731,7 @@ fn render_layout_if_unchanged(
             for (source, destination, item) in local_tabs {
                 let item_id = item.item_id();
                 destination.update(cx, |pane, cx| {
-                    pane.add_item(item, false, false, Some(pane.items_len()), window, cx);
+                    pane.restore_item(item, true, Some(pane.items_len()), window, cx);
                 });
                 source.update(cx, |pane, cx| {
                     pane.remove_item(item_id, false, false, window, cx);
@@ -899,14 +900,7 @@ async fn add_placeholder(
             Tab::Terminal { session_id } => MissingTab::session(session_id.0, cx),
             Tab::Editor { path } => MissingTab::file(path, cx),
         });
-        pane.add_item(
-            Box::new(placeholder.clone()),
-            false,
-            false,
-            None,
-            window,
-            cx,
-        );
+        pane.restore_item(Box::new(placeholder.clone()), true, None, window, cx);
         placeholder
     })
     .log_err()
@@ -929,15 +923,7 @@ fn replace_terminal_placeholder(
         };
         let active_item = pane.active_item();
         let active_item_was_focused = pane.has_focus(window, cx);
-        pane.add_item_inner(
-            Box::new(terminal.clone()),
-            false,
-            false,
-            false,
-            Some(index),
-            window,
-            cx,
-        );
+        pane.restore_item(Box::new(terminal.clone()), false, Some(index), window, cx);
         pane.remove_item(placeholder.entity_id(), false, false, window, cx);
         let active_index = active_item.as_ref().and_then(|active_item| {
             if active_item.item_id() == placeholder.entity_id() {
@@ -3037,6 +3023,11 @@ mod tests {
         let initial = workspace
             .read_with(&mut cx, |workspace, cx| capture_layout(workspace, cx))
             .unwrap();
+        cx.update_global(|settings: &mut settings::SettingsStore, cx| {
+            settings.update_user_settings(cx, |settings| {
+                settings.workspace.max_tabs = std::num::NonZeroUsize::new(1);
+            });
+        });
         backend.seed_layout(&workspace_id, initial.clone(), 1);
         cx.update(|window, cx| {
             workspace.update(cx, |workspace, cx| {

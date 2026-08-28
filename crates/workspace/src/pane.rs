@@ -1372,6 +1372,20 @@ impl Pane {
         )
     }
 
+    /// Restoring existing tabs must not evict other items to enforce an open-tab limit.
+    pub fn restore_item(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        activate: bool,
+        destination_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let max_tabs = self.max_tabs.take();
+        self.add_item_inner(item, false, false, activate, destination_index, window, cx);
+        self.max_tabs = max_tabs;
+    }
+
     pub fn items_len(&self) -> usize {
         self.items.len()
     }
@@ -5109,6 +5123,25 @@ mod tests {
             }
             is_dragged_tab
         }
+    }
+
+    #[gpui::test]
+    async fn test_restoring_items_bypasses_only_the_restore_tab_limit(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        set_max_tabs(cx, Some(1));
+        add_labeled_item(&pane, "A", false, cx);
+        pane.update_in(cx, |pane, window, cx| {
+            let restored = Box::new(cx.new(|cx| TestItem::new(cx).with_label("B")));
+            pane.restore_item(restored, true, Some(pane.items_len()), window, cx);
+        });
+        assert_item_labels(&pane, ["A", "B*"], cx);
+        add_labeled_item(&pane, "C", false, cx);
+        assert_item_labels(&pane, ["C*"], cx);
     }
 
     #[gpui::test]
