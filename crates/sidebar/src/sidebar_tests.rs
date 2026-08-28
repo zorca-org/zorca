@@ -4548,6 +4548,17 @@ async fn test_claimed_ssh_workspace_does_not_open_a_stock_terminal(
         "the connection flow owns the first terminal while ADE attachment is in flight",
     );
 
+    cx.update(|window, cx| {
+        agent_workspaces::spawn_center_agent_terminal(&workspace, "unused", window, cx)
+    });
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.create_new_terminal_with_command(&workspace, Some("unused"), window, cx)
+    });
+    assert!(
+        terminal_requests.lock().unwrap().is_empty(),
+        "an agent preset must not start a disposable terminal before ADE is ready",
+    );
+
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.set_ade_owns_layout(window, cx);
     });

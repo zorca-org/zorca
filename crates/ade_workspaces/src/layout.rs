@@ -225,6 +225,23 @@ fn open_new_session_terminal(
     open_new_session_terminal_at(zed_workspace, terminal_id, None, window, cx)
 }
 
+pub fn open_agent_terminal(
+    zed_workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Option<Task<Result<WeakEntity<terminal::Terminal>>>> {
+    if zed_workspace.ade_owns_layout() {
+        return open_new_session_terminal(zed_workspace, None, window, cx);
+    }
+    // A preset can reach an SSH workspace before its layout owner is ready.
+    // Never run the agent in a throwaway PTY while that connection is attaching.
+    crate::connect::open_connection_workspace(zed_workspace, window, cx).then(|| {
+        Task::ready(Err(anyhow::anyhow!(
+            "Persistent terminals are still connecting. Start the agent again once the project is ready."
+        )))
+    })
+}
+
 fn open_new_session_terminal_at(
     zed_workspace: &mut Workspace,
     terminal_id: Option<TerminalId>,
@@ -612,34 +629,68 @@ fn render_layout_if_unchanged(
                     Member::Pane(pane)
                 }
             };
+            let current_center_panes = zed_workspace.center().panes();
+            let current_active_pane = current_center_panes
+                .iter()
+                .copied()
+                .find(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
+                .cloned()
+                .or_else(|| {
+                    let expected_active_pane = expected_current
+                        .as_ref()
+                        .map(|(_, pane)| pane)
+                        .unwrap_or_else(|| zed_workspace.active_pane());
+                    current_center_panes
+                        .iter()
+                        .copied()
+                        .find(|pane| *pane == expected_active_pane)
+                        .cloned()
+                })
+                .unwrap_or_else(|| zed_workspace.center().first_pane());
             if let Some((expected, expected_active_pane)) = expected_current.as_ref() {
                 let current = capture_persistable_layout(zed_workspace, cx);
-                let current_center_panes = zed_workspace.center().panes();
-                let active_pane = current_center_panes
-                    .iter()
-                    .copied()
-                    .find(|pane| pane.read(cx).focus_handle(cx).contains_focused(window, cx))
-                    .cloned()
-                    .or_else(|| {
-                        current_center_panes
-                            .iter()
-                            .copied()
-                            .find(|pane| *pane == expected_active_pane)
-                            .cloned()
-                    })
-                    .unwrap_or_else(|| zed_workspace.center().first_pane());
                 let changed = current
                     .as_ref()
                     .is_none_or(|current| !same_layout_except_focus(current, expected))
-                    || &active_pane != expected_active_pane;
+                    || &current_active_pane != expected_active_pane;
                 if changed {
-                    zed_workspace.discard_center_panes(created, active_pane, window, cx);
+                    zed_workspace.discard_center_panes(created, current_active_pane, window, cx);
                     return false;
                 }
             }
             let Some(active_pane) = focused.clone().or_else(|| installed.first().cloned()) else {
                 return false;
             };
+            // The daemon cannot name local-only tabs. Move their live items,
+            // not just their labels, before replacing the panes that own them.
+            let active_item = current_active_pane.read(cx).active_item();
+            let mut local_tabs = Vec::new();
+            for source in zed_workspace.center().panes() {
+                let source_tabs = source
+                    .read(cx)
+                    .items()
+                    .filter_map(|item| tab_of_item(item.as_ref(), zed_workspace, cx))
+                    .collect::<Vec<_>>();
+                let destination = installed
+                    .iter()
+                    .find(|pane| {
+                        pane.read(cx).items().any(|item| {
+                            tab_of_item(item.as_ref(), zed_workspace, cx)
+                                .is_some_and(|tab| source_tabs.contains(&tab))
+                        })
+                    })
+                    .unwrap_or(&active_pane);
+                for item in source.read(cx).items() {
+                    if tab_of_item(item.as_ref(), zed_workspace, cx).is_none() {
+                        local_tabs.push((source.clone(), destination.clone(), item.clone()));
+                    }
+                }
+            }
+            let local_active = active_item.filter(|active| {
+                local_tabs
+                    .iter()
+                    .any(|(_, _, item)| item.item_id() == active.item_id())
+            });
             pending_terminals.retain(|(placeholder, session_id)| {
                 let Some(destination) = zed_workspace.pane_for(placeholder) else {
                     return true;
@@ -676,6 +727,15 @@ fn render_layout_if_unchanged(
                 });
                 false
             });
+            for (source, destination, item) in local_tabs {
+                let item_id = item.item_id();
+                destination.update(cx, |pane, cx| {
+                    pane.add_item(item, false, false, Some(pane.items_len()), window, cx);
+                });
+                source.update(cx, |pane, cx| {
+                    pane.remove_item(item_id, false, false, window, cx);
+                });
+            }
             let unused = created
                 .into_iter()
                 .filter(|created| !installed.iter().any(|installed| installed == created))
@@ -683,6 +743,10 @@ fn render_layout_if_unchanged(
             zed_workspace.discard_center_panes(unused, active_pane, window, cx);
             zed_workspace.set_center_group(root, focused, window, cx);
             activate_layout_tabs(&kept, &leaves, window, cx);
+            if let Some(item) = local_active {
+                let focus = !zed_workspace.has_active_modal(window, cx);
+                zed_workspace.activate_item(item.as_ref(), true, focus, window, cx);
+            }
             true
         })?;
         if !committed {
@@ -2812,6 +2876,216 @@ mod tests {
             "closing a terminal tab must kill its session: {:?}",
             backend.calls()
         );
+    }
+
+    #[gpui::test]
+    async fn test_terminal_close_preserves_unpersisted_terminals_after_stale_push(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let backend =
+            install_lifecycle("test_close_preserves_unpersisted_terminals", &mut cx).await;
+        let workspace_id = ade_workspace.daemon_workspace_id();
+        let stored = LayoutDoc::new(leaf(
+            vec![terminal("first-session"), terminal("doomed-session")],
+            0,
+            true,
+        ));
+        backend.seed_layout(&workspace_id, stored.clone(), 68);
+        backend
+            .live_sessions
+            .lock()
+            .unwrap()
+            .extend(["first-session".to_owned(), "doomed-session".to_owned()]);
+        render(&workspace, &ade_workspace, stored.clone(), &mut cx).await;
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_ade_owns_layout(window, cx)
+            });
+            AdeLayouts::install(
+                &workspace,
+                ade_workspace.clone(),
+                stored.clone(),
+                68,
+                window,
+                cx,
+            );
+        });
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            for _ in 0..2 {
+                terminal_panel::TerminalPanel::insert_test_center_terminal(
+                    workspace,
+                    TerminalId::new(),
+                    window,
+                    cx,
+                );
+            }
+            workspace.active_pane().update(cx, |pane, cx| {
+                pane.activate_item(0, false, false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let (doomed, plain_terminals) = workspace.read_with(&mut cx, |workspace, cx| {
+            let pane = workspace.active_pane().read(cx);
+            assert_eq!(pane.items_len(), 4);
+            assert_eq!(capture_layout(workspace, cx), Some(stored));
+            let terminals = pane
+                .items_of_type::<TerminalView>()
+                .map(|view| (view.entity_id(), view.read(cx).terminal().downgrade()))
+                .collect::<Vec<_>>();
+            let doomed = pane
+                .items_of_type::<MissingTab>()
+                .find(|item| item.read(cx).tab() == &terminal("doomed-session"))
+                .unwrap()
+                .entity_id();
+            (doomed, terminals)
+        });
+        assert_eq!(plain_terminals.len(), 2);
+        pretend_item_is_session(&workspace, doomed, "doomed-session", &mut cx);
+        workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.active_pane().update(cx, |pane, cx| {
+                    pane.close_item_by_id(doomed, SaveIntent::Skip, window, cx)
+                })
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            plain_terminals
+                .iter()
+                .all(|(_, terminal)| terminal.upgrade().is_some())
+        );
+
+        // The daemon scrubs the closed session before the debounced client save.
+        backend.seed_layout(
+            &workspace_id,
+            LayoutDoc::new(leaf(vec![terminal("first-session")], 0, true)),
+            69,
+        );
+        cx.executor().advance_clock(PUSH_DEBOUNCE * 2);
+        cx.run_until_parked();
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|call| call == &format!("update_layout:{workspace_id}@69"))
+        );
+        assert_eq!(
+            backend
+                .calls()
+                .into_iter()
+                .filter(|call| call.contains("kill"))
+                .collect::<Vec<_>>(),
+            vec!["kill_session:doomed-session"]
+        );
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+        let remaining = workspace.read_with(&mut cx, |workspace, cx| {
+            workspace
+                .center()
+                .panes()
+                .iter()
+                .flat_map(|pane| pane.read(cx).items().map(|item| item.item_id()))
+                .collect::<Vec<_>>()
+        });
+        let live_plain = plain_terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.upgrade().is_some())
+            .count();
+        assert_eq!(
+            (remaining.len(), live_plain),
+            (3, 2),
+            "closing one tab must preserve both unrelated terminals; after stale push: remaining={remaining:?}, plain={plain_terminals:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_remote_layout_keeps_a_local_only_pane_terminal(cx: &mut TestAppContext) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let backend = install_lifecycle("test_remote_layout_keeps_local_terminal", &mut cx).await;
+        let workspace_id = ade_workspace.daemon_workspace_id();
+        render(
+            &workspace,
+            &ade_workspace,
+            LayoutDoc::new(leaf(vec![editor(&path("a.rs"))], 0, true)),
+            &mut cx,
+        )
+        .await;
+        let local = workspace.update_in(&mut cx, |workspace, window, cx| {
+            terminal_panel::TerminalPanel::insert_test_center_terminal(
+                workspace,
+                TerminalId::new(),
+                window,
+                cx,
+            );
+            let source = workspace.active_pane().clone();
+            let item = source
+                .read(cx)
+                .items_of_type::<TerminalView>()
+                .next()
+                .unwrap();
+            let destination =
+                workspace.split_pane(source.clone(), workspace::SplitDirection::Right, window, cx);
+            workspace::move_item(&source, &destination, item.entity_id(), 0, true, window, cx);
+            item.downgrade()
+        });
+        cx.run_until_parked();
+        let initial = workspace
+            .read_with(&mut cx, |workspace, cx| capture_layout(workspace, cx))
+            .unwrap();
+        backend.seed_layout(&workspace_id, initial.clone(), 1);
+        cx.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_ade_owns_layout(window, cx)
+            });
+            AdeLayouts::install(&workspace, ade_workspace, initial, 1, window, cx);
+        });
+        let sync = cx.update(|_, cx| AdeLayouts::sync_for(workspace.entity_id(), cx).unwrap());
+        for (rev, remote) in [
+            (
+                2,
+                LayoutDoc::new(leaf(vec![editor(&path("b.rs"))], 0, true)),
+            ),
+            (3, LayoutDoc::empty()),
+        ] {
+            backend.seed_layout(&workspace_id, remote.clone(), rev);
+            sync.update(&mut cx, |sync, cx| {
+                sync.on_layout_event(
+                    &LayoutEvent {
+                        workspace_id: workspace_id.clone(),
+                        layout: remote,
+                        rev,
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            workspace.read_with(&mut cx, |workspace, cx| {
+                let local = local
+                    .upgrade()
+                    .expect("the live terminal must not be dropped");
+                assert!(workspace.pane_for(&local).is_some());
+                assert_eq!(
+                    workspace.active_item(cx).unwrap().item_id(),
+                    local.entity_id()
+                );
+                assert_eq!(
+                    workspace
+                        .center()
+                        .panes()
+                        .iter()
+                        .map(|pane| pane.read(cx).items_len())
+                        .sum::<usize>(),
+                    if rev == 2 { 2 } else { 1 }
+                );
+                assert_eq!(capture_layout(workspace, cx).is_some(), rev == 2);
+            });
+        }
+        assert!(!backend.killed_anything());
     }
 
     #[gpui::test]
