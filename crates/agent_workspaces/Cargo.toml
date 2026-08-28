@@ -20,6 +20,7 @@ test-support = [
 unit-eval = []
 
 [dependencies]
+ade_workspaces.workspace = true
 async-channel.workspace = true
 anyhow.workspace = true
 chrono.workspace = true

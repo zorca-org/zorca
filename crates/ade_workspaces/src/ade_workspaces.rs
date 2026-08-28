@@ -34,7 +34,7 @@ pub use daemon_backend::{DAEMON_BIN_ENV, DaemonBackend, DaemonUpgradeOutcome};
 pub use layout::{
     AdeLayouts, Arrangement, Broadcast, LayoutSync, Leaf, MIN_SPLIT_RATIO, PUSH_DEBOUNCE,
     arrangement_from_layout, broadcast_action, capture_layout, layout_from_arrangement,
-    render_layout, session_task_id, split_flexes,
+    open_agent_terminal, render_layout, session_task_id, split_flexes,
 };
 pub use lifecycle::{Reconciled, SessionState, WorkspaceEntry, WorkspaceLifecycleService};
 pub use missing_tab::MissingTab;

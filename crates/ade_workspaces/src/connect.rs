@@ -24,7 +24,7 @@
 
 use crate::{
     AdeWorkspace, SessionState, WorkspaceEntry, WorkspaceLifecycleService,
-    attach::attach_terminal,
+    attach::{attach_terminal, open_probed_workspace_session},
     open_workspace_session,
     store::AdeWorkspaceStore,
     workspace_view::{ensure_repository_worktree, name_window_after_workspace},
@@ -34,25 +34,50 @@ use gpui::{
     Window,
 };
 use remote::{RemoteConnectionOptions, SshConnectionOptions};
-use std::collections::HashSet;
+use std::collections::{HashMap, hash_map::Entry};
 use std::path::Path;
+use std::sync::Arc;
+use util::ResultExt as _;
 use workspace::Workspace;
 
-/// Windows the connect flow has already claimed, by workspace entity id.
-///
-/// Two callers can legitimately reach for the same fresh connection — the
-/// fresh-window item when nothing was serialized, and the sidebar's
-/// workspace-added hook when something was — and the flow must run once per
-/// window, not once per caller. The first claim wins; the second caller is
-/// told `true` so it opens nothing over the flow already in flight.
+// Completed claims still deduplicate connection flows, but must not block
+// agent launches in windows that fell back to ordinary terminals.
+enum ClaimState {
+    InFlight(Arc<()>),
+    Completed,
+}
+
 #[derive(Default)]
-struct ClaimedWindows(HashSet<EntityId>);
+struct ClaimedWindows(HashMap<EntityId, ClaimState>);
 
 impl Global for ClaimedWindows {}
 
-/// `true` when this window is now the caller's to run the flow in.
-fn claim_window(window: EntityId, cx: &mut App) -> bool {
-    cx.default_global::<ClaimedWindows>().0.insert(window)
+/// A token when this window is now the caller's to run the flow in.
+fn claim_window(window: EntityId, cx: &mut App) -> Option<Arc<()>> {
+    match cx.default_global::<ClaimedWindows>().0.entry(window) {
+        Entry::Vacant(entry) => {
+            let claim = Arc::new(());
+            entry.insert(ClaimState::InFlight(claim.clone()));
+            Some(claim)
+        }
+        Entry::Occupied(_) => None,
+    }
+}
+
+pub(crate) fn connection_is_in_flight(window: EntityId, cx: &App) -> bool {
+    cx.try_global::<ClaimedWindows>()
+        .and_then(|claims| claims.0.get(&window))
+        .is_some_and(|state| matches!(state, ClaimState::InFlight(_)))
+}
+
+fn complete_window_claim(window: EntityId, claim: &Arc<()>, cx: &mut App) {
+    if cx.has_global::<ClaimedWindows>()
+        && let Some(state) = cx.global_mut::<ClaimedWindows>().0.get_mut(&window)
+        && matches!(state, ClaimState::InFlight(current) if Arc::ptr_eq(current, claim))
+    {
+        // A released claim may already have been replaced by a retry.
+        *state = ClaimState::Completed;
+    }
 }
 
 pub(crate) fn release_window_claim(window: EntityId, cx: &mut App) {
@@ -129,9 +154,9 @@ pub fn open_connection_workspace(
     let host = ssh.as_ref().map(ssh_destination);
     let label = host.clone().unwrap_or_else(|| "this machine".to_owned());
     let window_id = cx.entity().entity_id();
-    if !claim_window(window_id, cx) {
+    let Some(claim) = claim_window(window_id, cx) else {
         return true;
-    }
+    };
     // The one line that proves the flow started; everything after it either
     // attaches or explains itself in this same log.
     log::info!("ADE claims the {label} window; reattaching once the project root settles");
@@ -175,6 +200,8 @@ pub fn open_connection_workspace(
             None => repository_path == *util::paths::home_dir(),
         };
         if is_home {
+            cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+                .log_err();
             open_plain_terminal_if_empty(&this, cx);
             return;
         }
@@ -208,7 +235,11 @@ pub fn open_connection_workspace(
                         })
                         .await
                     }
-                    Ok(false) => return,
+                    Ok(false) => {
+                        cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+                            .log_err();
+                        return;
+                    }
                     Err(error) => {
                         log::warn!("upgrading the session daemon on {label} failed: {error:#}");
                         let detail = format!("{error:#}");
@@ -234,6 +265,8 @@ pub fn open_connection_workspace(
                                 );
                             }
                         }
+                        cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+                            .log_err();
                         return;
                     }
                 }
@@ -247,6 +280,8 @@ pub fn open_connection_workspace(
                 log::warn!(
                     "ADE could not reach {label}, so this connection gets a plain terminal: {error:#}"
                 );
+                cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+                    .log_err();
                 open_plain_terminal_if_empty(&this, cx);
                 return;
             }
@@ -307,6 +342,8 @@ pub fn open_connection_workspace(
             .await;
         if let Err(error) = scoped {
             log::warn!("updating ADE project identity for {label} failed: {error:#}");
+            cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+                .log_err();
             open_plain_terminal_if_empty(&this, cx);
             return;
         }
@@ -347,6 +384,8 @@ pub fn open_connection_workspace(
             log::warn!("opening the ADE workspace for {label} failed: {error:#}");
             open_plain_terminal_if_empty(&this, cx);
         }
+        cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
+            .log_err();
     })
     .detach();
     true
@@ -474,9 +513,12 @@ async fn open_or_recreate(
             async move { lifecycle.open_workspace(&id).await }
         })
         .await?;
-    let (_, state) = probed;
-    if !matches!(state, SessionState::Dead) {
-        return open_in_window(this, id, cx).await;
+    if !matches!(probed.1, SessionState::Dead) {
+        return this
+            .update_in(cx, |_, window, cx| {
+                open_probed_workspace_session(&cx.entity(), probed, window, cx)
+            })?
+            .await;
     }
 
     log::info!(
@@ -702,6 +744,9 @@ mod tests {
     #[derive(Default)]
     struct UpgradeBackend {
         upgrades: AtomicUsize,
+        session_exists: bool,
+        probes: AtomicUsize,
+        layout_reads: AtomicUsize,
     }
 
     impl SessionBackend for UpgradeBackend {
@@ -717,8 +762,25 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SessionId, _expected: Option<&str>) -> anyhow::Result<bool> {
-            Ok(false)
+        fn exists(&self, _id: &SessionId, expected: Option<&str>) -> anyhow::Result<bool> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.session_exists {
+                assert_eq!(expected, Some("test-daemon"));
+            }
+            Ok(self.session_exists)
+        }
+
+        fn open_workspace(
+            &self,
+            _workspace_id: &str,
+            expected: Option<&str>,
+        ) -> anyhow::Result<crate::WorkspaceLayout> {
+            assert_eq!(expected, Some("test-daemon"));
+            self.layout_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::WorkspaceLayout {
+                layout: ade_session::LayoutDoc::empty(),
+                rev: 1,
+            })
         }
 
         fn attach(&self, _spec: &SessionSpec, _expected: Option<&str>) -> anyhow::Result<Attached> {
@@ -874,14 +936,106 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_reconnect_probes_a_live_workspace_once(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        let backend = Arc::new(UpgradeBackend {
+            session_exists: true,
+            ..Default::default()
+        });
+        let registry = crate::AdeWorkspaceRegistry::open_test_db("reconnect_probes_once").await;
+        let mut row = AdeWorkspace::new("main", "repo", "/repo");
+        row.terminal_session_id = Some(row.daemon_workspace_id());
+        row.daemon_id = Some("test-daemon".to_owned());
+        let id = row.id.clone();
+        registry.create_workspace(row.clone()).await.unwrap();
+        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            backend.clone(),
+        ));
+        window.update(|_, cx| cx.set_global(crate::GlobalLifecycleService(lifecycle.clone())));
+        let open = window.update(|window, cx| {
+            window.spawn(cx, {
+                let workspace = workspace.downgrade();
+                async move |cx| open_or_recreate(&workspace, &lifecycle, row, cx).await
+            })
+        });
+        open.await.unwrap();
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.layout_reads.load(Ordering::SeqCst), 1);
+        assert!(workspace.read_with(&window, |workspace, _| workspace.ade_owns_layout()));
+
+        let reopen = window.update(|window, cx| open_workspace_session(&workspace, id, window, cx));
+        reopen.await.unwrap();
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.layout_reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[gpui::test]
     async fn test_releasing_a_claim_allows_the_window_to_reconnect(cx: &mut TestAppContext) {
         let (workspace, mut window) = test_window(cx).await;
         window.update(|_, cx| {
             let id = workspace.entity_id();
-            assert!(cx.default_global::<ClaimedWindows>().0.insert(id));
+            assert!(claim_window(id, cx).is_some());
             release_window_claim(id, cx);
-            assert!(cx.default_global::<ClaimedWindows>().0.insert(id));
+            assert!(claim_window(id, cx).is_some());
         });
+    }
+
+    #[gpui::test]
+    async fn test_old_completion_does_not_finish_a_reclaimed_window(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        window.update(|_, cx| {
+            let id = workspace.entity_id();
+            let old = claim_window(id, cx).unwrap();
+            release_window_claim(id, cx);
+            let current = claim_window(id, cx).unwrap();
+            complete_window_claim(id, &old, cx);
+            assert!(connection_is_in_flight(id, cx));
+            complete_window_claim(id, &current, cx);
+            assert!(!connection_is_in_flight(id, cx));
+            assert!(claim_window(id, cx).is_none());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_an_in_flight_connection_blocks_agent_preset(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        window.update(|_, cx| {
+            let id = workspace.entity_id();
+            assert!(claim_window(id, cx).is_some());
+            assert!(
+                claim_window(id, cx).is_none(),
+                "duplicate callers share the flow"
+            );
+        });
+        let blocked = window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::layout::open_agent_terminal(workspace, window, cx).is_some()
+            })
+        });
+        assert!(
+            blocked,
+            "an in-flight connection must reject a throwaway PTY"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_completed_home_or_failure_fallback_does_not_block_agent_preset(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, mut window) = test_window(cx).await;
+        window.update(|_, cx| {
+            let id = workspace.entity_id();
+            let claim = claim_window(id, cx).unwrap();
+            complete_window_claim(id, &claim, cx);
+            assert!(!connection_is_in_flight(id, cx));
+        });
+        let allowed = window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                crate::layout::open_agent_terminal(workspace, window, cx).is_none()
+            })
+        });
+        assert!(allowed, "a completed fallback must allow a throwaway PTY");
     }
 
     #[cfg(unix)]
@@ -906,8 +1060,15 @@ mod tests {
         let id = workspace.entity_id();
         let this = workspace.downgrade();
         window.update(|_, cx| {
-            assert!(claim_window(id, cx), "the first caller takes the window");
-            assert!(!claim_window(id, cx), "and the flow runs once per window");
+            assert!(
+                claim_window(id, cx).is_some(),
+                "the first caller takes the window"
+            );
+            assert!(
+                claim_window(id, cx).is_none(),
+                "and the flow runs once per window"
+            );
+            assert!(connection_is_in_flight(id, cx));
         });
 
         window
@@ -915,10 +1076,12 @@ mod tests {
             .await;
 
         window.update(|_, cx| {
+            assert!(!connection_is_in_flight(id, cx));
             assert!(
-                claim_window(id, cx),
+                claim_window(id, cx).is_some(),
                 "a root that lands late must still find the window claimable"
             );
+            assert!(connection_is_in_flight(id, cx));
         });
     }
 

@@ -3316,30 +3316,7 @@ impl Sidebar {
             return;
         };
 
-        // Agent presets go to the center too. The init command is delivered by
-        // writing to the terminal after it starts, not by a creation-time hook,
-        // so the center path can carry it.
-        let command = command.to_owned();
-        workspace.update(cx, |workspace, cx| {
-            let working_directory = terminal_view::default_working_directory(workspace, cx);
-            let terminal = terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
-                workspace,
-                window,
-                cx,
-                move |project, cx| project.create_terminal_shell(working_directory, cx),
-            );
-            cx.spawn(async move |_, cx| {
-                let terminal = terminal.await?;
-                let Some(terminal) = terminal.upgrade() else {
-                    return anyhow::Ok(());
-                };
-                cx.update(|cx| {
-                    agent_workspaces::write_terminal_init_command(&terminal, command, cx)
-                });
-                anyhow::Ok(())
-            })
-            .detach_and_log_err(cx);
-        });
+        agent_workspaces::spawn_center_agent_terminal(workspace, command, window, cx);
     }
 
     fn selected_group_key(&self) -> Option<ProjectGroupKey> {
