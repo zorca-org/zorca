@@ -24,7 +24,7 @@
 
 use crate::{
     AdeWorkspace, SessionState, WorkspaceEntry, WorkspaceLifecycleService,
-    attach::attach_terminal,
+    attach::{attach_terminal, open_probed_workspace_session},
     open_workspace_session,
     store::AdeWorkspaceStore,
     workspace_view::{ensure_repository_worktree, name_window_after_workspace},
@@ -513,9 +513,12 @@ async fn open_or_recreate(
             async move { lifecycle.open_workspace(&id).await }
         })
         .await?;
-    let (_, state) = probed;
-    if !matches!(state, SessionState::Dead) {
-        return open_in_window(this, id, cx).await;
+    if !matches!(probed.1, SessionState::Dead) {
+        return this
+            .update_in(cx, |_, window, cx| {
+                open_probed_workspace_session(&cx.entity(), probed, window, cx)
+            })?
+            .await;
     }
 
     log::info!(
@@ -741,6 +744,9 @@ mod tests {
     #[derive(Default)]
     struct UpgradeBackend {
         upgrades: AtomicUsize,
+        session_exists: bool,
+        probes: AtomicUsize,
+        layout_reads: AtomicUsize,
     }
 
     impl SessionBackend for UpgradeBackend {
@@ -756,8 +762,25 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn exists(&self, _id: &SessionId, _expected: Option<&str>) -> anyhow::Result<bool> {
-            Ok(false)
+        fn exists(&self, _id: &SessionId, expected: Option<&str>) -> anyhow::Result<bool> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            if self.session_exists {
+                assert_eq!(expected, Some("test-daemon"));
+            }
+            Ok(self.session_exists)
+        }
+
+        fn open_workspace(
+            &self,
+            _workspace_id: &str,
+            expected: Option<&str>,
+        ) -> anyhow::Result<crate::WorkspaceLayout> {
+            assert_eq!(expected, Some("test-daemon"));
+            self.layout_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::WorkspaceLayout {
+                layout: ade_session::LayoutDoc::empty(),
+                rev: 1,
+            })
         }
 
         fn attach(&self, _spec: &SessionSpec, _expected: Option<&str>) -> anyhow::Result<Attached> {
@@ -910,6 +933,41 @@ mod tests {
             Path::new("/home/kingii"),
             &ssh("wsl-box", None, None)
         ));
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_probes_a_live_workspace_once(cx: &mut TestAppContext) {
+        let (workspace, mut window) = test_window(cx).await;
+        let backend = Arc::new(UpgradeBackend {
+            session_exists: true,
+            ..Default::default()
+        });
+        let registry = crate::AdeWorkspaceRegistry::open_test_db("reconnect_probes_once").await;
+        let mut row = AdeWorkspace::new("main", "repo", "/repo");
+        row.terminal_session_id = Some(row.daemon_workspace_id());
+        row.daemon_id = Some("test-daemon".to_owned());
+        let id = row.id.clone();
+        registry.create_workspace(row.clone()).await.unwrap();
+        let lifecycle = Arc::new(WorkspaceLifecycleService::with_backend(
+            registry,
+            backend.clone(),
+        ));
+        window.update(|_, cx| cx.set_global(crate::GlobalLifecycleService(lifecycle.clone())));
+        let open = window.update(|window, cx| {
+            window.spawn(cx, {
+                let workspace = workspace.downgrade();
+                async move |cx| open_or_recreate(&workspace, &lifecycle, row, cx).await
+            })
+        });
+        open.await.unwrap();
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.layout_reads.load(Ordering::SeqCst), 1);
+        assert!(workspace.read_with(&window, |workspace, _| workspace.ade_owns_layout()));
+
+        let reopen = window.update(|window, cx| open_workspace_session(&workspace, id, window, cx));
+        reopen.await.unwrap();
+        assert_eq!(backend.probes.load(Ordering::SeqCst), 2);
+        assert_eq!(backend.layout_reads.load(Ordering::SeqCst), 2);
     }
 
     #[gpui::test]

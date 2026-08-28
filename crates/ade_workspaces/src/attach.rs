@@ -59,6 +59,26 @@ pub fn open_workspace_session(
     window: &mut Window,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    open_workspace_session_inner(zed_workspace, id, None, window, cx)
+}
+
+/// Reuses a connection's probe; layout reads and terminal attachment remain fenced.
+pub(crate) fn open_probed_workspace_session(
+    zed_workspace: &Entity<Workspace>,
+    probed: (AdeWorkspace, SessionState),
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    open_workspace_session_inner(zed_workspace, probed.0.id.clone(), Some(probed), window, cx)
+}
+
+fn open_workspace_session_inner(
+    zed_workspace: &Entity<Workspace>,
+    id: WorkspaceId,
+    probed: Option<(AdeWorkspace, SessionState)>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let lifecycle = crate::lifecycle_service(cx);
     let zed_workspace = zed_workspace.downgrade();
 
@@ -68,7 +88,10 @@ pub fn open_workspace_session(
                 let lifecycle = lifecycle.clone();
                 let id = id.clone();
                 async move {
-                    let (mut workspace, state) = lifecycle.open_workspace(&id).await?;
+                    let (mut workspace, state) = match probed {
+                        Some(probed) => probed,
+                        None => lifecycle.open_workspace(&id).await?,
+                    };
                     // **The daemon is the restore path.** A workspace whose
                     // session is alive has an arrangement stored beside it, and
                     // opening means building that and attaching to what it
