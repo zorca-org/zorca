@@ -94,7 +94,8 @@ const MAX_PENDING: usize = 128;
 /// cursor: alacritty ignores all three, so they never reach the grid this
 /// repaint describes, and re-emitting one would act on the client instead —
 /// the swap after the painted rows, hiding them; the save over whatever cursor
-/// the client had put aside for itself.
+/// the client had put aside for itself. The rest of the `47` family is out of
+/// scope for the same reason: both emulators ignore it.
 const SCANNED_MODES: &[u16] = &[
     5,    // DECSCNM, reverse video
     9,    // X10 mouse reporting
@@ -165,6 +166,9 @@ pub struct SessionGrid {
     /// The screen left the alternate buffer, but there was nowhere safe to
     /// splice the repair yet — mid-sync, or mid-sequence at the end of a chunk.
     pending_exit_repair: bool,
+    /// The last segment ended on a completed dispatch, so the client's parser is
+    /// between sequences and a repaint spliced here cuts nothing in half.
+    stream_clean: bool,
 }
 
 impl SessionGrid {
@@ -180,6 +184,7 @@ impl SessionGrid {
             boundary_parser: Parser::new(),
             scanner: Scanner::default(),
             pending_exit_repair: false,
+            stream_clean: true,
         }
     }
 
@@ -200,8 +205,12 @@ impl SessionGrid {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
     fn sync_pending(&self) -> bool {
-        self.parser.sync_timeout().sync_timeout().is_some()
+        self.sync_deadline().is_some()
     }
 
     /// End a synchronized update whose deadline has passed.
@@ -214,13 +223,11 @@ impl SessionGrid {
     /// ponytail: no timer thread, so a stuck update with no further output stays
     /// frozen until the next chunk arrives. Add one if a session is ever seen
     /// wedged with an idle pty.
-    fn flush_expired_sync(&mut self) {
-        let expired = self
-            .parser
-            .sync_timeout()
-            .sync_timeout()
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        if expired {
+    pub(crate) fn flush_expired_sync(&mut self) {
+        if self
+            .sync_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             let was_alternate = self.is_alternate_screen();
             self.parser.stop_sync(&mut self.term);
             self.note_exit(was_alternate);
@@ -236,6 +243,23 @@ impl SessionGrid {
         }
     }
 
+    /// Claim a latched repair if there is somewhere safe to splice it: no
+    /// synchronized update open, and the last segment ended on a completed
+    /// dispatch, so the client's parser is between sequences. Clears the latch;
+    /// [`Self::defer_repair`] puts it back.
+    pub(crate) fn take_pending_repair(&mut self) -> bool {
+        let ready = self.pending_exit_repair && !self.sync_pending() && self.stream_clean;
+        if ready {
+            self.pending_exit_repair = false;
+        }
+        ready
+    }
+
+    /// Re-latch a repair a caller took but did not send.
+    pub(crate) fn defer_repair(&mut self) {
+        self.pending_exit_repair = true;
+    }
+
     /// Stop at a completed screen transition, before any following partial sequence.
     /// `None` means all bytes were consumed without such a transition.
     pub(crate) fn feed_until_primary(&mut self, data: &[u8]) -> Option<usize> {
@@ -247,11 +271,15 @@ impl SessionGrid {
         if !self.is_alternate_screen() && !self.pending_exit_repair && !data.contains(&0x1b) {
             self.scanner.scan(data);
             self.parser.advance(&mut self.term, data);
+            // The boundary parser never saw these bytes, so it sits exactly
+            // where it did and `stream_clean` still describes it.
             return None;
         }
         let mut consumed = 0;
         while consumed < data.len() {
-            let mut boundary = RepaintBoundary::default();
+            // Greedy while a repair waits, so the latch resolves at the first
+            // safe point instead of at the next screen transition.
+            let mut boundary = RepaintBoundary::new(self.pending_exit_repair);
             let count = self
                 .boundary_parser
                 .advance_until_terminated(&mut boundary, &data[consumed..]);
@@ -260,17 +288,16 @@ impl SessionGrid {
             self.scanner.scan(prefix);
             self.parser.advance(&mut self.term, prefix);
             consumed += count;
+            // A completed dispatch leaves the parser in the ground state — but
+            // vte reports a printed run only after swallowing the ESC that ended
+            // it, and a run can also stop mid-codepoint. An ASCII last byte
+            // rules out both.
+            self.stream_clean = boundary.terminated()
+                && prefix
+                    .last()
+                    .is_some_and(|byte| *byte < 0x80 && *byte != 0x1b);
             self.note_exit(was_alternate);
-            // A segment ends either on a completed boundary sequence or at the
-            // end of the chunk; the scanner's carried tail is what tells the two
-            // apart, so an empty one means the client's parser is between
-            // sequences and a repaint can be spliced in here.
-            //
-            // ponytail: the scanner skips unrecognised two-byte escapes whole,
-            // so a chunk ending on a bare `ESC (` reads as complete. The client
-            // then loses that one designation to the repaint's own ESC.
-            if self.pending_exit_repair && !self.sync_pending() && self.scanner.pending.is_empty() {
-                self.pending_exit_repair = false;
+            if self.take_pending_repair() {
                 return Some(consumed);
             }
         }
@@ -338,8 +365,7 @@ impl SessionGrid {
             let Some((rendered, ended_with)) = render_row(&cells, &default, &pen) else {
                 continue;
             };
-            out.extend_from_slice(CSI);
-            out.extend_from_slice(format!("{};1H", row + 1).as_bytes());
+            cup(&mut out, row as i32 + 1, 1);
             out.extend_from_slice(&rendered);
             pen = ended_with;
         }
@@ -423,6 +449,13 @@ impl SessionGrid {
                 // away, and it costs the client its saved cursor. Cheaper than
                 // a cursor that is permanently a region-offset out of place;
                 // revisit if a client is seen losing a save it wanted.
+                //
+                // ponytail: it also assumes alacritty's DECRC, which does not
+                // restore origin mode. A conformant DECRC would put DECOM back
+                // *off* and leave the client's CUP absolute for the rest of the
+                // session. Exact for every product client (all alacritty-based);
+                // raw `ade-daemon attach` into xterm diverges. Emit an explicit
+                // `CSI ? 6 h` after the restore if a non-alacritty client ships.
                 out.extend_from_slice(b"\x1b[?6l");
                 cup(&mut out, row + 1, column);
                 out.extend_from_slice(b"\x1b7\x1b[?6h\x1b8");
@@ -446,30 +479,68 @@ fn cup(out: &mut Vec<u8>, row: i32, column: usize) {
     out.extend_from_slice(format!("{};{column}H", row.max(1)).as_bytes());
 }
 
-#[derive(Default)]
-struct RepaintBoundary(bool);
+/// Where a segment may end: always at a completed screen transition, and in
+/// greedy mode at any completed dispatch.
+///
+/// Greedy is on only while a repair is latched, and only completed callbacks
+/// count — `hook`, `put` and the OSC interior never end a segment, because a
+/// repaint spliced into a half-written string would truncate it on the client
+/// and print the rest as text.
+///
+/// ponytail: a program that dies mid-OSC or mid-DCS therefore never reaches a
+/// clean point and its repair stays deferred forever. Time it out if a screen
+/// is ever seen stale behind a half-written string.
+struct RepaintBoundary {
+    at_boundary: bool,
+    greedy: bool,
+}
+
+impl RepaintBoundary {
+    fn new(greedy: bool) -> Self {
+        Self {
+            at_boundary: false,
+            greedy,
+        }
+    }
+}
 
 impl Perform for RepaintBoundary {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         let names = |code: u16| params.iter().any(|param| param.first() == Some(&code));
-        self.0 = !ignore
-            && intermediates == b"?"
-            && match action {
-                // Entering ends a segment too, so no segment can span an entry
-                // and its exit and hide the visit from `was_alternate`.
-                'h' => names(1049),
-                // A synchronized update may apply the screen change only at its end.
-                'l' => names(1049) || names(2026),
-                _ => false,
-            };
+        self.at_boundary = self.greedy
+            || (!ignore
+                && intermediates == b"?"
+                && match action {
+                    // Entering ends a segment too, so no segment can span an
+                    // entry and its exit and hide the visit from
+                    // `was_alternate`.
+                    'h' => names(1049),
+                    // A synchronized update may apply the screen change only at
+                    // its end.
+                    'l' => names(1049) || names(2026),
+                    _ => false,
+                });
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
-        self.0 = !ignore && intermediates.is_empty() && byte == b'c';
+        self.at_boundary = self.greedy || (!ignore && intermediates.is_empty() && byte == b'c');
+    }
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
+        self.at_boundary |= self.greedy;
+    }
+
+    fn unhook(&mut self) {
+        self.at_boundary |= self.greedy;
+    }
+
+    fn print(&mut self, _character: char) {
+        // vte only calls this for a complete codepoint.
+        self.at_boundary |= self.greedy;
     }
 
     fn terminated(&self) -> bool {
-        self.0
+        self.at_boundary
     }
 }
 
@@ -1317,7 +1388,10 @@ mod tests {
         assert!(grid.is_alternate_screen(), "the exit is still buffered");
         let splice = grid.feed_until_primary(&vec![b'\r'; SYNC_BUFFER_SIZE]);
         assert!(!grid.is_alternate_screen(), "the overrun flushed the sync");
-        assert!(splice.is_some(), "the deferred repair is spliced");
+        // Nothing in that segment completed a dispatch, so it proves nothing
+        // about where the client's parser is; the latch waits one chunk.
+        assert_eq!(splice, None, "no safe point yet");
+        assert_eq!(grid.feed_until_primary(b"$ "), Some(2), "the next one is");
     }
 
     #[test]
@@ -1340,6 +1414,60 @@ mod tests {
             "the primary screen is back: {:?}",
             screen_text(&grid)
         );
+    }
+
+    /// A grid back on the primary screen with a repair latched and nowhere to
+    /// put it: the exit applied when a stuck synchronized update expired, which
+    /// is not a boundary in the stream.
+    fn grid_with_a_latched_repair() -> SessionGrid {
+        let mut grid = SessionGrid::new(20, 5);
+        grid.feed(b"primary\x1b[?1049h\x1b[Happ");
+        assert_eq!(
+            grid.feed_until_primary(b"\x1b[?2026h\x1b[?1049l\x1b[?2026;25l"),
+            None
+        );
+        std::thread::sleep(SYNC_UPDATE_TIMEOUT + std::time::Duration::from_millis(20));
+        grid
+    }
+
+    #[test]
+    fn a_latched_repair_does_not_splice_inside_an_osc_string() {
+        // The scanner drops a tail longer than `MAX_PENDING`, so a long
+        // unterminated OSC read as "between sequences": the repaint's own ESC
+        // cut the client's title short and the payload printed as garbage.
+        let mut grid = grid_with_a_latched_repair();
+        let mut chunk = b"\x1b]0;".to_vec();
+        chunk.resize(chunk.len() + 200, b'x');
+        assert_eq!(grid.feed_until_primary(&chunk), None);
+    }
+
+    #[test]
+    fn a_latched_repair_does_not_splice_inside_a_dcs_string() {
+        // `ESC P` is an unrecognised two-byte escape to the scanner, so a tmux
+        // passthrough payload read as plain text and the splice landed inside it.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(grid.feed_until_primary(b"\x1bPtmux;hello"), None);
+    }
+
+    #[test]
+    fn a_latched_repair_splices_at_the_next_completed_sequence() {
+        // The OSC terminator is a positive safe point; the bytes after it are
+        // the next segment's problem.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(
+            grid.feed_until_primary(b"\x1b]0;title\x07rest"),
+            Some("\x1b]0;title\x07".len())
+        );
+    }
+
+    #[test]
+    fn a_deferred_repair_splices_at_the_next_clean_point() {
+        // What the sessions-side sweeper does when it cannot push the repaint:
+        // the latch goes back, and the next completed dispatch offers it again.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(grid.feed_until_primary(b"tail"), Some(4), "offered once");
+        grid.defer_repair();
+        assert_eq!(grid.feed_until_primary(b"more"), Some(4), "and again");
     }
 
     #[test]

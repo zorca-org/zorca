@@ -363,6 +363,24 @@ impl Outbound {
         true
     }
 
+    /// Queue one frame only if `reserve` bytes are still free behind it, and
+    /// say whether it went. A refusal costs the connection nothing — it is for
+    /// the frames this daemon synthesized, which a client can live without.
+    ///
+    /// Reserve and frame are accounted in one step on purpose: reading
+    /// [`Self::free_bytes`] and then pushing lets a concurrent push land
+    /// between the two, and the check that said there was room is the reason
+    /// the push then closes the connection.
+    fn try_push(&self, frame: Frame, reserve: u64) -> bool {
+        let cost = frame_bytes(&frame);
+        let before = self.queued.fetch_add(cost, Ordering::SeqCst);
+        if before + cost + reserve > self.max_bytes || self.frames.try_send(frame).is_err() {
+            self.queued.fetch_sub(cost, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
     /// The room left under the bound right now — what an attach budgets its
     /// replay against. Reading it beats assuming an empty queue: a multiplexed
     /// connection may already hold another session's replay.
@@ -725,6 +743,12 @@ impl OutputHub {
     fn publish(&mut self, session_id: &SessionId, mut chunk: &[u8]) {
         // History is raw pty bytes only — a synthesized repaint never enters it.
         self.ring.push(chunk);
+        // At most one synthesis per call: an app toggling the alternate screen
+        // dozens of times inside one read would otherwise pay a whole screen
+        // per toggle, and only the last toggle repairs anything anyway. The
+        // rest re-latch, so the repair rides the next splice point.
+        let mut synthesized = false;
+        let mut deferred = false;
         while !chunk.is_empty() {
             let boundary = self
                 .grid
@@ -732,39 +756,50 @@ impl OutputHub {
                 .and_then(|grid| grid.feed_until_primary(chunk));
             let (prefix, suffix) = chunk.split_at(boundary.unwrap_or(chunk.len()));
             // At a splice point, repair a truncated replay's primary screen
-            // without splitting a VT sequence — synthesized once here, since a
+            // without splitting a VT sequence — synthesized here, since a
             // detached session or an ordinary chunk must pay nothing for it.
             let spliced = match (boundary, self.grid.as_ref()) {
-                (Some(_), Some(grid)) if !self.subscribers.is_empty() => {
+                (Some(_), Some(grid)) if !self.subscribers.is_empty() && !synthesized => {
+                    synthesized = true;
                     Some([prefix, &grid.repaint()].concat())
+                }
+                // A later splice in the same chunk, with someone to repair for.
+                (Some(_), Some(_)) => {
+                    deferred |= !self.subscribers.is_empty();
+                    None
                 }
                 _ => None,
             };
             self.subscribers.retain(|(_, outbound)| {
                 // Prefix and repaint go as one frame: two would let a client
-                // render the stale primary in between. A queue without the room
-                // gets the prefix alone and keeps its stale screen — pty bytes
-                // are never dropped, and unlike [`Self::repaint`] a repaint
-                // nobody can take must not cost the connection.
-                // ponytail: a skipped repaint is never retried — the next
-                // attach or resize repaints anyway; queue one if that shows.
-                let bytes = match &spliced {
-                    Some(spliced)
-                        if spliced.len() as u64 + ATTACH_RESERVE_BYTES <= outbound.free_bytes() =>
-                    {
-                        spliced.clone()
-                    }
-                    _ => prefix.to_vec(),
-                };
+                // render the stale primary in between.
+                if let Some(spliced) = spliced.as_ref()
+                    && outbound.try_push(
+                        Frame::Output {
+                            session_id: session_id.clone(),
+                            bytes: spliced.clone(),
+                        },
+                        ATTACH_RESERVE_BYTES,
+                    )
+                {
+                    return true;
+                }
+                // No room for the repair: the prefix alone, so the client keeps
+                // a stale screen but loses no pty byte. See [`Self::repaint`]
+                // for why this one may not cost the connection.
+                deferred |= spliced.is_some();
                 outbound.push(Frame::Output {
                     session_id: session_id.clone(),
-                    bytes,
+                    bytes: prefix.to_vec(),
                 })
             });
             if boundary.is_none() {
                 break;
             }
             chunk = suffix;
+        }
+        if deferred && let Some(grid) = self.grid.as_mut() {
+            grid.defer_repair();
         }
     }
 
@@ -780,6 +815,12 @@ impl OutputHub {
     /// was for.
     fn attach(&mut self, session_id: &SessionId, subscriber: SubscriberId, outbound: &Outbound) {
         self.subscribers.retain(|(id, _)| *id != subscriber);
+        // An app killed mid-synchronized-update leaves the screen frozen with
+        // no further chunk to end it; painting that would replay the app's
+        // screen for a session that has left it.
+        if let Some(grid) = self.grid.as_mut() {
+            grid.flush_expired_sync();
+        }
         let mut repaint = match self.grid.as_ref() {
             Some(grid) => grid.repaint(),
             None => Vec::new(),
@@ -823,9 +864,11 @@ impl OutputHub {
         if self.subscribers.is_empty() {
             return;
         }
-        let Some(grid) = self.grid.as_ref() else {
+        let Some(grid) = self.grid.as_mut() else {
             return;
         };
+        // See [`Self::attach`]: an update nothing will end must not be painted.
+        grid.flush_expired_sync();
         let bytes = grid.repaint();
         self.subscribers.retain(|(_, outbound)| {
             outbound.push(Frame::Output {
@@ -833,6 +876,40 @@ impl OutputHub {
                 bytes: bytes.clone(),
             })
         });
+    }
+
+    /// End a synchronized update whose deadline has passed, and hand out the
+    /// repair it exposed. The one path that runs for a pty producing nothing:
+    /// an app killed mid-update writes no further chunk for
+    /// [`Self::publish`] to flush it on, so the sweep's cadence is what
+    /// unfreezes the screen.
+    ///
+    /// The repaint is a frame of its own — between chunks there is no stream
+    /// position to splice it into, and none is needed.
+    fn flush_stalled(&mut self, session_id: &SessionId) {
+        let Some(grid) = self.grid.as_mut() else {
+            return;
+        };
+        grid.flush_expired_sync();
+        if !grid.take_pending_repair() {
+            return;
+        }
+        // With nobody attached the latch simply stays cleared: an attach
+        // repaints the whole screen anyway, so there is nothing left to repair.
+        let bytes = grid.repaint();
+        let mut skipped = false;
+        for (_, outbound) in &self.subscribers {
+            skipped |= !outbound.try_push(
+                Frame::Output {
+                    session_id: session_id.clone(),
+                    bytes: bytes.clone(),
+                },
+                ATTACH_RESERVE_BYTES,
+            );
+        }
+        if skipped && let Some(grid) = self.grid.as_mut() {
+            grid.defer_repair();
+        }
     }
 
     /// `true` if `subscriber` was actually attached here.
@@ -2620,7 +2697,9 @@ impl SessionTable {
             .publish_event(&event);
     }
 
-    /// Re-derive every session's status and push the ones that changed.
+    /// Re-derive every session's status and push the ones that changed, and
+    /// unfreeze any screen stuck in a synchronized update — see
+    /// [`OutputHub::flush_stalled`].
     ///
     /// Called by the sweeper thread on [`StatusConfig::sweep_interval`]. This
     /// is the *only* writer of `info.status` after creation, which is what
@@ -2630,6 +2709,12 @@ impl SessionTable {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = Vec::new();
         for session in sessions.values_mut() {
+            // Lock order is sessions then hub, as everywhere else here.
+            session
+                .hub
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flush_stalled(&session.info.id);
             let derived = derive_status(session, self.status, now);
             if derived != session.info.status {
                 session.info.status = derived;
@@ -3255,8 +3340,8 @@ mod tests {
     };
 
     use super::{
-        Activity, Outbound, OutputHub, SessionGrid, SessionTable, StatusConfig, SubscriberId,
-        is_shell_name, login_shell_from, shell, terminal_env,
+        ATTACH_RESERVE_BYTES, Activity, Outbound, OutputHub, SessionGrid, SessionTable,
+        StatusConfig, SubscriberId, is_shell_name, login_shell_from, shell, terminal_env,
     };
     #[cfg(unix)]
     use super::{KILL_GRACE, terminate_groups, wait_for_termination};
@@ -4870,20 +4955,76 @@ mod tests {
         assert!(outbound.is_closed());
     }
 
+    /// The lead-in of a synthesized repaint, and of nothing a pty writes here.
+    const REPAINT_MARK: &[u8] = b"\x1b[?2026h";
+
+    fn repaints_in(frames: &[u8]) -> usize {
+        frames
+            .windows(REPAINT_MARK.len())
+            .filter(|window| *window == REPAINT_MARK)
+            .count()
+    }
+
+    fn drain_output(queue: &super::OutboundQueue) -> Vec<u8> {
+        let mut seen = Vec::new();
+        while let Some(frame) = queue.try_recv() {
+            if let Frame::Output { bytes, .. } = frame {
+                seen.extend(bytes);
+            }
+        }
+        seen
+    }
+
+    /// The reserve is taken in the same step that queues the frame, and a
+    /// refusal leaves the connection exactly as it was.
+    #[test]
+    fn try_push_refuses_a_frame_that_would_eat_the_reserve() {
+        let id = SessionId::new("try-push");
+        let (outbound, queue) = Outbound::new(4096);
+        let frame = |bytes: usize| Frame::Output {
+            session_id: id.clone(),
+            bytes: vec![b'x'; bytes],
+        };
+
+        assert!(outbound.try_push(frame(1024), 2048), "1280 + 2048 fits");
+        let free = outbound.free_bytes();
+
+        assert!(
+            !outbound.try_push(frame(1024), 3000),
+            "1280 + 3000 does not"
+        );
+        assert!(!outbound.is_closed(), "a refusal is not a close");
+        assert_eq!(outbound.free_bytes(), free, "the refusal kept its bytes");
+        assert!(queue.try_recv().is_some());
+        assert!(queue.try_recv().is_none(), "the refused frame was queued");
+    }
+
     /// A splice repaint is synthetic, so a subscriber with no room for it keeps
     /// its stale primary — the state it would have had without splices at all.
-    /// Closing the connection instead is what a probe caught: a stalled client
-    /// survived 7546 plain chunks and died on the 96th alternate-screen exit.
     #[test]
     fn a_splice_repaint_a_subscriber_cannot_take_is_skipped_not_fatal() {
         let id = SessionId::new("splice-headroom");
-        let (outbound, queue) = Outbound::new(4096);
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
         let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(120, 40)), None);
-        // A primary worth more than the whole queue, so the repaint the exit
-        // splices in cannot fit — while a bare pty frame still can.
         hub.publish(&id, &vec![b'X'; 120 * 40]);
+        let repaint = hub.grid.as_ref().expect("daemon grid").repaint().len() as u64;
         hub.publish(&id, b"\x1b[?1049h\x1b[HAPP");
         hub.attach(&id, SubscriberId::next(), &outbound);
+        drain_output(&queue);
+        // Room for the reserve and a bare pty frame, but not for the repaint on
+        // top of them: the guard has to fail on size, not on a queue too small
+        // to hold the reserve at all.
+        assert!(outbound.push(Frame::Output {
+            session_id: id.clone(),
+            bytes: vec![
+                b'f';
+                (OUTBOUND_QUEUE_BYTES - ATTACH_RESERVE_BYTES - repaint - 256) as usize
+            ],
+        }));
+        assert!(
+            outbound.free_bytes() > ATTACH_RESERVE_BYTES,
+            "the size branch is not the one under test"
+        );
 
         hub.publish(&id, b"\x1b[?1049lSHELL");
 
@@ -4893,15 +5034,105 @@ mod tests {
             "a synthetic repaint closed a live connection"
         );
         assert!(!outbound.is_closed(), "its queue was closed anyway");
-        let mut seen = Vec::new();
-        while let Some(frame) = queue.try_recv() {
-            if let Frame::Output { bytes, .. } = frame {
-                seen.extend(bytes);
-            }
-        }
+        let seen = drain_output(&queue);
+        assert_eq!(repaints_in(&seen), 0, "a repaint was forced past the bound");
+        assert!(
+            seen.ends_with(b"\x1b[?1049lSHELL"),
+            "pty bytes were dropped"
+        );
+    }
+
+    /// The other half of the same guard: a queue smaller than the reserve can
+    /// never take a splice, however small the screen is.
+    #[test]
+    fn a_splice_repaint_is_skipped_when_the_queue_cannot_hold_the_reserve() {
+        let id = SessionId::new("splice-reserve");
+        let (outbound, queue) = Outbound::new(4096);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(40, 8)), None);
+        hub.publish(&id, b"\x1b[?1049h\x1b[HAPP");
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        drain_output(&queue);
+
+        hub.publish(&id, b"\x1b[?1049lSHELL");
+
+        assert_eq!(hub.subscribers.len(), 1);
+        assert!(!outbound.is_closed());
+        assert_eq!(drain_output(&queue), b"\x1b[?1049lSHELL");
+    }
+
+    /// A skipped repair is not lost: it re-latches and rides the next splice.
+    #[test]
+    fn a_skipped_splice_repaint_is_retried_at_the_next_splice() {
+        let id = SessionId::new("splice-retry");
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(40, 8)), None);
+        hub.publish(&id, b"shell\x1b[?1049h\x1b[HAPP");
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        drain_output(&queue);
+        assert!(outbound.push(Frame::Output {
+            session_id: id.clone(),
+            bytes: vec![b'f'; (OUTBOUND_QUEUE_BYTES - ATTACH_RESERVE_BYTES - 256) as usize],
+        }));
+
+        hub.publish(&id, b"\x1b[?1049lSHELL");
+        assert_eq!(repaints_in(&drain_output(&queue)), 0, "it had no room");
+
+        hub.publish(&id, b"later output");
+
         assert_eq!(
-            seen, b"\x1b[?1049lSHELL",
-            "pty bytes were dropped, or a repaint was forced past the bound"
+            repaints_in(&drain_output(&queue)),
+            1,
+            "the skipped repair never came back"
+        );
+    }
+
+    /// One synthesis per publish, however many times the chunk toggles.
+    #[test]
+    fn a_toggle_storm_costs_one_repaint_per_chunk() {
+        let id = SessionId::new("splice-storm");
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(40, 8)), None);
+        hub.publish(&id, b"shell");
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        drain_output(&queue);
+
+        hub.publish(&id, b"\x1b[?1049hA\x1b[?1049lB\x1b[?1049hC\x1b[?1049lD");
+
+        let seen = drain_output(&queue);
+        assert_eq!(repaints_in(&seen), 1, "one repaint per publish call");
+        assert!(seen.ends_with(b"D"), "pty bytes were dropped");
+    }
+
+    /// An app killed mid-synchronized-update writes no further byte, so the
+    /// sweep is the only thing left to end the update and repair the screen.
+    #[test]
+    fn a_sweep_flushes_a_synchronized_update_no_output_will_end() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let (table, id) = seeded_table(dir.path());
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        {
+            let sessions = table.sessions.lock().expect("sessions");
+            let hub = sessions.get(&id).expect("the seeded session").hub.clone();
+            let mut hub = hub.lock().expect("hub");
+            // The seeded row is lost: give it the screen and the live stream a
+            // session with a pty behind it would have.
+            hub.grid = Some(SessionGrid::new(20, 5));
+            hub.ending = None;
+            hub.publish(&id, b"primary\x1b[?1049h\x1b[Happ");
+            // A combined ESU, which vte's in-sync scan does not match: only the
+            // deadline can end this update.
+            hub.publish(&id, b"\x1b[?2026h\x1b[?1049l\x1b[?2026;25l");
+            hub.attach(&id, SubscriberId::next(), &outbound);
+        }
+        drain_output(&queue);
+        std::thread::sleep(Duration::from_millis(200));
+
+        table.sweep();
+
+        let seen = String::from_utf8_lossy(&drain_output(&queue)).into_owned();
+        assert!(
+            seen.contains("primary"),
+            "the frozen screen was never repaired: {seen:?}"
         );
     }
 
