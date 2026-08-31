@@ -49,7 +49,8 @@
 //!   screen.** [`Term`] holds it, but only in a private field, and the one public
 //!   door to it ([`Term::swap_alt`]) resets the alternate screen on the way
 //!   back. The retained ring reconstructs it only if it still contains the
-//!   app's entry into the alternate screen.
+//!   app's entry into the alternate screen. The output hub repaints the primary
+//!   screen when the app exits to repair that incomplete copy.
 //! - **No charset-designation state.** `ESC ( 0` line-drawing is not re-emitted;
 //!   cells are stored already translated, so the painted rows are right and only
 //!   an app that leaves G0 non-default mid-stream would be off.
@@ -60,6 +61,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
+use alacritty_terminal::vte::{Params, Parser, Perform};
 
 const CSI: &[u8] = b"\x1b[";
 
@@ -154,6 +156,7 @@ impl Dimensions for GridSize {
 pub struct SessionGrid {
     term: Term<VoidListener>,
     parser: Processor<StdSyncHandler>,
+    boundary_parser: Parser,
     scanner: Scanner,
 }
 
@@ -167,15 +170,46 @@ impl SessionGrid {
         Self {
             term: Term::new(config, &size, VoidListener),
             parser: Processor::default(),
+            boundary_parser: Parser::new(),
             scanner: Scanner::default(),
         }
     }
 
     /// Advance the screen by `data`, and note any mode or margin change in it
     /// that [`Term`] does not record.
-    pub fn feed(&mut self, data: &[u8]) {
-        self.scanner.scan(data);
-        self.parser.advance(&mut self.term, data);
+    pub fn feed(&mut self, mut data: &[u8]) {
+        while let Some(consumed) = self.feed_until_primary(data) {
+            data = &data[consumed..];
+        }
+    }
+
+    fn is_alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Stop at a completed screen transition, before any following partial sequence.
+    /// `None` means all bytes were consumed without such a transition.
+    pub(crate) fn feed_until_primary(&mut self, data: &[u8]) -> Option<usize> {
+        let mut consumed = 0;
+        while consumed < data.len() {
+            let mut boundary = RepaintBoundary::default();
+            let count = self
+                .boundary_parser
+                .advance_until_terminated(&mut boundary, &data[consumed..]);
+            let was_alternate = self.is_alternate_screen();
+            let prefix = &data[consumed..consumed + count];
+            self.scanner.scan(prefix);
+            self.parser.advance(&mut self.term, prefix);
+            consumed += count;
+            if boundary.0
+                && was_alternate
+                && !self.is_alternate_screen()
+                && self.parser.sync_timeout().sync_timeout().is_none()
+            {
+                return Some(consumed);
+            }
+        }
+        None
     }
 
     /// Resize the screen. Content comes off the bottom and scrolls off the top
@@ -216,6 +250,10 @@ impl SessionGrid {
         if mode.contains(TermMode::ALT_SCREEN) {
             out.extend_from_slice(CSI);
             out.extend_from_slice(b"?1049h");
+        }
+        if mode.contains(TermMode::ORIGIN) {
+            // Repaints also target live terminals, whose CUP may still be relative.
+            out.extend_from_slice(b"\x1b[?6l");
         }
         // Pen first, then erase: the erase paints with the current background.
         out.extend_from_slice(CSI);
@@ -319,6 +357,29 @@ impl SessionGrid {
             b"?25l"
         });
         out
+    }
+}
+
+#[derive(Default)]
+struct RepaintBoundary(bool);
+
+impl Perform for RepaintBoundary {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.0 = !ignore
+            && intermediates == b"?"
+            && action == 'l'
+            // A synchronized update may apply the screen change only at its end.
+            && params
+                .iter()
+                .any(|param| matches!(param.first(), Some(1049 | 2026)));
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.0 = !ignore && intermediates.is_empty() && byte == b'c';
+    }
+
+    fn terminated(&self) -> bool {
+        self.0
     }
 }
 

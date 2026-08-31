@@ -722,19 +722,27 @@ impl OutputHub {
     /// This runs on the pty drain thread, so it never waits on a client:
     /// [`Outbound::push`] queues or drops, and either way the pty keeps
     /// being read.
-    fn publish(&mut self, session_id: &SessionId, chunk: &[u8]) {
+    fn publish(&mut self, session_id: &SessionId, mut chunk: &[u8]) {
         self.ring.push(chunk);
-        // The daemon's own copy of what the client is about to draw. Only this
-        // copy is interpreted; the bytes forwarded below are untouched.
-        if let Some(grid) = self.grid.as_mut() {
-            grid.feed(chunk);
+        while !chunk.is_empty() {
+            let boundary = self
+                .grid
+                .as_mut()
+                .and_then(|grid| grid.feed_until_primary(chunk));
+            let (prefix, suffix) = chunk.split_at(boundary.unwrap_or(chunk.len()));
+            self.subscribers.retain(|(_, outbound)| {
+                outbound.push(Frame::Output {
+                    session_id: session_id.clone(),
+                    bytes: prefix.to_vec(),
+                })
+            });
+            if boundary.is_none() {
+                break;
+            }
+            // Repair a truncated replay's primary screen without splitting a VT sequence.
+            self.repaint(session_id);
+            chunk = suffix;
         }
-        self.subscribers.retain(|(_, outbound)| {
-            outbound.push(Frame::Output {
-                session_id: session_id.clone(),
-                bytes: chunk.to_vec(),
-            })
-        });
     }
 
     /// Queue the replay and subscribe. Re-attaching replaces the previous
@@ -4679,6 +4687,146 @@ mod tests {
              reading"
         );
         assert!(!never_read.is_closed(), "its queue was closed anyway");
+    }
+
+    #[test]
+    fn exiting_alternate_screen_repairs_a_truncated_replay() {
+        let id = SessionId::new("alternate-screen-exit");
+        let drawing = b"\x1b[HSTALE APP\x1b[4;1HAPP FOOTER";
+        let exit = b"\x1b[?1049lSHELL AFTER";
+        for capacity in [drawing.len(), 4096] {
+            for split in 0..=exit.len() {
+                for resized in [false, true] {
+                    let mut hub = OutputHub::new(capacity, Some(SessionGrid::new(40, 8)), None);
+                    hub.publish(&id, b"shell before\r\n\x1b[?1049h");
+                    hub.publish(&id, drawing);
+
+                    let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+                    hub.attach(&id, SubscriberId::next(), &outbound);
+                    let Some(Frame::Replay {
+                        bytes, truncated, ..
+                    }) = queue.try_recv()
+                    else {
+                        panic!("expected replay");
+                    };
+                    assert_eq!(truncated, capacity == drawing.len());
+                    let mut client = SessionGrid::new(40, 8);
+                    client.feed(&bytes);
+                    assert!(String::from_utf8_lossy(&client.repaint()).contains("STALE APP"));
+                    if resized {
+                        hub.resize_grid(50, 10);
+                        client.resize(50, 10);
+                        hub.repaint(&id);
+                    }
+
+                    hub.publish(&id, &exit[..split]);
+                    hub.publish(&id, &exit[split..]);
+                    while let Some(frame) = queue.try_recv() {
+                        let Frame::Output { bytes, .. } = frame else {
+                            panic!("expected live output");
+                        };
+                        client.feed(&bytes);
+                    }
+                    let actual = client.repaint();
+                    let expected = hub.grid.as_ref().expect("daemon grid").repaint();
+                    assert_eq!(
+                        String::from_utf8_lossy(&actual),
+                        String::from_utf8_lossy(&expected),
+                        "shell restoration: capacity={capacity}, split={split}, resized={resized}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exit_repaint_preserves_following_control_sequences() {
+        let cases: &[(&str, &[u8], &[u8])] = &[
+            ("color", b"", b"\x1b[?1049l\x1b[31mRED\x1b[0m"),
+            ("title BEL", b"", b"\x1b[?1049l\x1b]0;after title\x07PROMPT"),
+            (
+                "title ST",
+                b"",
+                b"\x1b[?1049l\x1b]2;after title\x1b\\PROMPT",
+            ),
+            ("UTF-8", b"", "\x1b[?1049l☃ prompt".as_bytes()),
+            (
+                "synchronized",
+                b"",
+                b"\x1b[?2026h\x1b[?1049l\x1b[31mRED\x1b[?2026l\x1b[0mTAIL",
+            ),
+            (
+                "reentry",
+                b"",
+                b"\x1b[?1049lFIRST\x1b[?1049hSECOND\x1b[?1049lLAST",
+            ),
+            ("combined modes", b"", b"\x1b[?25;1049lPROMPT"),
+            ("reset", b"", b"\x1bc\x1b[31mRESET"),
+            (
+                "origin",
+                b"\x1b[3;6r\x1b[?6h",
+                b"\x1b[?1049l\x1b[?6l\x1b[rPROMPT",
+            ),
+            ("DCS", b"", b"\x1b[?1049l\x1bP0qdiscard\x1b\\\x1b[31mRED"),
+        ];
+        for &(name, setup, output) in cases {
+            let mut partitions: Vec<Vec<&[u8]>> = (0..=output.len())
+                .map(|split| vec![&output[..split], &output[split..]])
+                .collect();
+            partitions.push(output.chunks(1).collect());
+            for (partition, chunks) in partitions.into_iter().enumerate() {
+                let id = SessionId::new("exit-boundary");
+                let mut hub = OutputHub::new(4096, Some(SessionGrid::new(40, 8)), None);
+                hub.publish(&id, b"shell before\r\n\x1b[?1049h");
+                hub.publish(&id, setup);
+                hub.publish(&id, b"\x1b[HAPP");
+                let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+                hub.attach(&id, SubscriberId::next(), &outbound);
+                let Some(Frame::Replay { bytes, .. }) = queue.try_recv() else {
+                    panic!("expected replay");
+                };
+                let mut client = SessionGrid::new(40, 8);
+                client.feed(&bytes);
+
+                for chunk in chunks.into_iter().chain([b"!\x1b[0m".as_slice()]) {
+                    hub.publish(&id, chunk);
+                    while let Some(frame) = queue.try_recv() {
+                        let Frame::Output { bytes, .. } = frame else {
+                            panic!("expected output");
+                        };
+                        client.feed(&bytes);
+                    }
+                }
+                assert_eq!(
+                    String::from_utf8_lossy(&client.repaint()),
+                    String::from_utf8_lossy(&hub.grid.as_ref().expect("daemon grid").repaint()),
+                    "case={name}, partition={partition}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_output_does_not_trigger_a_repaint() {
+        let id = SessionId::new("ordinary-output");
+        let mut hub = OutputHub::new(4096, Some(SessionGrid::new(40, 8)), None);
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        assert!(matches!(queue.try_recv(), Some(Frame::Replay { .. })));
+        for chunk in [
+            b"shell output".as_slice(),
+            b"\x1b[?1049h",
+            b"app output",
+            b"\x1b]0;literal [?1049l\x07",
+            b"\x1bPqpayload [?1049l\x1b\\",
+        ] {
+            hub.publish(&id, chunk);
+            let Some(Frame::Output { bytes, .. }) = queue.try_recv() else {
+                panic!("expected output");
+            };
+            assert_eq!(bytes, chunk);
+            assert!(queue.try_recv().is_none(), "no unnecessary repaint");
+        }
     }
 
     #[test]
