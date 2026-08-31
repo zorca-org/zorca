@@ -49,7 +49,8 @@
 //!   screen.** [`Term`] holds it, but only in a private field, and the one public
 //!   door to it ([`Term::swap_alt`]) resets the alternate screen on the way
 //!   back. The retained ring reconstructs it only if it still contains the
-//!   app's entry into the alternate screen.
+//!   app's entry into the alternate screen. The output hub repaints the primary
+//!   screen when the app exits to repair that incomplete copy.
 //! - **No charset-designation state.** `ESC ( 0` line-drawing is not re-emitted;
 //!   cells are stored already translated, so the painted rows are right and only
 //!   an app that leaves G0 non-default mid-stream would be off.
@@ -60,6 +61,8 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
+use alacritty_terminal::vte::{Params, Parser, Perform};
+use std::time::Instant;
 
 const CSI: &[u8] = b"\x1b[";
 
@@ -83,18 +86,22 @@ const MAX_PENDING: usize = 128;
 /// them and therefore no bit in [`TermMode`] to read back.
 ///
 /// Everything else a repaint restores comes from [`Term::mode`], which cannot
-/// drift from what the emulator actually did. These eight are the exceptions,
+/// drift from what the emulator actually did. These five are the exceptions,
 /// and every one of them is a mode whose loss a user would feel as a dead mouse
 /// or an inverted screen rather than as a wrong pixel.
+///
+/// Only *state* belongs here. `47`/`1047` swap the screen and `1048` saves the
+/// cursor: alacritty ignores all three, so they never reach the grid this
+/// repaint describes, and re-emitting one would act on the client instead —
+/// the swap after the painted rows, hiding them; the save over whatever cursor
+/// the client had put aside for itself. The rest of the `47` family is out of
+/// scope for the same reason: both emulators ignore it.
 const SCANNED_MODES: &[u16] = &[
     5,    // DECSCNM, reverse video
     9,    // X10 mouse reporting
-    47,   // legacy alternate screen buffer
     1001, // mouse: highlight tracking
     1015, // mouse: urxvt coordinates
     1016, // mouse: SGR pixel coordinates
-    1047, // alternate screen buffer
-    1048, // save/restore cursor for the alternate screen
 ];
 
 /// A mode alacritty tracks, and the DECSET number that sets it.
@@ -154,7 +161,14 @@ impl Dimensions for GridSize {
 pub struct SessionGrid {
     term: Term<VoidListener>,
     parser: Processor<StdSyncHandler>,
+    boundary_parser: Parser,
     scanner: Scanner,
+    /// The screen left the alternate buffer, but there was nowhere safe to
+    /// splice the repair yet — mid-sync, or mid-sequence at the end of a chunk.
+    pending_exit_repair: bool,
+    /// The last segment ended on a completed dispatch, so the client's parser is
+    /// between sequences and a repaint spliced here cuts nothing in half.
+    stream_clean: bool,
 }
 
 impl SessionGrid {
@@ -167,15 +181,127 @@ impl SessionGrid {
         Self {
             term: Term::new(config, &size, VoidListener),
             parser: Processor::default(),
+            boundary_parser: Parser::new(),
             scanner: Scanner::default(),
+            pending_exit_repair: false,
+            stream_clean: true,
         }
     }
 
     /// Advance the screen by `data`, and note any mode or margin change in it
     /// that [`Term`] does not record.
-    pub fn feed(&mut self, data: &[u8]) {
-        self.scanner.scan(data);
-        self.parser.advance(&mut self.term, data);
+    ///
+    /// For the mirror grids the tests stand in for clients with: it
+    /// deliberately drops the splice points [`Self::feed_until_primary`]
+    /// reports, which is why nothing in production calls it.
+    #[cfg(test)]
+    pub(crate) fn feed(&mut self, mut data: &[u8]) {
+        while let Some(consumed) = self.feed_until_primary(data) {
+            data = &data[consumed..];
+        }
+    }
+
+    fn is_alternate_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.parser.sync_timeout().sync_timeout()
+    }
+
+    fn sync_pending(&self) -> bool {
+        self.sync_deadline().is_some()
+    }
+
+    /// End a synchronized update whose deadline has passed.
+    ///
+    /// Nothing else ever calls `stop_sync`, and vte ends an update only on the
+    /// exact eight bytes of `CSI ? 2026 l` — so an app killed mid-update, or one
+    /// that writes a combined `CSI ? 2026 ; 25 l`, would otherwise buffer output
+    /// unapplied to vte's 2 MiB ceiling and freeze the screen behind it.
+    ///
+    /// ponytail: no timer thread, so a stuck update with no further output stays
+    /// frozen until the next chunk arrives. Add one if a session is ever seen
+    /// wedged with an idle pty.
+    pub(crate) fn flush_expired_sync(&mut self) {
+        if self
+            .sync_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let was_alternate = self.is_alternate_screen();
+            self.parser.stop_sync(&mut self.term);
+            self.note_exit(was_alternate);
+        }
+    }
+
+    /// Latch an alternate-screen exit until there is somewhere safe to repair it.
+    fn note_exit(&mut self, was_alternate: bool) {
+        if self.is_alternate_screen() {
+            self.pending_exit_repair = false;
+        } else if was_alternate {
+            self.pending_exit_repair = true;
+        }
+    }
+
+    /// Claim a latched repair if there is somewhere safe to splice it: no
+    /// synchronized update open, and the last segment ended on a completed
+    /// dispatch, so the client's parser is between sequences. Clears the latch;
+    /// [`Self::defer_repair`] puts it back.
+    pub(crate) fn take_pending_repair(&mut self) -> bool {
+        let ready = self.pending_exit_repair && !self.sync_pending() && self.stream_clean;
+        if ready {
+            self.pending_exit_repair = false;
+        }
+        ready
+    }
+
+    /// Re-latch a repair a caller took but did not send.
+    pub(crate) fn defer_repair(&mut self) {
+        self.pending_exit_repair = true;
+    }
+
+    /// Stop at a completed screen transition, before any following partial sequence.
+    /// `None` means all bytes were consumed without such a transition.
+    pub(crate) fn feed_until_primary(&mut self, data: &[u8]) -> Option<usize> {
+        self.flush_expired_sync();
+        // Plain output on the primary screen can hold no transition: entering
+        // and leaving the alternate screen both take an escape, and there is
+        // none here. Skipping the boundary parse costs nothing — it resyncs on
+        // the next ESC — and shell output then pays for one parse, not two.
+        if !self.is_alternate_screen() && !self.pending_exit_repair && !data.contains(&0x1b) {
+            self.scanner.scan(data);
+            self.parser.advance(&mut self.term, data);
+            // The boundary parser never saw these bytes, so it sits exactly
+            // where it did and `stream_clean` still describes it.
+            return None;
+        }
+        let mut consumed = 0;
+        while consumed < data.len() {
+            // Greedy while a repair waits, so the latch resolves at the first
+            // safe point instead of at the next screen transition.
+            let mut boundary = RepaintBoundary::new(self.pending_exit_repair);
+            let count = self
+                .boundary_parser
+                .advance_until_terminated(&mut boundary, &data[consumed..]);
+            let was_alternate = self.is_alternate_screen();
+            let prefix = &data[consumed..consumed + count];
+            self.scanner.scan(prefix);
+            self.parser.advance(&mut self.term, prefix);
+            consumed += count;
+            // A completed dispatch leaves the parser in the ground state — but
+            // vte reports a printed run only after swallowing the ESC that ended
+            // it, and a run can also stop mid-codepoint. An ASCII last byte
+            // rules out both.
+            self.stream_clean = boundary.terminated()
+                && prefix
+                    .last()
+                    .is_some_and(|byte| *byte < 0x80 && *byte != 0x1b);
+            self.note_exit(was_alternate);
+            if self.take_pending_repair() {
+                return Some(consumed);
+            }
+        }
+        None
     }
 
     /// Resize the screen. Content comes off the bottom and scrolls off the top
@@ -217,6 +343,10 @@ impl SessionGrid {
             out.extend_from_slice(CSI);
             out.extend_from_slice(b"?1049h");
         }
+        if mode.contains(TermMode::ORIGIN) {
+            // Repaints also target live terminals, whose CUP may still be relative.
+            out.extend_from_slice(b"\x1b[?6l");
+        }
         // Pen first, then erase: the erase paints with the current background.
         out.extend_from_slice(CSI);
         out.extend_from_slice(b"0m");
@@ -235,13 +365,14 @@ impl SessionGrid {
             let Some((rendered, ended_with)) = render_row(&cells, &default, &pen) else {
                 continue;
             };
-            out.extend_from_slice(CSI);
-            out.extend_from_slice(format!("{};1H", row + 1).as_bytes());
+            cup(&mut out, row as i32 + 1, 1);
             out.extend_from_slice(&rendered);
             pen = ended_with;
         }
 
         // After the rows, because DECSTBM homes the cursor as a side effect.
+        // Unconditional: neither emulator resets the region on a screen swap,
+        // so one an app left behind is still the session's own.
         if let Some((top, bottom)) = self.scanner.scroll_region {
             out.extend_from_slice(CSI);
             out.extend_from_slice(format!("{top};{bottom}r").as_bytes());
@@ -301,17 +432,37 @@ impl SessionGrid {
     fn cursor_bytes(&self, mode: TermMode) -> Vec<u8> {
         let grid = self.term.grid();
         let point = grid.cursor.point;
-        let column = point.column.0.min(grid.columns().saturating_sub(1));
-        let mut row = point.line.0.max(0);
-        if mode.contains(TermMode::ORIGIN)
-            && let Some((top, _)) = self.scanner.scroll_region
-        {
-            // Origin mode was re-emitted above, so CUP is now relative to it.
-            row -= i32::from(top) - 1;
-        }
+        let column = point.column.0.min(grid.columns().saturating_sub(1)) + 1;
+        let row = point.line.0.max(0);
         let mut out = Vec::new();
-        out.extend_from_slice(CSI);
-        out.extend_from_slice(format!("{};{}H", row.max(0) + 1, column + 1).as_bytes());
+        // Origin mode was re-emitted above, so CUP is now measured from the
+        // region's top row — and clamped to the region, which the cursor need
+        // not be inside: an app can leave a region behind on a screen whose
+        // cursor is above it.
+        let region = mode
+            .contains(TermMode::ORIGIN)
+            .then_some(self.scanner.scroll_region)
+            .flatten();
+        match region {
+            Some((top, bottom)) if !(i32::from(top) - 1..i32::from(bottom)).contains(&row) => {
+                // ponytail: DECRC is the one way back to a row DECOM clamps
+                // away, and it costs the client its saved cursor. Cheaper than
+                // a cursor that is permanently a region-offset out of place;
+                // revisit if a client is seen losing a save it wanted.
+                //
+                // ponytail: it also assumes alacritty's DECRC, which does not
+                // restore origin mode. A conformant DECRC would put DECOM back
+                // *off* and leave the client's CUP absolute for the rest of the
+                // session. Exact for every product client (all alacritty-based);
+                // raw `ade-daemon attach` into xterm diverges. Emit an explicit
+                // `CSI ? 6 h` after the restore if a non-alacritty client ships.
+                out.extend_from_slice(b"\x1b[?6l");
+                cup(&mut out, row + 1, column);
+                out.extend_from_slice(b"\x1b7\x1b[?6h\x1b8");
+            }
+            Some((top, _)) => cup(&mut out, row - (i32::from(top) - 1) + 1, column),
+            None => cup(&mut out, row + 1, column),
+        }
         out.extend_from_slice(CSI);
         out.extend_from_slice(if mode.contains(TermMode::SHOW_CURSOR) {
             b"?25h"
@@ -319,6 +470,79 @@ impl SessionGrid {
             b"?25l"
         });
         out
+    }
+}
+
+/// One-based `CUP`.
+fn cup(out: &mut Vec<u8>, row: i32, column: usize) {
+    out.extend_from_slice(CSI);
+    out.extend_from_slice(format!("{};{column}H", row.max(1)).as_bytes());
+}
+
+/// Where a segment may end: always at a completed screen transition, and in
+/// greedy mode at any completed dispatch.
+///
+/// Greedy is on only while a repair is latched, and only completed callbacks
+/// count — `hook`, `put` and the OSC interior never end a segment, because a
+/// repaint spliced into a half-written string would truncate it on the client
+/// and print the rest as text.
+///
+/// ponytail: a program that dies mid-OSC or mid-DCS therefore never reaches a
+/// clean point and its repair stays deferred forever. So does one writing only
+/// C0 — a stream of bare `\r`, `\n` or BEL has no `execute` callback here, and
+/// offers no boundary until something prints or a sequence completes. Time it
+/// out if a screen is ever seen stale behind either.
+struct RepaintBoundary {
+    at_boundary: bool,
+    greedy: bool,
+}
+
+impl RepaintBoundary {
+    fn new(greedy: bool) -> Self {
+        Self {
+            at_boundary: false,
+            greedy,
+        }
+    }
+}
+
+impl Perform for RepaintBoundary {
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let names = |code: u16| params.iter().any(|param| param.first() == Some(&code));
+        self.at_boundary = self.greedy
+            || (!ignore
+                && intermediates == b"?"
+                && match action {
+                    // Entering ends a segment too, so no segment can span an
+                    // entry and its exit and hide the visit from
+                    // `was_alternate`.
+                    'h' => names(1049),
+                    // A synchronized update may apply the screen change only at
+                    // its end.
+                    'l' => names(1049) || names(2026),
+                    _ => false,
+                });
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.at_boundary = self.greedy || (!ignore && intermediates.is_empty() && byte == b'c');
+    }
+
+    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
+        self.at_boundary |= self.greedy;
+    }
+
+    fn unhook(&mut self) {
+        self.at_boundary |= self.greedy;
+    }
+
+    fn print(&mut self, _character: char) {
+        // vte only calls this for a complete codepoint.
+        self.at_boundary |= self.greedy;
+    }
+
+    fn terminated(&self) -> bool {
+        self.at_boundary
     }
 }
 
@@ -535,9 +759,10 @@ impl Scanner {
                 }
                 Escape::Reset(len) => {
                     // RIS puts everything back to power-on defaults, and
-                    // alacritty's own state goes with it.
+                    // alacritty's own state — the title included — goes with it.
                     self.modes.clear();
                     self.scroll_region = None;
+                    self.title = None;
                     at += len;
                 }
             }
@@ -1133,6 +1358,166 @@ mod tests {
             "synchronized wraps everything: {text:?}"
         );
         assert_same_screen(&grid, &roundtrip(&grid));
+    }
+
+    // -- splice points -------------------------------------------------------
+
+    /// vte's own, private: the sync buffer's ceiling and the sync deadline.
+    const SYNC_BUFFER_SIZE: usize = 0x20_0000;
+    const SYNC_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150);
+
+    #[test]
+    fn an_alternate_screen_visit_inside_one_chunk_still_splices() {
+        // Enter and exit in one read: without the entry ending the segment,
+        // `was_alternate` is read before the entry and the repair depends on
+        // how the pty happened to chunk its output.
+        let mut grid = SessionGrid::new(20, 5);
+        grid.feed(b"shell prompt");
+        assert!(
+            grid.feed_until_primary(b"\x1b[?1049h\x1b[Happ\x1b[?1049l")
+                .is_some(),
+            "the exit is a splice point"
+        );
+    }
+
+    #[test]
+    fn an_exit_applied_without_a_boundary_still_splices() {
+        // vte flushes a synchronized update that overruns its buffer, so the
+        // exit lands in the middle of a segment that holds no boundary at all.
+        let mut grid = SessionGrid::new(40, 5);
+        grid.feed(b"primary\x1b[?1049h\x1b[Happ");
+        assert_eq!(grid.feed_until_primary(b"\x1b[?2026h\x1b[?1049l"), None);
+        assert!(grid.is_alternate_screen(), "the exit is still buffered");
+        let splice = grid.feed_until_primary(&vec![b'\r'; SYNC_BUFFER_SIZE]);
+        assert!(!grid.is_alternate_screen(), "the overrun flushed the sync");
+        // Nothing in that segment completed a dispatch, so it proves nothing
+        // about where the client's parser is; the latch waits one chunk.
+        assert_eq!(splice, None, "no safe point yet");
+        assert_eq!(grid.feed_until_primary(b"$ "), Some(2), "the next one is");
+    }
+
+    #[test]
+    fn an_expired_synchronized_update_is_flushed_and_repaired() {
+        // A combined ESU: vte's in-sync scan matches only the exact eight bytes
+        // of `CSI ? 2026 l`, so nothing but the deadline ends this update.
+        let mut grid = SessionGrid::new(20, 5);
+        grid.feed(b"primary\x1b[?1049h\x1b[Happ");
+        assert_eq!(
+            grid.feed_until_primary(b"\x1b[?2026h\x1b[?1049l\x1b[?2026;25l"),
+            None
+        );
+        assert!(grid.is_alternate_screen(), "still frozen mid-sync");
+        std::thread::sleep(SYNC_UPDATE_TIMEOUT + std::time::Duration::from_millis(20));
+        let splice = grid.feed_until_primary(b"tail");
+        assert!(!grid.is_alternate_screen(), "the expired sync was flushed");
+        assert_eq!(splice, Some(4), "and the repair spliced after the chunk");
+        assert!(
+            screen_text(&grid).contains("primary"),
+            "the primary screen is back: {:?}",
+            screen_text(&grid)
+        );
+    }
+
+    /// A grid back on the primary screen with a repair latched and nowhere to
+    /// put it: the exit applied when a stuck synchronized update expired, which
+    /// is not a boundary in the stream.
+    fn grid_with_a_latched_repair() -> SessionGrid {
+        let mut grid = SessionGrid::new(20, 5);
+        grid.feed(b"primary\x1b[?1049h\x1b[Happ");
+        assert_eq!(
+            grid.feed_until_primary(b"\x1b[?2026h\x1b[?1049l\x1b[?2026;25l"),
+            None
+        );
+        std::thread::sleep(SYNC_UPDATE_TIMEOUT + std::time::Duration::from_millis(20));
+        grid
+    }
+
+    #[test]
+    fn a_latched_repair_does_not_splice_inside_an_osc_string() {
+        // The scanner drops a tail longer than `MAX_PENDING`, so a long
+        // unterminated OSC read as "between sequences": the repaint's own ESC
+        // cut the client's title short and the payload printed as garbage.
+        let mut grid = grid_with_a_latched_repair();
+        let mut chunk = b"\x1b]0;".to_vec();
+        chunk.resize(chunk.len() + 200, b'x');
+        assert_eq!(grid.feed_until_primary(&chunk), None);
+    }
+
+    #[test]
+    fn a_latched_repair_does_not_splice_inside_a_dcs_string() {
+        // `ESC P` is an unrecognised two-byte escape to the scanner, so a tmux
+        // passthrough payload read as plain text and the splice landed inside it.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(grid.feed_until_primary(b"\x1bPtmux;hello"), None);
+    }
+
+    #[test]
+    fn a_latched_repair_splices_at_the_next_completed_sequence() {
+        // The OSC terminator is a positive safe point; the bytes after it are
+        // the next segment's problem.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(
+            grid.feed_until_primary(b"\x1b]0;title\x07rest"),
+            Some("\x1b]0;title\x07".len())
+        );
+    }
+
+    #[test]
+    fn a_deferred_repair_splices_at_the_next_clean_point() {
+        // What the sessions-side sweeper does when it cannot push the repaint:
+        // the latch goes back, and the next completed dispatch offers it again.
+        let mut grid = grid_with_a_latched_repair();
+        assert_eq!(grid.feed_until_primary(b"tail"), Some(4), "offered once");
+        grid.defer_repair();
+        assert_eq!(grid.feed_until_primary(b"more"), Some(4), "and again");
+    }
+
+    #[test]
+    fn a_cursor_above_the_scroll_region_survives_origin_mode() {
+        // The app left a scroll region and origin mode behind on its way out of
+        // the alternate screen, and the primary cursor sits above the region —
+        // where DECOM cannot put it, so a relative CUP lands a region lower.
+        let grid = grid_with(
+            20,
+            8,
+            b"shell\r\n\x1b[?1049h\x1b[3;6r\x1b[?6h\x1b[HAPP\x1b[?1049l",
+        );
+        assert!(grid.term.mode().contains(TermMode::ORIGIN));
+        assert_eq!(grid.term.grid().cursor.point.line, Line(1));
+        assert_same_screen(&grid, &roundtrip(&grid));
+    }
+
+    // -- actions are not state -----------------------------------------------
+
+    #[test]
+    fn a_reset_clears_the_title() {
+        // RIS clears the emulator's title, so a repaint after one must not
+        // re-assert the dead name.
+        let mut grid = grid_with(20, 5, b"\x1b]0;dead\x07");
+        grid.feed(b"\x1bc");
+        assert_eq!(grid.scanner.title, None);
+        assert!(!String::from_utf8_lossy(&grid.repaint()).contains("dead"));
+    }
+
+    #[test]
+    fn a_cursor_or_screen_action_is_not_replayed_as_a_mode() {
+        // 1048 saves the cursor and 47/1047 swap the screen: replaying them
+        // acts on the client instead of describing the session — and the swap
+        // lands after the rows, hiding the whole repaint.
+        let grid = grid_with(20, 5, b"\x1b[?1048h\x1b[?1047h\x1b[?47htext");
+        let repaint = String::from_utf8_lossy(&grid.repaint()).into_owned();
+        for action in ["?1048h", "?1047h", "?47h"] {
+            assert!(!repaint.contains(action), "{action} replayed: {repaint:?}");
+        }
+        let mut mirror = SessionGrid::new(20, 5);
+        mirror.feed(b"\x1b[3;5H\x1b7");
+        let saved = mirror.term.grid().saved_cursor.point;
+        mirror.feed(&grid.repaint());
+        assert_eq!(
+            mirror.term.grid().saved_cursor.point,
+            saved,
+            "the client's own saved cursor survives"
+        );
     }
 
     #[test]
