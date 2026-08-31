@@ -2405,7 +2405,7 @@ async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAp
     )
     .await;
 
-    let (project, _) = init_test(&fs, cx, server_cx).await;
+    let (project, headless_project) = init_test(&fs, cx, server_cx).await;
 
     let (worktree, _) = project
         .update(cx, |project, cx| {
@@ -2415,6 +2415,20 @@ async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAp
         .unwrap();
 
     cx.run_until_parked();
+
+    let repository_id = server_cx.update(|cx| {
+        headless_project.update(cx, |headless_project, cx| {
+            let git_store = headless_project.git_store.read(cx);
+            assert_eq!(git_store.repositories().len(), 1);
+            let repository = git_store.active_repository().unwrap();
+            let repository = repository.read(cx);
+            assert_eq!(
+                repository.work_directory_abs_path.as_ref(),
+                Path::new(path!("/code/project1"))
+            );
+            repository.id
+        })
+    });
 
     fs.rename(
         &PathBuf::from("/code/project1"),
@@ -2427,7 +2441,21 @@ async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAp
     cx.run_until_parked();
     worktree.update(cx, |worktree, _| {
         assert_eq!(worktree.root_name(), "project2")
-    })
+    });
+
+    server_cx.update(|cx| {
+        headless_project.update(cx, |headless_project, cx| {
+            let git_store = headless_project.git_store.read(cx);
+            assert_eq!(git_store.repositories().len(), 1);
+            let repository = git_store.active_repository().unwrap();
+            let repository = repository.read(cx);
+            assert_eq!(repository.id, repository_id);
+            assert_eq!(
+                repository.work_directory_abs_path.as_ref(),
+                Path::new(path!("/code/project2"))
+            );
+        })
+    });
 }
 
 #[gpui::test]
