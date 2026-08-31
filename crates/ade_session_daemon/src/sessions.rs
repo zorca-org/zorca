@@ -367,18 +367,25 @@ impl Outbound {
     /// say whether it went. A refusal costs the connection nothing — it is for
     /// the frames this daemon synthesized, which a client can live without.
     ///
-    /// Reserve and frame are accounted in one step on purpose: reading
+    /// Reserve and frame are accounted in one compare-and-swap on purpose, and
+    /// **a reservation is never visible unless it commits**: reading
     /// [`Self::free_bytes`] and then pushing lets a concurrent push land
-    /// between the two, and the check that said there was room is the reason
-    /// the push then closes the connection.
+    /// between the two, and adding the cost only to take it back on refusal is
+    /// worse still — a concurrent [`Self::push`] that reads the inflated count
+    /// overruns the bound and *closes* the connection over bytes this call was
+    /// never going to queue.
     fn try_push(&self, frame: Frame, reserve: u64) -> bool {
         let cost = frame_bytes(&frame);
-        let before = self.queued.fetch_add(cost, Ordering::SeqCst);
-        if before + cost + reserve > self.max_bytes || self.frames.try_send(frame).is_err() {
-            self.queued.fetch_sub(cost, Ordering::SeqCst);
-            return false;
-        }
-        true
+        self.queued
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                (queued + cost + reserve <= self.max_bytes).then_some(queued + cost)
+            })
+            .is_ok()
+            && (self.frames.try_send(frame).is_ok() || {
+                // Unbounded, so the only failure is a queue somebody closed.
+                self.queued.fetch_sub(cost, Ordering::SeqCst);
+                false
+            })
     }
 
     /// The room left under the bound right now — what an attach budgets its
@@ -389,10 +396,9 @@ impl Outbound {
             .saturating_sub(self.queued.load(Ordering::SeqCst))
     }
 
-    /// Whether this connection's queue has already been closed on. Only the
-    /// bound's own tests ask; production code reads the answer from
-    /// [`Self::push`] returning `false`.
-    #[cfg(test)]
+    /// Whether this connection's queue has already been closed on. [`Self::push`]
+    /// answers it as a side effect; the synthetic paths on [`Self::try_push`]
+    /// have to ask, since a refusal there says nothing about the connection.
     fn is_closed(&self) -> bool {
         self.frames.is_closed()
     }
@@ -820,6 +826,11 @@ impl OutputHub {
         // screen for a session that has left it.
         if let Some(grid) = self.grid.as_mut() {
             grid.flush_expired_sync();
+            // Nobody else is waiting on the splice, and the replay below repaints
+            // this client whole, so a latched repair has nothing left to repair.
+            if self.subscribers.is_empty() {
+                grid.take_pending_repair();
+            }
         }
         let mut repaint = match self.grid.as_ref() {
             Some(grid) => grid.repaint(),
@@ -896,9 +907,17 @@ impl OutputHub {
         }
         // With nobody attached the latch simply stays cleared: an attach
         // repaints the whole screen anyway, so there is nothing left to repair.
+        if self.subscribers.is_empty() {
+            return;
+        }
         let bytes = grid.repaint();
         let mut skipped = false;
-        for (_, outbound) in &self.subscribers {
+        self.subscribers.retain(|(_, outbound)| {
+            // A closed queue is gone, not behind: re-latching for it would defer
+            // the repair afresh on every sweep, forever.
+            if outbound.is_closed() {
+                return false;
+            }
             skipped |= !outbound.try_push(
                 Frame::Output {
                     session_id: session_id.clone(),
@@ -906,7 +925,8 @@ impl OutputHub {
                 },
                 ATTACH_RESERVE_BYTES,
             );
-        }
+            true
+        });
         if skipped && let Some(grid) = self.grid.as_mut() {
             grid.defer_repair();
         }
@@ -4997,6 +5017,69 @@ mod tests {
         assert_eq!(outbound.free_bytes(), free, "the refusal kept its bytes");
         assert!(queue.try_recv().is_some());
         assert!(queue.try_recv().is_none(), "the refused frame was queued");
+    }
+
+    /// A `try_push` that refuses must never be visible to anyone else: a
+    /// reservation held across the refusal reads to a concurrent [`push`] as a
+    /// queue over the bound, and costs a sibling session its connection.
+    #[test]
+    fn a_refused_try_push_is_invisible_to_a_concurrent_push() {
+        const ROUNDS: usize = 10_000;
+
+        let id = SessionId::new("try-push-race");
+        let (outbound, queue) = Outbound::new(4096);
+        let doomed = outbound.clone();
+        let oversized = id.clone();
+        let hammer = std::thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                // 4096 + 256 of overhead: over the bound alone, always refused.
+                assert!(
+                    !doomed.try_push(
+                        Frame::Output {
+                            session_id: oversized.clone(),
+                            bytes: vec![b'x'; 4096],
+                        },
+                        0,
+                    ),
+                    "an oversized frame was queued"
+                );
+            }
+        });
+        for _ in 0..ROUNDS {
+            assert!(
+                outbound.push(Frame::Output {
+                    session_id: id.clone(),
+                    bytes: vec![b'y'; 512],
+                }),
+                "a frame that fits an empty queue was refused"
+            );
+            queue.try_recv().expect("the frame just pushed");
+        }
+        hammer.join().expect("hammer thread");
+        assert!(!outbound.is_closed());
+    }
+
+    /// A subscriber whose queue is already closed is pruned, not re-latched:
+    /// otherwise a dead connection re-arms the repair every single sweep.
+    #[test]
+    fn flush_stalled_prunes_a_closed_subscriber_instead_of_deferring() {
+        let id = SessionId::new("flush-closed");
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(4096, Some(SessionGrid::new(40, 8)), None);
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        drop(queue);
+        hub.grid.as_mut().expect("daemon grid").defer_repair();
+
+        hub.flush_stalled(&id);
+
+        assert!(hub.subscribers.is_empty(), "the dead subscriber stayed");
+        assert!(
+            !hub.grid
+                .as_mut()
+                .expect("daemon grid")
+                .take_pending_repair(),
+            "a pruned subscriber re-armed the repair"
+        );
     }
 
     /// A splice repaint is synthetic, so a subscriber with no room for it keeps

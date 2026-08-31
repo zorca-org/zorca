@@ -488,8 +488,10 @@ fn cup(out: &mut Vec<u8>, row: i32, column: usize) {
 /// and print the rest as text.
 ///
 /// ponytail: a program that dies mid-OSC or mid-DCS therefore never reaches a
-/// clean point and its repair stays deferred forever. Time it out if a screen
-/// is ever seen stale behind a half-written string.
+/// clean point and its repair stays deferred forever. So does one writing only
+/// C0 — a stream of bare `\r`, `\n` or BEL has no `execute` callback here, and
+/// offers no boundary until something prints or a sequence completes. Time it
+/// out if a screen is ever seen stale behind either.
 struct RepaintBoundary {
     at_boundary: bool,
     greedy: bool,
