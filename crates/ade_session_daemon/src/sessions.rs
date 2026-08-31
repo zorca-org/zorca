@@ -723,6 +723,7 @@ impl OutputHub {
     /// [`Outbound::push`] queues or drops, and either way the pty keeps
     /// being read.
     fn publish(&mut self, session_id: &SessionId, mut chunk: &[u8]) {
+        // History is raw pty bytes only — a synthesized repaint never enters it.
         self.ring.push(chunk);
         while !chunk.is_empty() {
             let boundary = self
@@ -730,17 +731,39 @@ impl OutputHub {
                 .as_mut()
                 .and_then(|grid| grid.feed_until_primary(chunk));
             let (prefix, suffix) = chunk.split_at(boundary.unwrap_or(chunk.len()));
+            // At a splice point, repair a truncated replay's primary screen
+            // without splitting a VT sequence — synthesized once here, since a
+            // detached session or an ordinary chunk must pay nothing for it.
+            let spliced = match (boundary, self.grid.as_ref()) {
+                (Some(_), Some(grid)) if !self.subscribers.is_empty() => {
+                    Some([prefix, &grid.repaint()].concat())
+                }
+                _ => None,
+            };
             self.subscribers.retain(|(_, outbound)| {
+                // Prefix and repaint go as one frame: two would let a client
+                // render the stale primary in between. A queue without the room
+                // gets the prefix alone and keeps its stale screen — pty bytes
+                // are never dropped, and unlike [`Self::repaint`] a repaint
+                // nobody can take must not cost the connection.
+                // ponytail: a skipped repaint is never retried — the next
+                // attach or resize repaints anyway; queue one if that shows.
+                let bytes = match &spliced {
+                    Some(spliced)
+                        if spliced.len() as u64 + ATTACH_RESERVE_BYTES <= outbound.free_bytes() =>
+                    {
+                        spliced.clone()
+                    }
+                    _ => prefix.to_vec(),
+                };
                 outbound.push(Frame::Output {
                     session_id: session_id.clone(),
-                    bytes: prefix.to_vec(),
+                    bytes,
                 })
             });
             if boundary.is_none() {
                 break;
             }
-            // Repair a truncated replay's primary screen without splitting a VT sequence.
-            self.repaint(session_id);
             chunk = suffix;
         }
     }
@@ -793,8 +816,13 @@ impl OutputHub {
         }
     }
 
-    /// Repaint every attached viewer after the shared screen changes size.
+    /// Redraw the shared screen for every attached viewer — what a resize or a
+    /// focus claim owes them; a queue that cannot take it loses its connection,
+    /// unlike [`Self::publish`]'s splice, whose repaint is only a repair.
     fn repaint(&mut self, session_id: &SessionId) {
+        if self.subscribers.is_empty() {
+            return;
+        }
         let Some(grid) = self.grid.as_ref() else {
             return;
         };
@@ -4840,6 +4868,91 @@ mod tests {
 
         assert!(hub.subscribers.is_empty());
         assert!(outbound.is_closed());
+    }
+
+    /// A splice repaint is synthetic, so a subscriber with no room for it keeps
+    /// its stale primary — the state it would have had without splices at all.
+    /// Closing the connection instead is what a probe caught: a stalled client
+    /// survived 7546 plain chunks and died on the 96th alternate-screen exit.
+    #[test]
+    fn a_splice_repaint_a_subscriber_cannot_take_is_skipped_not_fatal() {
+        let id = SessionId::new("splice-headroom");
+        let (outbound, queue) = Outbound::new(4096);
+        let mut hub = OutputHub::new(64 * 1024, Some(SessionGrid::new(120, 40)), None);
+        // A primary worth more than the whole queue, so the repaint the exit
+        // splices in cannot fit — while a bare pty frame still can.
+        hub.publish(&id, &vec![b'X'; 120 * 40]);
+        hub.publish(&id, b"\x1b[?1049h\x1b[HAPP");
+        hub.attach(&id, SubscriberId::next(), &outbound);
+
+        hub.publish(&id, b"\x1b[?1049lSHELL");
+
+        assert_eq!(
+            hub.subscribers.len(),
+            1,
+            "a synthetic repaint closed a live connection"
+        );
+        assert!(!outbound.is_closed(), "its queue was closed anyway");
+        let mut seen = Vec::new();
+        while let Some(frame) = queue.try_recv() {
+            if let Frame::Output { bytes, .. } = frame {
+                seen.extend(bytes);
+            }
+        }
+        assert_eq!(
+            seen, b"\x1b[?1049lSHELL",
+            "pty bytes were dropped, or a repaint was forced past the bound"
+        );
+    }
+
+    /// The prefix and the repaint repairing it ride one frame: two would let a
+    /// client render the stale primary in between.
+    #[test]
+    fn a_splice_reaches_a_subscriber_as_one_frame() {
+        let id = SessionId::new("splice-atomic");
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        let mut hub = OutputHub::new(4096, Some(SessionGrid::new(40, 8)), None);
+        hub.publish(&id, b"\x1b[?1049h\x1b[HAPP");
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        assert!(matches!(queue.try_recv(), Some(Frame::Replay { .. })));
+
+        hub.publish(&id, b"\x1b[?1049lSHELL");
+
+        let mut frames = Vec::new();
+        while let Some(frame) = queue.try_recv() {
+            let Frame::Output { bytes, .. } = frame else {
+                panic!("expected output");
+            };
+            frames.push(bytes);
+        }
+        let exit = b"\x1b[?1049l".as_slice();
+        assert!(frames[0].starts_with(exit));
+        assert!(
+            frames[0].len() > exit.len(),
+            "the repaint arrived in a frame of its own, after a stale one"
+        );
+        assert_eq!(frames.last().expect("a frame"), b"SHELL");
+    }
+
+    /// The zero-subscriber guard skips the repaint, never the grid feed.
+    #[test]
+    fn a_splice_with_no_subscribers_still_tracks_the_screen() {
+        let id = SessionId::new("splice-detached");
+        let mut hub = OutputHub::new(4096, Some(SessionGrid::new(40, 8)), None);
+        hub.publish(&id, b"\x1b[?1049h\x1b[HAPP");
+        hub.publish(&id, b"\x1b[?1049lSHELL AFTER");
+
+        let (outbound, queue) = Outbound::new(OUTBOUND_QUEUE_BYTES);
+        hub.attach(&id, SubscriberId::next(), &outbound);
+        let Some(Frame::Replay { bytes, .. }) = queue.try_recv() else {
+            panic!("expected replay");
+        };
+        let mut client = SessionGrid::new(40, 8);
+        client.feed(&bytes);
+        assert_eq!(
+            String::from_utf8_lossy(&client.repaint()),
+            String::from_utf8_lossy(&hub.grid.as_ref().expect("daemon grid").repaint()),
+        );
     }
 
     /// Output larger than the attach budget replays only the newest of it and
