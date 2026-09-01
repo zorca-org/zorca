@@ -2395,7 +2395,7 @@ async fn test_reconnect(cx: &mut TestAppContext, server_cx: &mut TestAppContext)
 async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
     let fs = FakeFs::new(server_cx.executor());
     fs.insert_tree(
-        "/code",
+        path!("/code"),
         json!({
             "project1": {
                 ".git": {},
@@ -2409,7 +2409,7 @@ async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAp
 
     let (worktree, _) = project
         .update(cx, |project, cx| {
-            project.find_or_create_worktree("/code/project1", true, cx)
+            project.find_or_create_worktree(path!("/code/project1"), true, cx)
         })
         .await
         .unwrap();
@@ -2431,8 +2431,8 @@ async fn test_remote_root_rename(cx: &mut TestAppContext, server_cx: &mut TestAp
     });
 
     fs.rename(
-        &PathBuf::from("/code/project1"),
-        &PathBuf::from("/code/project2"),
+        &PathBuf::from(path!("/code/project1")),
+        &PathBuf::from(path!("/code/project2")),
         Default::default(),
     )
     .await
