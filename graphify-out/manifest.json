@@ -347,7 +347,7 @@
   ".codex/hooks.json": {
     "mtime": 1786366006.2239907,
     "ast_hash": "b2ed40576881804109bfce886b5c6399",
-    "semantic_hash": ""
+    "semantic_hash": "b2ed40576881804109bfce886b5c6399"
   },
   ".agents/skills/gpui-test/SKILL.md": {
     "mtime": 1786213291.5549269,
@@ -380,14 +380,14 @@
     "semantic_hash": "9ab675549478a14462aee6bbc499d126"
   },
   ".github/workflows/pages.yml": {
-    "mtime": 1786264846.606619,
-    "ast_hash": "489bd9e6517c3cfbd9c313337b24c9fe",
-    "semantic_hash": "489bd9e6517c3cfbd9c313337b24c9fe"
+    "mtime": 1786966457.049709,
+    "ast_hash": "dd92df6ac957ee94d1fb083be2035a67",
+    "semantic_hash": "dd92df6ac957ee94d1fb083be2035a67"
   },
   ".github/workflows/pr-checks.yml": {
-    "mtime": 1786520830.9976358,
-    "ast_hash": "7f40aa2bd205b898c984098a8124fdc0",
-    "semantic_hash": ""
+    "mtime": 1787658428.1635492,
+    "ast_hash": "5e70d34304b5d8fa12e1d55ba2670a93",
+    "semantic_hash": "5e70d34304b5d8fa12e1d55ba2670a93"
   },
   ".github/workflows/release.yml": {
     "mtime": 1786213291.5560493,
@@ -395,19 +395,19 @@
     "semantic_hash": "29ecb2828335ed7ff21c7f3653f5aaba"
   },
   ".github/workflows/zorca-ci.yml": {
-    "mtime": 1786358925.1108816,
-    "ast_hash": "30d49a60b747f3228c449aedc1f22d7b",
-    "semantic_hash": "30d49a60b747f3228c449aedc1f22d7b"
+    "mtime": 1787658428.1640055,
+    "ast_hash": "7ffd52cba24bcac6b9b613fd450bff43",
+    "semantic_hash": "7ffd52cba24bcac6b9b613fd450bff43"
   },
   "AGENTS.md": {
-    "mtime": 1786213291.5565102,
-    "ast_hash": "225ac811009fad5e29cc1cc9abf062a0",
-    "semantic_hash": "225ac811009fad5e29cc1cc9abf062a0"
+    "mtime": 1786710714.8008573,
+    "ast_hash": "bf44b6d8449414e3f7c47f767d2acac3",
+    "semantic_hash": "bf44b6d8449414e3f7c47f767d2acac3"
   },
   "CLAUDE.md": {
-    "mtime": 1786213291.5565102,
-    "ast_hash": "225ac811009fad5e29cc1cc9abf062a0",
-    "semantic_hash": "225ac811009fad5e29cc1cc9abf062a0"
+    "mtime": 1786710714.8008573,
+    "ast_hash": "bf44b6d8449414e3f7c47f767d2acac3",
+    "semantic_hash": "bf44b6d8449414e3f7c47f767d2acac3"
   },
   "CODE_OF_CONDUCT.md": {
     "mtime": 1786213291.5568452,
@@ -415,24 +415,24 @@
     "semantic_hash": "c50a3fbb9957b4810c812ee14c5f3ffb"
   },
   "CONTRIBUTING.md": {
-    "mtime": 1786545297.9276628,
+    "mtime": 1786619901.4364362,
     "ast_hash": "0770094d17d9e2b41cb289128d2c3fca",
-    "semantic_hash": ""
+    "semantic_hash": "0770094d17d9e2b41cb289128d2c3fca"
   },
   "GEMINI.md": {
-    "mtime": 1786213291.5565102,
-    "ast_hash": "225ac811009fad5e29cc1cc9abf062a0",
-    "semantic_hash": "225ac811009fad5e29cc1cc9abf062a0"
+    "mtime": 1786710714.8008573,
+    "ast_hash": "bf44b6d8449414e3f7c47f767d2acac3",
+    "semantic_hash": "bf44b6d8449414e3f7c47f767d2acac3"
   },
   "README.md": {
-    "mtime": 1786220376.6687891,
-    "ast_hash": "92335c8e9ccfe0c1897ed72e1c5a5710",
-    "semantic_hash": "92335c8e9ccfe0c1897ed72e1c5a5710"
+    "mtime": 1787669855.3438678,
+    "ast_hash": "c54994124fdbed41f08edab5fee21e00",
+    "semantic_hash": "c54994124fdbed41f08edab5fee21e00"
   },
   "SECURITY.md": {
-    "mtime": 1786213291.5586066,
-    "ast_hash": "3abe5f46c9698c7f2f70b960a141ee01",
-    "semantic_hash": "3abe5f46c9698c7f2f70b960a141ee01"
+    "mtime": 1786966257.4785578,
+    "ast_hash": "c40c335dde0fbfdd4d40c8bf73e89930",
+    "semantic_hash": "c40c335dde0fbfdd4d40c8bf73e89930"
   },
   "crates/agent_settings/src/prompts/compaction_prompt.txt": {
     "mtime": 1786213291.6128063,
@@ -567,7 +567,7 @@
   "graphify-out/memory/query_20260810_122847_deeply_investigate_why_renaming_the_worktree_is_cr.md": {
     "mtime": 1786364927.1554775,
     "ast_hash": "38e985147e22da4d867df6307613aebd",
-    "semantic_hash": ""
+    "semantic_hash": "38e985147e22da4d867df6307613aebd"
   },
   "tooling/lints/README.md": {
     "mtime": 1786213292.014401,
@@ -575,19 +575,19 @@
     "semantic_hash": "85adb0d3f825aeb0c55c8ada3621c7a4"
   },
   "website/DESIGN.md": {
-    "mtime": 1786213292.0183537,
-    "ast_hash": "5569c8aaf05e00e2097757f799bc3b00",
-    "semantic_hash": "5569c8aaf05e00e2097757f799bc3b00"
+    "mtime": 1787483826.494676,
+    "ast_hash": "bf0d7cf4d66b424c89d3a6bd6e111652",
+    "semantic_hash": "bf0d7cf4d66b424c89d3a6bd6e111652"
   },
   "website/PRODUCT.md": {
-    "mtime": 1786265960.0291758,
-    "ast_hash": "1e421a5c695c75194e2a68b5b5b966ad",
-    "semantic_hash": "1e421a5c695c75194e2a68b5b5b966ad"
+    "mtime": 1787669835.0289214,
+    "ast_hash": "da3cd65fbb6c17d84dbaddd157491e9c",
+    "semantic_hash": "da3cd65fbb6c17d84dbaddd157491e9c"
   },
   "website/index.html": {
-    "mtime": 1786267611.6520913,
-    "ast_hash": "4dc5a544cb04f7d4a2f5b2f0727ab8db",
-    "semantic_hash": "4dc5a544cb04f7d4a2f5b2f0727ab8db"
+    "mtime": 1787669835.0285442,
+    "ast_hash": "ab864ac3b8a26f061c57d90047939a61",
+    "semantic_hash": "ab864ac3b8a26f061c57d90047939a61"
   },
   "crates/gpui/examples/image/arrow_circle.svg": {
     "mtime": 1786213291.701255,
@@ -607,146 +607,426 @@
   "script/update-graphify": {
     "mtime": 1786365944.1765468,
     "ast_hash": "7c5d5f61a1378bb3a9ec2aff72ade551",
-    "semantic_hash": ""
+    "semantic_hash": "7c5d5f61a1378bb3a9ec2aff72ade551"
   },
   "graphify-out/memory/query_20260810_124202_why_does__gpui__connect__gpui_project_infrastructu.md": {
     "mtime": 1786365722.8358622,
     "ast_hash": "554ff01ebb62ea79ea45a68062f7757c",
-    "semantic_hash": ""
+    "semantic_hash": "554ff01ebb62ea79ea45a68062f7757c"
   },
   ".githooks/pre-commit": {
-    "mtime": 1786545297.928406,
+    "mtime": 1786619901.4355376,
     "ast_hash": "9e53a5ca5c452c7a795867cf42f10fb7",
-    "semantic_hash": ""
+    "semantic_hash": "9e53a5ca5c452c7a795867cf42f10fb7"
   },
   ".github/workflows/cleanup-artifacts.yml": {
     "mtime": 1786473761.329726,
     "ast_hash": "00847460239885b11748f1fdb2a103bf",
-    "semantic_hash": ""
+    "semantic_hash": "00847460239885b11748f1fdb2a103bf"
   },
   "docs/ade/protocol-compatibility.md": {
     "mtime": 1786384933.35744,
     "ast_hash": "85b835f6a2312347390b02ee3d10f0fa",
-    "semantic_hash": ""
+    "semantic_hash": "85b835f6a2312347390b02ee3d10f0fa"
   },
   "graphify-out/memory/query_20260810_135113_why_sidebar_still_shows_the_phantom_project_and_th.md": {
     "mtime": 1786369873.481891,
     "ast_hash": "ced6594e95da63de5605515822a54185",
-    "semantic_hash": ""
+    "semantic_hash": "ced6594e95da63de5605515822a54185"
   },
   "graphify-out/memory/query_20260810_155146_i_clicked_on__packages_chrome_extension_store_read.md": {
     "mtime": 1786377106.779762,
     "ast_hash": "ca7dd7462297f233d67f5ead20519b83",
-    "semantic_hash": ""
+    "semantic_hash": "ca7dd7462297f233d67f5ead20519b83"
   },
   "graphify-out/memory/query_20260810_170255_why_can_zorca_not_resume_a_remote_codex_session_af.md": {
     "mtime": 1786381375.337624,
     "ast_hash": "6b79b22b31ec11080f70afe2ea59b905",
-    "semantic_hash": ""
+    "semantic_hash": "6b79b22b31ec11080f70afe2ea59b905"
   },
   "graphify-out/memory/query_20260810_173513_because_i_m_unable_to_connect_to_the_previous_open.md": {
     "mtime": 1786383313.0987473,
     "ast_hash": "13bcba357862fe8b704d6edf91dc5de6",
-    "semantic_hash": ""
+    "semantic_hash": "13bcba357862fe8b704d6edf91dc5de6"
   },
   "graphify-out/memory/query_20260810_181706_why_does_reconnecting_to_an_older_remote_persisten.md": {
     "mtime": 1786385826.4752073,
     "ast_hash": "c45a23e0e88a36e9d22a587d19668965",
-    "semantic_hash": ""
+    "semantic_hash": "c45a23e0e88a36e9d22a587d19668965"
   },
   "graphify-out/memory/query_20260811_143906_i_m_getting_a_different_strange_behaviour__when_i.md": {
     "mtime": 1786459146.3403184,
     "ast_hash": "118cd0ac47530e516e0136aa3b76a67c",
-    "semantic_hash": ""
+    "semantic_hash": "118cd0ac47530e516e0136aa3b76a67c"
   },
   "graphify-out/memory/query_20260811_145548_why_does_an_uncommitted_changes_file_diff_tab_clos.md": {
     "mtime": 1786460148.381356,
     "ast_hash": "67d129d3f4f366cd234026b64ae29bc3",
-    "semantic_hash": ""
+    "semantic_hash": "67d129d3f4f366cd234026b64ae29bc3"
   },
   "graphify-out/memory/query_20260811_164207_why_does_an_incompatible_remote_session_daemon_pro.md": {
     "mtime": 1786466527.5796702,
     "ast_hash": "97d6ef47a396ed475e6914c5eeb411d1",
-    "semantic_hash": ""
+    "semantic_hash": "97d6ef47a396ed475e6914c5eeb411d1"
   },
   "graphify-out/memory/query_20260811_164929_why_does_opening_a_selected_file_in_uncommitted_ch.md": {
     "mtime": 1786466969.799725,
     "ast_hash": "814343b59da3d3f8ee6b3e6bb019cfeb",
-    "semantic_hash": ""
+    "semantic_hash": "814343b59da3d3f8ee6b3e6bb019cfeb"
   },
   "graphify-out/memory/query_20260811_165830_another_issue_with_the_render__when_i_click_on_any.md": {
     "mtime": 1786467510.7573612,
     "ast_hash": "d01125332c471395c97aed2627287524",
-    "semantic_hash": ""
+    "semantic_hash": "d01125332c471395c97aed2627287524"
   },
   "graphify-out/memory/query_20260811_175011_the_ui_ux_issue__when_i_click_on_the_pretty_big_im.md": {
     "mtime": 1786470611.5271332,
     "ast_hash": "452037f4ac9a3face63402a21c6e28a1",
-    "semantic_hash": ""
+    "semantic_hash": "452037f4ac9a3face63402a21c6e28a1"
   },
   "graphify-out/memory/query_20260811_180846_why_does_one_remote_checkout_appear_twice_as_main.md": {
     "mtime": 1786471726.0945935,
     "ast_hash": "96d1a55bcf1530069cce6ecebe6ca675",
-    "semantic_hash": ""
+    "semantic_hash": "96d1a55bcf1530069cce6ecebe6ca675"
   },
   "graphify-out/memory/query_20260811_180846_why_does_switching_codex_tabs_or_files_erase_visib.md": {
     "mtime": 1786471726.0486078,
     "ast_hash": "119e5935a2965f31a67feaebfdd82757",
-    "semantic_hash": ""
+    "semantic_hash": "119e5935a2965f31a67feaebfdd82757"
   },
   "graphify-out/memory/query_20260811_181730_what_is_this_error.md": {
     "mtime": 1786472250.7050831,
     "ast_hash": "e487126fb9145b69bd56dbf3dcea2a43",
-    "semantic_hash": ""
+    "semantic_hash": "e487126fb9145b69bd56dbf3dcea2a43"
   },
   "graphify-out/memory/query_20260811_183522_why_does_an_ade_backed_codex_terminal_visibly_repa.md": {
     "mtime": 1786473322.930251,
     "ast_hash": "446a4e10cd23ffe33119b85d6c92aefb",
-    "semantic_hash": ""
+    "semantic_hash": "446a4e10cd23ffe33119b85d6c92aefb"
   },
   "graphify-out/memory/query_20260811_185406_why_can_closing_mixed_terminal_and_file_tabs_reope.md": {
     "mtime": 1786474446.4110096,
     "ast_hash": "022707d5434d4026d7a7dcc67a702b7d",
-    "semantic_hash": ""
+    "semantic_hash": "022707d5434d4026d7a7dcc67a702b7d"
   },
   "graphify-out/memory/query_20260811_191142_open_in_terminal__not_working_and_not_openning_an.md": {
     "mtime": 1786475502.3361297,
     "ast_hash": "8376e8529a44968b3e99b0501f9a245e",
-    "semantic_hash": ""
+    "semantic_hash": "8376e8529a44968b3e99b0501f9a245e"
   },
   "graphify-out/memory/query_20260811_192208_ok_go_ahead_with_the_fix_and_regression_test.md": {
     "mtime": 1786476128.906965,
     "ast_hash": "bc8656716abad79ca28adb0eb576e923",
-    "semantic_hash": ""
+    "semantic_hash": "bc8656716abad79ca28adb0eb576e923"
   },
   "graphify-out/memory/query_20260811_192542_please_review_the_persistence_server_and_create_te.md": {
     "mtime": 1786476342.083196,
     "ast_hash": "d399ca3e0a79c6efcb548e804d2462ed",
-    "semantic_hash": ""
+    "semantic_hash": "d399ca3e0a79c6efcb548e804d2462ed"
   },
   "graphify-out/memory/query_20260811_201728_please_review_the_persistence_server_and_create_te.md": {
     "mtime": 1786479448.1199148,
     "ast_hash": "f83e595ee1b92f0f9e0a7abde79a3eb8",
-    "semantic_hash": ""
+    "semantic_hash": "f83e595ee1b92f0f9e0a7abde79a3eb8"
   },
   "graphify-out/memory/query_20260811_203801_investigate_why_remote_development_server_is_tryin.md": {
     "mtime": 1786480681.1090987,
     "ast_hash": "a67921e1d4c0a58ab0404735cda72306",
-    "semantic_hash": ""
+    "semantic_hash": "a67921e1d4c0a58ab0404735cda72306"
   },
   "graphify-out/memory/query_20260811_225318_let_s_do_tests_the_same_way_for_the_sidebar_and_tr.md": {
     "mtime": 1786488798.87356,
     "ast_hash": "23b241aaf042300abce3ed69239df6a5",
-    "semantic_hash": ""
+    "semantic_hash": "23b241aaf042300abce3ed69239df6a5"
   },
   "graphify-out/memory/query_20260812_010538_audit_persisted_ade_workspace_and_project_provenan.md": {
     "mtime": 1786496738.5175455,
     "ast_hash": "b3c5d951827ec05be8379009b4b35e4c",
-    "semantic_hash": ""
+    "semantic_hash": "b3c5d951827ec05be8379009b4b35e4c"
   },
   "graphify-out/memory/query_20260812_021720_why_does_a_linked_worktree_appear_as_its_own_top_l.md": {
     "mtime": 1786501040.7458968,
     "ast_hash": "a276002f604b7cc854018f44f1fcfe9a",
-    "semantic_hash": ""
+    "semantic_hash": "a276002f604b7cc854018f44f1fcfe9a"
+  },
+  "script/rebuild-client": {
+    "mtime": 1788277169.3697922,
+    "ast_hash": "f8c72286ba148b1271c104adbede505e",
+    "semantic_hash": "f8c72286ba148b1271c104adbede505e"
+  },
+  ".agents/skills/conventional-commit/SKILL.md": {
+    "mtime": 1786985064.9767642,
+    "ast_hash": "3eaf65642be0fefb8e7c5236c5c09298",
+    "semantic_hash": "3eaf65642be0fefb8e7c5236c5c09298"
+  },
+  ".agents/skills/simple-english/SKILL.md": {
+    "mtime": 1787341488.4288814,
+    "ast_hash": "9b3ad02a95e40e5232c3f7e2fa4f7ff8",
+    "semantic_hash": "9b3ad02a95e40e5232c3f7e2fa4f7ff8"
+  },
+  ".agents/skills/simple-english/references/checklist.md": {
+    "mtime": 1787341488.4291172,
+    "ast_hash": "dcfc58ba1f213f85f57fcb00bd2460b5",
+    "semantic_hash": "dcfc58ba1f213f85f57fcb00bd2460b5"
+  },
+  ".agents/skills/simple-english/references/use-cases.md": {
+    "mtime": 1787341488.4292023,
+    "ast_hash": "fe2a19533a2319452f18c970e0d1b792",
+    "semantic_hash": "fe2a19533a2319452f18c970e0d1b792"
+  },
+  ".agents/skills/simple-english/references/word-swaps.md": {
+    "mtime": 1787341488.4292843,
+    "ast_hash": "45efdde5572bca190cde4b74cc869ba5",
+    "semantic_hash": "45efdde5572bca190cde4b74cc869ba5"
+  },
+  "graphify-out/memory/query_20260813_121637_trace_remote_workspace_loading_open_file_path__ssh.md": {
+    "mtime": 1786623397.288612,
+    "ast_hash": "c1e1befcf4344c5857a0797bc7c2737d",
+    "semantic_hash": "c1e1befcf4344c5857a0797bc7c2737d"
+  },
+  "graphify-out/memory/query_20260813_132905_please_investigate_why_after_some_time_working_in.md": {
+    "mtime": 1786627745.0300791,
+    "ast_hash": "cb17385ad4106a7e5ddef8b2df27559c",
+    "semantic_hash": "cb17385ad4106a7e5ddef8b2df27559c"
+  },
+  "graphify-out/memory/query_20260813_150548_trace_the_remote_projects_picker_flow_after_select.md": {
+    "mtime": 1786633548.5762284,
+    "ast_hash": "57c9368d544507f07b6d12a026f78eab",
+    "semantic_hash": "57c9368d544507f07b6d12a026f78eab"
+  },
+  "graphify-out/memory/query_20260813_150607_find_existing_tests_for_the_remote_projects_server.md": {
+    "mtime": 1786633567.7505739,
+    "ast_hash": "ad9e7eee2982d2f6db2f545ceff61a07",
+    "semantic_hash": "ad9e7eee2982d2f6db2f545ceff61a07"
+  },
+  "graphify-out/memory/query_20260813_152500_review_the_current_diff_for_the_new_server_folder.md": {
+    "mtime": 1786634700.559665,
+    "ast_hash": "7a33828895781fd3586cb1985e27614f",
+    "semantic_hash": "7a33828895781fd3586cb1985e27614f"
+  },
+  "graphify-out/memory/query_20260813_153143_review_the_current_remote_servers_rs_diff_for_corr.md": {
+    "mtime": 1786635103.1558704,
+    "ast_hash": "1f6a9604753b63a3ad9ba911c25b3597",
+    "semantic_hash": "1f6a9604753b63a3ad9ba911c25b3597"
+  },
+  "graphify-out/memory/query_20260813_153750_final_review_of_current_one_file_diff_after_cancel.md": {
+    "mtime": 1786635470.6871715,
+    "ast_hash": "cf909cc0c4f71a14a24760e3de9f276a",
+    "semantic_hash": "cf909cc0c4f71a14a24760e3de9f276a"
+  },
+  "graphify-out/memory/query_20260813_153813_final_review_current_diff_tests__reassess_settings.md": {
+    "mtime": 1786635493.7286708,
+    "ast_hash": "443e668062868b6772fd5a3735410b63",
+    "semantic_hash": "443e668062868b6772fd5a3735410b63"
+  },
+  "graphify-out/memory/query_20260813_154508_ponytail_audit_current_one_file_338_line_diff_for.md": {
+    "mtime": 1786635908.4155798,
+    "ast_hash": "cd7c5a4b8b7ba0b811b5e609c3560697",
+    "semantic_hash": "cd7c5a4b8b7ba0b811b5e609c3560697"
+  },
+  "graphify-out/memory/query_20260813_155041_review_only__can_we_dramatically_simplify_current.md": {
+    "mtime": 1786636241.8272877,
+    "ast_hash": "4de3ed5494a20c88bd4a0470e60bd4db",
+    "semantic_hash": "4de3ed5494a20c88bd4a0470e60bd4db"
+  },
+  "graphify-out/memory/query_20260813_155227_reduced_patch_is_now_applied__final_read_only_revi.md": {
+    "mtime": 1786636347.8146024,
+    "ast_hash": "680fe95ac5618009bad49256dfdae9b9",
+    "semantic_hash": "680fe95ac5618009bad49256dfdae9b9"
+  },
+  "graphify-out/memory/query_20260813_155345_reduced_patch_is_now_applied__final_read_only_revi.md": {
+    "mtime": 1786636425.7303944,
+    "ast_hash": "8dbf9f6d606c77fd63c3a0846c226436",
+    "semantic_hash": "8dbf9f6d606c77fd63c3a0846c226436"
+  },
+  "graphify-out/memory/query_20260813_155424_after_adding_a_new_ssh_server__open_folder_selecti.md": {
+    "mtime": 1786636464.2927225,
+    "ast_hash": "1988291cd16558e8c97fd744e1efe0f1",
+    "semantic_hash": "1988291cd16558e8c97fd744e1efe0f1"
+  },
+  "graphify-out/memory/query_20260814_090212_root_cause__viral_studio_changed_from_100_78_83_67.md": {
+    "mtime": 1786698132.8882432,
+    "ast_hash": "362f88dc6da13f5259f930bdbf096d09",
+    "semantic_hash": "362f88dc6da13f5259f930bdbf096d09"
+  },
+  "graphify-out/memory/query_20260814_100022_trace_the_sidebar_project_group_header_renderer_an.md": {
+    "mtime": 1786701622.178649,
+    "ast_hash": "3f8cb2c152f9e60929734a5436d114b9",
+    "semantic_hash": "3f8cb2c152f9e60929734a5436d114b9"
+  },
+  "graphify-out/memory/query_20260814_100629_how_can_i_understand_what_ssh_url_project_attached.md": {
+    "mtime": 1786701989.255179,
+    "ast_hash": "62f6cbc71ced2409e0e93686b0e686be",
+    "semantic_hash": "62f6cbc71ced2409e0e93686b0e686be"
+  },
+  "graphify-out/memory/query_20260814_101802_trace_ade_layout_and_session_ownership_on_first_op.md": {
+    "mtime": 1786702682.9399254,
+    "ast_hash": "026b4c366bb40c9eca75aac53c7bde7b",
+    "semantic_hash": "026b4c366bb40c9eca75aac53c7bde7b"
+  },
+  "graphify-out/memory/query_20260814_102210_inspect_existing_sidebar_ade_workspaces_gpui_tests.md": {
+    "mtime": 1786702930.4058435,
+    "ast_hash": "66e6c07763580c780aef5f090dadffaa",
+    "semantic_hash": "66e6c07763580c780aef5f090dadffaa"
+  },
+  "graphify-out/memory/query_20260814_102823_when_a_remote_worktree_is_opened_for_the_first_tim.md": {
+    "mtime": 1786703303.1430757,
+    "ast_hash": "021c6e58f29850888397cab26fc94723",
+    "semantic_hash": "021c6e58f29850888397cab26fc94723"
+  },
+  "graphify-out/memory/query_20260814_110107_we_need_to_have_something_that_will_allow_to_drop.md": {
+    "mtime": 1786705267.0301733,
+    "ast_hash": "9922bc39a88b7b3d202e3a9774f2ecb5",
+    "semantic_hash": "9922bc39a88b7b3d202e3a9774f2ecb5"
+  },
+  "graphify-out/memory/query_20260814_110248_we_need_a_control_to_drop_daemon_sessions_and_recr.md": {
+    "mtime": 1786705368.6127536,
+    "ast_hash": "97945a5161b776833710d3e34e4938fa",
+    "semantic_hash": "97945a5161b776833710d3e34e4938fa"
+  },
+  "graphify-out/memory/query_20260814_120054_add_a_safe_ui_control_to_drop_stale_daemon_session.md": {
+    "mtime": 1786708854.0486927,
+    "ast_hash": "4b8ea641e01b66c0547ee0f24851d5b8",
+    "semantic_hash": "4b8ea641e01b66c0547ee0f24851d5b8"
+  },
+  "graphify-out/memory/query_20260814_123124_also_we_should_add_command_pallete_toggler_to_the.md": {
+    "mtime": 1786710684.631469,
+    "ast_hash": "9148ecc6e343c30cca071b91bcaa4985",
+    "semantic_hash": "9148ecc6e343c30cca071b91bcaa4985"
+  },
+  "graphify-out/memory/query_20260814_124358_i_see_workspace_toggle_menu_has_a_lot_of_different.md": {
+    "mtime": 1786711438.713996,
+    "ast_hash": "3b5609d36bf9febec88fc292b2ece35b",
+    "semantic_hash": "3b5609d36bf9febec88fc292b2ece35b"
+  },
+  "graphify-out/memory/query_20260814_144251_i_clicked__kill_and_recreate_session__and_it_creat.md": {
+    "mtime": 1786718571.0508378,
+    "ast_hash": "f0030a4c5ad77f9c14bdd814945cdec4",
+    "semantic_hash": "f0030a4c5ad77f9c14bdd814945cdec4"
+  },
+  "graphify-out/memory/query_20260814_150017_why_does_the_workspaces_view_show_sessions_that_do.md": {
+    "mtime": 1786719617.6987703,
+    "ast_hash": "cad85e68ee63e923d851899f544ef195",
+    "semantic_hash": "cad85e68ee63e923d851899f544ef195"
+  },
+  "graphify-out/memory/query_20260814_150146_please_align_font_on_the_workspaces_view_as_everyw.md": {
+    "mtime": 1786719706.1291287,
+    "ast_hash": "161a031b5c2754f9cb4a0bb94fcb0e95",
+    "semantic_hash": "161a031b5c2754f9cb4a0bb94fcb0e95"
+  },
+  "graphify-out/memory/query_20260814_152940_why_are_ade_workspaces_rows_not_scoped_like_the_ma.md": {
+    "mtime": 1786721380.374655,
+    "ast_hash": "36486986468f147d5f801fd8b9edb7a7",
+    "semantic_hash": "36486986468f147d5f801fd8b9edb7a7"
+  },
+  "graphify-out/memory/query_20260814_154544_trace_sidebar_______new_worktree_flow_end_to_end.md": {
+    "mtime": 1786722344.37786,
+    "ast_hash": "9098d29245b86625b47dbdf09f440908",
+    "semantic_hash": "9098d29245b86625b47dbdf09f440908"
+  },
+  "graphify-out/memory/query_20260814_154730_trace_every_new_terminal_entry_path_relevant_to_an.md": {
+    "mtime": 1786722450.0017195,
+    "ast_hash": "8c03fbe9d1a019985c5debf75733ad17",
+    "semantic_hash": "8c03fbe9d1a019985c5debf75733ad17"
+  },
+  "graphify-out/memory/query_20260814_155343_design_minimal_failing_regressions_for_new_termina.md": {
+    "mtime": 1786722823.479965,
+    "ast_hash": "097c6ce7ad77ab818e6f40f3ce7c2e4d",
+    "semantic_hash": "097c6ce7ad77ab818e6f40f3ce7c2e4d"
+  },
+  "graphify-out/memory/query_20260814_162846_review_current_ade_terminal_cwd_and_sidebar_worktr.md": {
+    "mtime": 1786724926.3783042,
+    "ast_hash": "3d19a493f6d6c754d6b5ee931d4d8ca8",
+    "semantic_hash": "3d19a493f6d6c754d6b5ee931d4d8ca8"
+  },
+  "graphify-out/memory/query_20260814_170503_re_review_the_latest_terminal_cwd_and_worktree_pri.md": {
+    "mtime": 1786727104.0003738,
+    "ast_hash": "78fa57c142934d9c2dbc5b6128bf4c98",
+    "semantic_hash": "78fa57c142934d9c2dbc5b6128bf4c98"
+  },
+  "graphify-out/memory/query_20260814_171829_why_do_new_ade_terminals_start_outside_the_worktre.md": {
+    "mtime": 1786727909.9141386,
+    "ast_hash": "07326056e7dcccf7e43c04b237d0fdd6",
+    "semantic_hash": "07326056e7dcccf7e43c04b237d0fdd6"
+  },
+  "graphify-out/memory/query_20260814_202218_why_does_an_existing_ade_codex_terminal_show_a_sta.md": {
+    "mtime": 1786738938.4559774,
+    "ast_hash": "6545b76fb3538cfeef1df4233ea90e03",
+    "semantic_hash": "6545b76fb3538cfeef1df4233ea90e03"
+  },
+  "graphify-out/memory/query_20260814_202817_design_the_smallest_deterministic_gpui_regression.md": {
+    "mtime": 1786739297.093576,
+    "ast_hash": "7986cfe42ab458cfc748c8eb31ba5fec",
+    "semantic_hash": "7986cfe42ab458cfc748c8eb31ba5fec"
+  },
+  "graphify-out/memory/query_20260814_210002_when_i_open_a_new_file_from_the_file_explorer__the.md": {
+    "mtime": 1786741202.0839612,
+    "ast_hash": "4dbb65d79f492542c0a9dd53219d5639",
+    "semantic_hash": "4dbb65d79f492542c0a9dd53219d5639"
+  },
+  "graphify-out/memory/query_20260815_075140_i_created_a_new_worktree_but_the_sidebar_still_hig.md": {
+    "mtime": 1786780300.4310484,
+    "ast_hash": "318415d664a5a8d93780ab5b78503a9b",
+    "semantic_hash": "318415d664a5a8d93780ab5b78503a9b"
+  },
+  "graphify-out/memory/query_20260815_082651_i_clicked_remove_project_on_viral_studio__but_it_r.md": {
+    "mtime": 1786782411.5242953,
+    "ast_hash": "17581b39919a6404481fd9b0d1a7d9a2",
+    "semantic_hash": "17581b39919a6404481fd9b0d1a7d9a2"
+  },
+  "graphify-out/memory/query_20260818_195610_when_session_is_not_connected__how_to_about_show_t.md": {
+    "mtime": 1787082970.8397021,
+    "ast_hash": "dac21c52733aa085c1dc371b8ef12096",
+    "semantic_hash": "dac21c52733aa085c1dc371b8ef12096"
+  },
+  "graphify-out/memory/query_20260819_073415_when_i_connect_to_the_disconnected_session__it_sti.md": {
+    "mtime": 1787124855.1708643,
+    "ast_hash": "96937b99b0aadd83a827b7f4a0655a43",
+    "semantic_hash": "96937b99b0aadd83a827b7f4a0655a43"
+  },
+  "graphify-out/memory/query_20260819_194303_the_problem_still_persists__can_you_deeply_investi.md": {
+    "mtime": 1787168583.8517296,
+    "ast_hash": "f6d01043930e86a3a6606367d1e5b048",
+    "semantic_hash": "f6d01043930e86a3a6606367d1e5b048"
+  },
+  "graphify-out/memory/query_20260820_150351_when_i_start_the_app_it_showing_this_error__but_i.md": {
+    "mtime": 1787238231.7991817,
+    "ast_hash": "1314367840906484d9bf6a80db70a9e5",
+    "semantic_hash": "1314367840906484d9bf6a80db70a9e5"
+  },
+  "graphify-out/memory/query_20260823_131436_why_are_workspaces_sessions_not_all_grouped_under.md": {
+    "mtime": 1787490876.246268,
+    "ast_hash": "dd6f2fdbceadcf99535552413fba9a6f",
+    "semantic_hash": "dd6f2fdbceadcf99535552413fba9a6f"
+  },
+  "graphify-out/memory/query_20260823_140714_why_ade_workspace_sessions_from_linked_git_worktre.md": {
+    "mtime": 1787494034.7218227,
+    "ast_hash": "797e717a3df12cad59274303f9c27366",
+    "semantic_hash": "797e717a3df12cad59274303f9c27366"
+  },
+  "graphify-out/memory/query_20260823_152632_fix_ade_workspaces_project_scoping_and_add_a_kill.md": {
+    "mtime": 1787498792.9317698,
+    "ast_hash": "fbf7794cd26dddb72928ad5ba6c88e6b",
+    "semantic_hash": "fbf7794cd26dddb72928ad5ba6c88e6b"
+  },
+  "graphify-out/memory/query_20260901_153034_remote_download_reported_success_but_no_host_file.md": {
+    "mtime": 1788276634.2141018,
+    "ast_hash": "788149f4ce7728646c424be1189c9688",
+    "semantic_hash": "788149f4ce7728646c424be1189c9688"
+  },
+  "graphify-out/memory/query_20260901_153614_maybe_we_should_show_the_loader_while_it_is_loadin.md": {
+    "mtime": 1788276974.546946,
+    "ast_hash": "a3da439d6e9533845af522ce604977ae",
+    "semantic_hash": "a3da439d6e9533845af522ce604977ae"
+  },
+  "website/zorca-github-org-avatar.svg": {
+    "mtime": 1786802167.282607,
+    "ast_hash": "36eddd0d8c65117c1171bc8169b23e7a",
+    "semantic_hash": "36eddd0d8c65117c1171bc8169b23e7a"
+  },
+  "graphify-out/memory/query_20260901_193443_i_clicked__close_right__for_the_tabs__but_after_se.md": {
+    "mtime": 1788291283.5353775,
+    "ast_hash": "1b2de02f60cf7e2f4cc58c1bd70d5437",
+    "semantic_hash": "1b2de02f60cf7e2f4cc58c1bd70d5437"
   }
 }
