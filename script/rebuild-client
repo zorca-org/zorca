@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+
+# Rebuild the zorca dev client and relaunch it, replacing any running dev
+# instance so the new binary actually gets launched instead of forwarding to
+# the old process.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# Build before touching the running client, so a compile error leaves the
+# current editor untouched and the old client keeps running while the build
+# takes its time.
+cargo build -p zed
+
+target_dir="$(cargo metadata --format-version 1 --no-deps |
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+binary="$target_dir/debug/zorca"
+if [[ ! -x "$binary" ]]; then
+    echo "error: expected the built binary at $binary" >&2
+    exit 1
+fi
+
+# Match on the binary path so an installed Zorca.app is left alone. The dev
+# client has no SIGTERM handler, so in-flight state (unsaved edits, the last
+# moments of workspace serialization) can be lost — save first if that matters.
+if pgrep -f "$binary" >/dev/null; then
+    echo "Closing running dev client..."
+    pkill -TERM -f "$binary" || true
+
+    for _ in $(seq 1 10); do
+        pgrep -f "$binary" >/dev/null || break
+        sleep 0.5
+    done
+
+    if pgrep -f "$binary" >/dev/null; then
+        echo "Dev client did not exit; force killing"
+        pkill -9 -f "$binary" || true
+        sleep 1
+    fi
+fi
+
+log="${TMPDIR:-/tmp}/zorca-rebuild.log"
+echo "Launching $binary (log: $log)"
+nohup "$binary" >"$log" 2>&1 &
+pid=$!
+disown
+
+sleep 1
+if ! kill -0 "$pid" 2>/dev/null; then
+    echo "error: zorca exited right after launch:" >&2
+    cat "$log" >&2
+    exit 1
+fi

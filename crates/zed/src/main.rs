@@ -1437,7 +1437,8 @@ async fn restore_or_create_workspace_for_session(
                         Default::default(),
                         app_state.clone(),
                         cx,
-                        |workspace, _window, cx| {
+                        |workspace, window, cx| {
+                            init_nothing_restored_workspace(workspace, window, cx);
                             workspace.show_toast(
                                 Toast::new(NotificationId::unique::<()>(), message),
                                 cx,
@@ -1459,16 +1460,7 @@ async fn restore_or_create_workspace_for_session(
                     Default::default(),
                     app_state.clone(),
                     cx,
-                    |workspace, window, cx| {
-                        let restore_on_startup =
-                            WorkspaceSettings::get_global(cx).restore_on_startup;
-                        match restore_on_startup {
-                            workspace::RestoreOnStartupBehavior::Launchpad => {}
-                            _ => {
-                                Editor::new_file(workspace, &Default::default(), window, cx);
-                            }
-                        }
-                    },
+                    init_nothing_restored_workspace,
                 )
             })
             .await?;
@@ -1481,21 +1473,37 @@ async fn restore_or_create_workspace_for_session(
                 Default::default(),
                 app_state,
                 cx,
-                |workspace, window, cx| {
-                    let restore_on_startup = WorkspaceSettings::get_global(cx).restore_on_startup;
-                    match restore_on_startup {
-                        workspace::RestoreOnStartupBehavior::Launchpad => {}
-                        _ => {
-                            Editor::new_file(workspace, &Default::default(), window, cx);
-                        }
-                    }
-                },
+                init_nothing_restored_workspace,
             )
         })
         .await?;
     }
 
     Ok(())
+}
+
+/// Set up the fallback window that opens when there is nothing to restore.
+fn init_nothing_restored_workspace(
+    workspace: &mut workspace::Workspace,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<workspace::Workspace>,
+) {
+    match WorkspaceSettings::get_global(cx).restore_on_startup {
+        // An explicit empty_tab keeps its editor tab, along with whatever a
+        // fresh window normally opens.
+        workspace::RestoreOnStartupBehavior::EmptyTab => {
+            Editor::new_file(workspace, &Default::default(), window, cx);
+        }
+        // Everything else leaves the pane empty — without the fresh-window
+        // terminal — so the launchpad is shown. For launchpad that is the
+        // setting's whole meaning; for the session/workspace modes it is
+        // what "nothing to restore" should look like.
+        workspace::RestoreOnStartupBehavior::Launchpad
+        | workspace::RestoreOnStartupBehavior::LastWorkspace
+        | workspace::RestoreOnStartupBehavior::LastSession => {
+            workspace.suppress_fresh_window_item();
+        }
+    }
 }
 
 async fn restorable_workspaces(

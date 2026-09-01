@@ -554,6 +554,13 @@ fn open_plain_terminal_if_empty(this: &WeakEntity<Workspace>, cx: &mut AsyncWind
         if occupied {
             return;
         }
+        // The startup fallback keeps its window empty on purpose so the
+        // launchpad shows; dropping a shell in would hide it. The suppression
+        // lifts once the window gains a project root, so later connect flows
+        // get their fallback shell as usual.
+        if workspace.fresh_window_item_suppressed() {
+            return;
+        }
         // A fake fs has no real PTY behind it; its reader thread would also
         // violate the deterministic test scheduler.
         if workspace.project().read(cx).fs().is_fake() {
