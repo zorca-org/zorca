@@ -1471,6 +1471,7 @@ pub struct Workspace {
     last_open_dock_positions: Vec<DockPosition>,
     removing: bool,
     open_in_dev_container: bool,
+    suppress_fresh_window_item: bool,
     _dev_container_task: Option<Task<Result<()>>>,
     _panels_task: Option<Task<Result<()>>>,
     sidebar_focus_handle: Option<FocusHandle>,
@@ -1943,9 +1944,25 @@ impl Workspace {
             active_workspace_id: None,
             active_worktree_creation: ActiveWorktreeCreation::default(),
             open_in_dev_container: false,
+            suppress_fresh_window_item: false,
             _dev_container_task: None,
             deferred_save_items: Vec::new(),
         }
+    }
+
+    /// Prevent this window from opening the fresh-window item (for ADE, a
+    /// center-pane terminal) so its pane stays empty and the launchpad shows.
+    /// Only has an effect when called from the `init` callback of
+    /// [`Workspace::new_local`], before the item would be opened.
+    pub fn suppress_fresh_window_item(&mut self) {
+        self.suppress_fresh_window_item = true;
+    }
+
+    /// Whether this window opted out of the fresh-window item to show the
+    /// launchpad. Fallback flows that would drop a terminal into an empty
+    /// window must leave such a window alone.
+    pub fn fresh_window_item_suppressed(&self) -> bool {
+        self.suppress_fresh_window_item
     }
 
     pub fn new_local(
@@ -2237,8 +2254,11 @@ impl Workspace {
                             });
                             // ...and the center pane gets that terminal, via
                             // whatever `terminal_view` installed. See
-                            // [`on_fresh_window`].
-                            open_fresh_window_item(workspace, window, cx);
+                            // [`on_fresh_window`]. The startup fallback opts
+                            // out so an empty start shows the launchpad.
+                            if !workspace.suppress_fresh_window_item {
+                                open_fresh_window_item(workspace, window, cx);
+                            }
                             cx.notify();
                         });
                     })

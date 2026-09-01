@@ -3386,6 +3386,50 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_startup_with_nothing_to_restore_shows_launchpad(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+
+        // Stand in for the ADE fresh-window terminal, which tests don't
+        // install, so the fallback's suppression of it is exercised.
+        cx.update(|cx| {
+            workspace::on_fresh_window(cx, |workspace, window, cx| {
+                Editor::new_file(workspace, &Default::default(), window, cx);
+            })
+        });
+
+        // Mark onboarding as already seen so startup takes the
+        // "nothing to restore" fallback instead of the first-open view.
+        let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+        kvp.write_kvp(onboarding::FIRST_OPEN.to_string(), "false".to_string())
+            .await
+            .unwrap();
+
+        let mut async_cx = cx.to_async();
+        crate::restore_or_create_workspace(app_state, &mut async_cx)
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let multi_workspace = cx
+            .update(|cx| cx.windows().first().unwrap().downcast::<MultiWorkspace>())
+            .unwrap();
+        multi_workspace
+            .read_with(cx, |multi_workspace, cx| {
+                let items_len = multi_workspace
+                    .workspace()
+                    .read(cx)
+                    .active_pane()
+                    .read(cx)
+                    .items_len();
+                assert_eq!(
+                    items_len, 0,
+                    "an empty start should leave the pane empty so the launchpad is shown"
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     async fn test_open_entry(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         app_state

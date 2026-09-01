@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+# Rebuild the zorca client, closing any running instance first so the new
+# binary actually gets launched instead of forwarding to the old process.
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+if pgrep -x zorca >/dev/null; then
+    echo "Closing running zorca..."
+    # Session and workspace state are persisted continuously, so terminating
+    # via signal does not lose meaningful state.
+    pkill -TERM -x zorca || true
+
+    for _ in $(seq 1 10); do
+        pgrep -x zorca >/dev/null || break
+        sleep 0.5
+    done
+
+    if pgrep -x zorca >/dev/null; then
+        echo "zorca did not exit; force killing"
+        pkill -9 -x zorca || true
+        sleep 1
+    fi
+fi
+
+cargo build -p zed
+
+binary="${CARGO_TARGET_DIR:-target}/debug/zorca"
+echo "Launching $binary"
+nohup "$binary" >/dev/null 2>&1 &
+disown
