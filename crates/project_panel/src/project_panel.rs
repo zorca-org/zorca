@@ -3619,6 +3619,7 @@ impl ProjectPanel {
         }
 
         let total_files = files_to_download.len();
+        let project = self.project.clone();
         let workspace = self.workspace.clone();
 
         let destination_dir = cx.prompt_for_paths(PathPromptOptions {
@@ -3631,78 +3632,96 @@ impl ProjectPanel {
         let fs = self.fs.clone();
         let notification_id =
             workspace::notifications::NotificationId::Named("download-progress".into());
-        cx.spawn_in(window, async move |this, cx| {
-            if let Ok(Ok(Some(mut paths))) = destination_dir.await {
-                if let Some(dest_dir) = paths.pop() {
-                    // Show initial toast
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.show_toast(
-                                workspace::Toast::new(
-                                    notification_id.clone(),
-                                    format!("Downloading 0/{} files...", total_files),
-                                ),
-                                cx,
-                            );
-                        })
-                        .ok();
+        cx.spawn_in(window, async move |_, cx| {
+            let result: Result<Option<PathBuf>> = async {
+                let Some(mut paths) = destination_dir
+                    .await
+                    .context("failed to receive the download destination")?
+                    .context("failed to choose the download destination")?
+                else {
+                    return Ok(None);
+                };
+                let Some(dest_dir) = paths.pop() else {
+                    return Ok(None);
+                };
 
-                    for (index, (worktree_id, entry_path, relative_path)) in
-                        files_to_download.into_iter().enumerate()
-                    {
-                        // Update progress toast
-                        workspace
-                            .update(cx, |workspace, cx| {
-                                workspace.show_toast(
-                                    workspace::Toast::new(
-                                        notification_id.clone(),
-                                        format!(
-                                            "Downloading {}/{} files...",
-                                            index + 1,
-                                            total_files
-                                        ),
-                                    ),
-                                    cx,
-                                );
-                            })
-                            .ok();
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            notification_id.clone(),
+                            format!("Downloading 0/{} files...", total_files),
+                        ),
+                        cx,
+                    );
+                })?;
 
-                        let destination_path = dest_dir.join(&relative_path);
+                for (index, (worktree_id, entry_path, relative_path)) in
+                    files_to_download.into_iter().enumerate()
+                {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                notification_id.clone(),
+                                format!("Downloading {}/{} files...", index + 1, total_files),
+                            ),
+                            cx,
+                        );
+                    })?;
 
-                        // Create parent directories if needed
-                        if let Some(parent) = destination_path.parent() {
-                            if !parent.exists() {
-                                fs.create_dir(parent).await.log_err();
-                            }
-                        }
-
-                        let download_task = this.update(cx, |this, cx| {
-                            let project = this.project.clone();
-                            project.update(cx, |project, cx| {
-                                project.download_file(worktree_id, entry_path, destination_path, cx)
-                            })
-                        });
-                        if let Ok(task) = download_task {
-                            task.await.log_err();
-                        }
+                    let destination_path = dest_dir.join(&relative_path);
+                    if let Some(parent) = destination_path.parent() {
+                        fs.create_dir(parent).await.with_context(|| {
+                            format!("failed to create download directory {}", parent.display())
+                        })?;
                     }
 
-                    // Show completion toast
-                    workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.show_toast(
-                                workspace::Toast::new(
-                                    notification_id.clone(),
-                                    format!("Downloaded {} files", total_files),
-                                ),
+                    let source_path = entry_path.as_unix_str().to_owned();
+                    project
+                        .update(cx, |project, cx| {
+                            project.download_file(
+                                worktree_id,
+                                entry_path,
+                                destination_path.clone(),
                                 cx,
-                            );
+                            )
                         })
-                        .ok();
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to download {} to {}",
+                                source_path,
+                                destination_path.display()
+                            )
+                        })?;
                 }
+
+                Ok(Some(dest_dir))
             }
+            .await;
+
+            workspace.update(cx, |workspace, cx| match result {
+                Ok(Some(destination_dir)) => {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            notification_id,
+                            format!(
+                                "Downloaded {} files to {}",
+                                total_files,
+                                destination_dir.display()
+                            ),
+                        ),
+                        cx,
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    workspace.dismiss_toast(&notification_id, cx);
+                    workspace.show_error(format!("Download failed: {error:#}"), cx);
+                }
+            })?;
+            anyhow::Ok(())
         })
-        .detach();
+        .detach_and_log_err(cx);
     }
 
     fn duplicate(&mut self, _: &Duplicate, window: &mut Window, cx: &mut Context<Self>) {

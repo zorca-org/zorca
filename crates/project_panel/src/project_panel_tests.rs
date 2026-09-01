@@ -173,6 +173,45 @@ async fn test_opening_file(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_failed_download_from_remote_does_not_report_success(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/root"), json!({ "archive.zip": "contents" }))
+        .await;
+    let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let workspace = window
+        .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+        .expect("test window should have a workspace");
+    let cx = &mut VisualTestContext::from_window(window.into(), cx);
+    let panel = workspace.update_in(cx, ProjectPanel::new);
+    cx.run_until_parked();
+
+    select_path(&panel, "root/archive.zip", cx);
+    panel.update_in(cx, |panel, window, cx| {
+        panel.download_from_remote(&DownloadFromRemote, window, cx)
+    });
+    assert!(cx.did_prompt_for_paths());
+
+    let destination = tempfile::tempdir().expect("failed to create test download directory");
+    let destination_path = destination.path().to_path_buf();
+    cx.simulate_path_prompt_response(move |_| Some(vec![destination_path]));
+    cx.run_until_parked();
+
+    assert!(!destination.path().join("archive.zip").exists());
+    let notification_ids = workspace.read_with(cx, |workspace, _| workspace.notification_ids());
+    assert!(
+        !notification_ids.contains(&workspace::notifications::NotificationId::Named(
+            "download-progress".into()
+        ))
+    );
+    assert!(
+        notification_ids.contains(&workspace::notifications::NotificationId::unique::<String>())
+    );
+}
+
+#[gpui::test]
 async fn test_file_history_action_uses_focused_project_panel_selection(
     cx: &mut gpui::TestAppContext,
 ) {
