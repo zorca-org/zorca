@@ -1601,6 +1601,9 @@ impl Workspace {
                         .worktree_for_id(id, cx)
                         .is_some_and(|wt| wt.read(cx).is_visible())
                     {
+                        // Gaining a project root replaces the launchpad, so
+                        // the window no longer needs to stay empty for it.
+                        this.suppress_fresh_window_item = false;
                         this.serialize_workspace(window, cx);
                         this.update_history(cx);
                     }
@@ -1952,13 +1955,15 @@ impl Workspace {
 
     /// Prevent this window from opening the fresh-window item (for ADE, a
     /// center-pane terminal) so its pane stays empty and the launchpad shows.
-    /// Only has an effect when called from the `init` callback of
-    /// [`Workspace::new_local`], before the item would be opened.
+    /// The suppression lasts only while the window remains projectless: it is
+    /// cleared as soon as a visible worktree is added, since a project root
+    /// replaces the launchpad and the window then deserves its terminal
+    /// fallbacks again.
     pub fn suppress_fresh_window_item(&mut self) {
         self.suppress_fresh_window_item = true;
     }
 
-    /// Whether this window opted out of the fresh-window item to show the
+    /// Whether this window is currently keeping its pane empty to show the
     /// launchpad. Fallback flows that would drop a terminal into an empty
     /// window must leave such a window alone.
     pub fn fresh_window_item_suppressed(&self) -> bool {
@@ -2254,11 +2259,8 @@ impl Workspace {
                             });
                             // ...and the center pane gets that terminal, via
                             // whatever `terminal_view` installed. See
-                            // [`on_fresh_window`]. The startup fallback opts
-                            // out so an empty start shows the launchpad.
-                            if !workspace.suppress_fresh_window_item {
-                                open_fresh_window_item(workspace, window, cx);
-                            }
+                            // [`on_fresh_window`].
+                            open_fresh_window_item(workspace, window, cx);
                             cx.notify();
                         });
                     })
@@ -10753,12 +10755,16 @@ pub fn on_fresh_window(
 /// Put the fresh-window item — for ADE, a center-pane terminal rooted at the
 /// project — into `workspace`. The seam any crate uses to open that terminal
 /// without depending on `terminal_view`. A no-op, returning `false`, when no
-/// hook is installed (tests, headless).
+/// hook is installed (tests, headless) or when the workspace is keeping its
+/// pane empty for the launchpad ([`Workspace::suppress_fresh_window_item`]).
 pub fn open_fresh_window_item(
     workspace: &mut Workspace,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> bool {
+    if workspace.suppress_fresh_window_item {
+        return false;
+    }
     let Some(open) = cx
         .try_global::<FreshWindowItem>()
         .map(|hook| hook.0.clone())
@@ -11886,6 +11892,38 @@ mod tests {
             root_paths.as_slice(),
             [Arc::<Path>::from(Path::new("/fallback"))]
         );
+    }
+
+    #[gpui::test]
+    async fn test_adding_worktree_lifts_fresh_window_item_suppression(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({})).await;
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update(cx, |workspace, _| {
+            workspace.suppress_fresh_window_item();
+            assert!(workspace.fresh_window_item_suppressed());
+        });
+
+        // Gaining a project root replaces the launchpad, so the suppression
+        // must lift and the terminal fallbacks apply to this window again.
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/root"), true, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                !workspace.fresh_window_item_suppressed(),
+                "gaining a project root should lift the launchpad suppression"
+            );
+        });
     }
 
     #[gpui::test]

@@ -3415,16 +3415,13 @@ mod tests {
             .unwrap();
         multi_workspace
             .read_with(cx, |multi_workspace, cx| {
-                let items_len = multi_workspace
-                    .workspace()
-                    .read(cx)
-                    .active_pane()
-                    .read(cx)
-                    .items_len();
+                let workspace = multi_workspace.workspace().read(cx);
+                let items_len = workspace.active_pane().read(cx).items_len();
                 assert_eq!(
                     items_len, 0,
                     "an empty start should leave the pane empty so the launchpad is shown"
                 );
+                assert!(workspace.fresh_window_item_suppressed());
             })
             .unwrap();
     }
