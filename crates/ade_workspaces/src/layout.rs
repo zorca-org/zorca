@@ -1598,6 +1598,7 @@ impl LayoutSync {
             workspace::Event::ItemRemoved { item_id } => *item_id,
             _ => return,
         };
+        self.schedule(cx);
         // Left in the map until the decision is made: after a move the item is
         // the same item, and its mapping is still the truth.
         let Some(session) = self.sessions_by_item.get(&item_id).cloned() else {
@@ -1623,7 +1624,6 @@ impl LayoutSync {
             .log_err();
         })
         .detach();
-        self.schedule(cx);
     }
 
     /// Whether the removed item is still somewhere in this window: under its own
@@ -2264,7 +2264,7 @@ mod tests {
     use std::sync::Mutex;
     use terminal_view::TerminalId;
     use workspace::{
-        SaveIntent,
+        CloseItemsToTheRight, SaveIntent,
         item::test::{TestItem, TestProjectItem},
     };
 
@@ -3162,6 +3162,62 @@ mod tests {
                 .map(|stored| stored.layout.clone()),
             Some(local),
             "the local close should be persisted on top of the scrub revision"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_close_right_persists_inactive_editor_removals(cx: &mut TestAppContext) {
+        let (workspace, ade_workspace, mut cx) = test_window(cx).await;
+        let backend = install_lifecycle("test_close_right_persists", &mut cx).await;
+        let workspace_id = ade_workspace.daemon_workspace_id();
+        let initial = LayoutDoc::new(leaf(
+            vec![
+                editor(&path("a.rs")),
+                editor(&path("b.rs")),
+                editor(&path("c.rs")),
+            ],
+            0,
+            true,
+        ));
+        backend.seed_layout(&workspace_id, initial.clone(), 1);
+        render(&workspace, &ade_workspace, initial.clone(), &mut cx).await;
+        cx.update(|window, cx| {
+            AdeLayouts::install(&workspace, ade_workspace, initial, 1, window, cx)
+        });
+
+        cx.executor().advance_clock(PUSH_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        let pane = workspace.read_with(&mut cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(&mut cx, |pane, window, cx| {
+            pane.close_items_to_the_right_by_id(
+                None,
+                &CloseItemsToTheRight {
+                    close_pinned: false,
+                },
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("close right succeeds");
+        let closed = workspace
+            .read_with(&mut cx, |workspace, cx| capture_layout(workspace, cx))
+            .expect("the first file remains open");
+
+        cx.executor().advance_clock(PUSH_DEBOUNCE * 2);
+        cx.run_until_parked();
+
+        assert_eq!(backend.stored_rev(&workspace_id), Some(2));
+        assert_eq!(
+            backend
+                .layouts
+                .lock()
+                .expect("layout store is not poisoned")
+                .get(&workspace_id)
+                .map(|stored| stored.layout.clone()),
+            Some(closed),
+            "closing inactive tabs to the right must update the daemon layout"
         );
     }
 
