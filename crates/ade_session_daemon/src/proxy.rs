@@ -186,7 +186,8 @@ pub async fn ensure(config: ProxyConfig) -> Result<String> {
     if let Some(ready) = ack.upgrade_ready {
         line.push_str(&format!(" upgrade_ready={ready}"));
     }
-    // Lets the client validate a prebuilt daemon without another ssh round trip.
+    // Lets the client pick its binary for a freshness check or an upgrade
+    // without another ssh round trip.
     if let Some(platform) = ade_session::HostPlatform::current() {
         line.push_str(&format!(" platform={}", platform.target_triple()));
     }
