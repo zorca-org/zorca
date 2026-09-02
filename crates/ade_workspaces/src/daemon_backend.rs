@@ -2515,7 +2515,9 @@ impl HostLink {
         if self.daemon_freshness.swap(value, Ordering::Relaxed) == value {
             return;
         }
-        log::debug!(
+        // `info`: this client logs nothing below it, and one line per host per
+        // change is the whole record of why the arrow is or is not drawn.
+        log::info!(
             "{}: daemon is {}",
             self.host.destination,
             if stale { "behind" } else { "current" }
