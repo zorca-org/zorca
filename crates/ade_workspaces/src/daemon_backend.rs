@@ -1960,7 +1960,7 @@ impl Endpoint {
         // Shared for observation only; requests use `Control::instance_id`.
         *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id.clone();
         if let Some((link, ensure_line)) = freshness_probe {
-            link.note_prebuilt_freshness(&ensure_line);
+            link.note_freshness(&ensure_line);
         }
         Ok(Control {
             connection,
@@ -2319,23 +2319,6 @@ fn daemon_hash(line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn daemon_platform(line: &str) -> Option<ade_session::HostPlatform> {
-    line.split_whitespace()
-        .find_map(|token| {
-            token
-                .strip_prefix("platform=")
-                .filter(|value| !value.is_empty())
-        })
-        .and_then(ade_session::HostPlatform::from_target_triple)
-}
-
-fn prebuilt_freshness(ensure_line: &str, binary: &[u8]) -> Option<bool> {
-    let remote_hash = daemon_hash(ensure_line)?;
-    let platform = daemon_platform(ensure_line)?;
-    ade_session::daemon_binary_matches_platform(binary, &platform)
-        .then(|| ade_session::sha256_hex(binary) != remote_hash)
-}
-
 /// One remote host's single ssh connection, and everything needed to bring it
 /// back.
 #[derive(Debug)]
@@ -2346,12 +2329,12 @@ struct HostLink {
     local: LocalEndpoint,
     state: Mutex<HostLinkState>,
     /// Whether the host's daemon is behind this client's:
-    /// `FRESHNESS_UNKNOWN` until a hash comparison says otherwise, and still
-    /// that for a daemon too old to report a hash at all.
+    /// `FRESHNESS_UNKNOWN` until a comparison says otherwise. A daemon too old
+    /// to report a hash is behind without one.
     ///
-    /// Written only by [`HostLink::note_hash_verdict`], after comparing a
-    /// configured prebuilt binary or completing the operator's own upgrade.
-    /// Read by the sidebar, to decide whether to offer that upgrade.
+    /// Written only by [`HostLink::note_hash_verdict`], from
+    /// [`HostLink::note_freshness`] at connect or from the operator's own
+    /// upgrade. Read by the sidebar, to decide whether to offer that upgrade.
     ///
     /// **Deliberately not in [`HostLinkState`], and deliberately lock-free.**
     /// That mutex is held across `--ensure`, ssh round trips and a possible
@@ -2540,17 +2523,6 @@ impl HostLink {
         self.freshness_observers.announce();
     }
 
-    fn forget_hash_verdict(&self) {
-        if self
-            .daemon_freshness
-            .swap(FRESHNESS_UNKNOWN, Ordering::Relaxed)
-            == FRESHNESS_UNKNOWN
-        {
-            return;
-        }
-        self.freshness_observers.announce();
-    }
-
     /// Whether this host's daemon is known to be behind the client. `false`
     /// while nothing knows, so an unanswered question never draws a control
     /// that claims an update exists.
@@ -2563,28 +2535,34 @@ impl HostLink {
         self.freshness_observers.add(observer);
     }
 
-    /// Compare only a caller-supplied binary that matches this host.
-    fn note_prebuilt_freshness(&self, ensure_line: &str) {
-        let Some(path) = std::env::var_os(ade_session::DAEMON_BINARY_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-        else {
-            self.forget_hash_verdict();
+    /// Record whether the daemon behind `ensure_line` is behind this client,
+    /// so the sidebar can offer the upgrade.
+    ///
+    /// A daemon too old to report a hash is older than every client that reads
+    /// one: that verdict is immediate. Otherwise the answer is the binary this
+    /// client would deploy ([`Self::local_binary`]: an ssh round trip and a
+    /// cargo build that is a no-op once warm), compared on a thread of its
+    /// own — the connect never waits for it, and the sidebar redraws through
+    /// the freshness observers when the verdict lands. A comparison that
+    /// fails leaves the last verdict standing rather than clearing it.
+    fn note_freshness(self: Arc<Self>, ensure_line: &str) {
+        let Some(remote_hash) = daemon_hash(ensure_line) else {
+            self.note_hash_verdict(true);
             return;
         };
-        match std::fs::read(&path) {
-            Ok(binary) => match prebuilt_freshness(ensure_line, &binary) {
-                Some(stale) => self.note_hash_verdict(stale),
-                None => self.forget_hash_verdict(),
-            },
-            Err(error) => {
-                self.forget_hash_verdict();
-                log::warn!(
-                    "{}: cannot read the configured daemon binary at {}: {error}",
-                    self.host.destination,
-                    path.display()
-                );
-            }
+        // ponytail: one cargo no-op build per host per connect; memoize the
+        // local hash per platform if reconnect storms make that visible.
+        let spawned = std::thread::Builder::new()
+            .name(format!("ade-daemon-freshness-{}", self.host.destination))
+            .spawn(move || match self.local_binary() {
+                Ok((_, local_hash)) => self.note_hash_verdict(local_hash != remote_hash),
+                Err(error) => log::warn!(
+                    "{}: cannot tell whether the daemon is behind: {error:#}",
+                    self.host.destination
+                ),
+            });
+        if let Err(error) = spawned {
+            log::warn!("cannot spawn the daemon freshness thread: {error}");
         }
     }
 
@@ -4747,7 +4725,7 @@ mod control_connection {
 
 #[cfg(test)]
 mod daemon_hash_tests {
-    use super::{daemon_hash, daemon_platform};
+    use super::daemon_hash;
 
     /// A daemon from before binary identity: two tokens, nothing else. The
     /// missing hash is what keeps the upgrade path away from it.
@@ -4777,21 +4755,6 @@ mod daemon_hash_tests {
             None
         );
     }
-
-    #[test]
-    fn platform_is_optional_and_strict() {
-        assert_eq!(daemon_platform("ade-daemon 0.1.0"), None);
-        assert_eq!(
-            daemon_platform("ade-daemon 0.1.0 platform=aarch64-unknown-linux-musl")
-                .expect("a supported platform")
-                .target_triple(),
-            "aarch64-unknown-linux-musl"
-        );
-        assert_eq!(
-            daemon_platform("ade-daemon 0.1.0 platform=x86_64-pc-windows-msvc"),
-            None
-        );
-    }
 }
 
 /// What the sidebar's "upgrade host daemon" arrow is drawn from.
@@ -4804,46 +4767,6 @@ mod daemon_freshness_tests {
             ade_session::SshHost::new("fevm1"),
             LocalEndpoint::Loopback(0),
         )
-    }
-
-    fn elf(machine: u16) -> Vec<u8> {
-        let mut bytes = vec![0; 64 + 56];
-        bytes[..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[6] = 1;
-        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
-        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
-        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
-        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn prebuilt_freshness_requires_a_matching_reported_platform() {
-        let x86 = elf(62);
-        let hash = ade_session::sha256_hex(&x86);
-        assert_eq!(
-            prebuilt_freshness(
-                &format!("ade-daemon 0.1.0 hash={hash} platform=x86_64-unknown-linux-musl"),
-                &x86
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            prebuilt_freshness(
-                &format!("ade-daemon 0.1.0 hash={hash} platform=aarch64-unknown-linux-musl"),
-                &x86
-            ),
-            None
-        );
-        assert_eq!(
-            prebuilt_freshness(&format!("ade-daemon 0.1.0 hash={hash}"), &x86),
-            None
-        );
     }
 
     /// The three states the arrow is drawn from, in the order a host moves
@@ -4884,10 +4807,16 @@ mod daemon_freshness_tests {
         assert_eq!(announced(), 1, "a probe that confirms it is not");
         link.note_hash_verdict(false);
         assert_eq!(announced(), 2, "and the upgrade is news again");
-        link.forget_hash_verdict();
-        assert_eq!(announced(), 3, "losing the comparison is news");
-        link.forget_hash_verdict();
-        assert_eq!(announced(), 3, "remaining unknown is not");
+    }
+
+    /// A daemon that cannot say which build it is predates binary identity,
+    /// so it is behind every client that asks — no comparison needed, and no
+    /// thread: the verdict is readable before the connect goes on.
+    #[test]
+    fn a_daemon_without_a_hash_is_behind_by_definition() {
+        let link = Arc::new(link());
+        Arc::clone(&link).note_freshness("ade-daemon 0.1.0");
+        assert!(link.daemon_stale());
     }
 
     /// The verdict is already recorded when the observer runs, because the
