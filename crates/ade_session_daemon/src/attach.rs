@@ -901,12 +901,54 @@ async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bo
         .is_ok()
 }
 
-async fn write_out(stdout: &mut Unblock<std::io::Stdout>, bytes: &[u8]) -> Result<()> {
-    stdout.write_all(bytes).await.context("writing to stdout")?;
+async fn write_out<W: std::io::Write + Send + 'static>(
+    stdout: &mut Unblock<W>,
+    bytes: &[u8],
+) -> Result<()> {
+    if let Err(error) = stdout.write_all(bytes).await {
+        // `Unblock` writes on a background task. When that write fails the
+        // task closes its pipe, the foreground sees `WriteZero`, and the real
+        // error waits for the next flush — so ask for it.
+        let error = stdout.flush().await.err().unwrap_or(error);
+        return Err(error).context("writing to stdout");
+    }
     // stdout is line buffered and pty output frequently carries no newline, so
     // an unflushed write would sit in the buffer until something else pushed a
     // newline through — i.e. the prompt would not appear.
     stdout.flush().await.context("flushing stdout")
+}
+
+#[cfg(test)]
+mod write_out_tests {
+    use super::*;
+
+    /// A writer that fails every write with a message the test can look for.
+    struct Failing;
+
+    impl std::io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the real error",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A payload larger than the pipe forces a second fill, which is where a
+    /// failed background write shows up as `WriteZero` rather than itself.
+    #[test]
+    fn a_failed_background_write_reports_the_real_error() {
+        let error = smol::block_on(async {
+            let mut stdout = Unblock::with_capacity(1024, Failing);
+            write_out(&mut stdout, &[b'x'; 4096]).await.unwrap_err()
+        });
+        let chain = format!("{error:#}");
+        assert!(chain.contains("the real error"), "{chain}");
+        assert!(!chain.contains("write zero"), "{chain}");
+    }
 }
 
 /// The Unix terminal: termios raw mode and SIGWINCH.
