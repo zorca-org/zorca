@@ -86,15 +86,16 @@ Rules:
   about. That covers both shapes of unmatchable: an error carrying no `rid`, and one
   echoing a `rid` the peer is not waiting on — with a single request outstanding the
   second is a bug in the sender, and reading it as the answer beats waiting out a bound
-  for a reply that has already been spent. That is the attach client between sending
-  `attach` and its first reply: `attach` is the only frame it has sent, and the error
-  frames it may send meanwhile are not requests and are never answered (bullet below), so
-  it fails the attach on any error naming this session or naming none, rather than
-  ignoring it (`await_replay`, `crates/ade_session_daemon/src/attach.rs`). The exception
-  closes the moment a second frame is in flight — once that same client is also sending
-  `write` and `resize`, an unmatchable rejection may name any of them, is the answer to
-  nothing the client is waiting on, and MUST NOT end the terminal. It is an exception
-  about *which one request* an error answers, never a licence to treat one as fatal.
+  for a reply that has already been spent. The attach client is **not** that peer: it
+  sends `resize` and then `attach` before its first reply, so two frames are in flight
+  from the start. Only an error echoing the attach's `rid` refuses the attach; an error
+  before the replay that echoes nothing answers the `resize` — a lost session has no pty
+  to take one — and is printed, not fatal (`await_replay`,
+  `crates/ade_session_daemon/src/attach.rs`). Once attached, the same client is also
+  sending `write` and `resize`: an unmatchable rejection may name any of them, is the
+  answer to nothing the client is waiting on, and MUST NOT end the terminal. The
+  exception is about *which one request* an error answers, never a licence to treat one
+  as fatal.
   `malformed_frame` is deliberately **outside** this class — but not because the stream
   has become unreadable. The length prefix was read and the payload was consumed, so the
   stream is still in sync; the prefix that genuinely would desync is a transport failure,

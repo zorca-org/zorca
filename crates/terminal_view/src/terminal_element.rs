@@ -1,7 +1,7 @@
 use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
     AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
-    Element, ElementId, Entity, FocusHandle, Focusable, Font, FontFeatures, FontStyle, FontWeight,
+    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
     GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
     IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
     Point as GpuiPoint, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
@@ -1083,11 +1083,9 @@ impl Element for TerminalElement {
                 let search_matches = self.terminal.read(cx).matches.clone();
 
                 let background_color = theme.colors().terminal_background;
-                let view_is_focused = self.terminal_view.focus_handle(cx).is_focused(window);
-
                 let (last_hovered_word, hover_tooltip) =
                     self.terminal.update(cx, |terminal, cx| {
-                        terminal.set_view_size(dimensions, view_is_focused);
+                        terminal.set_size(dimensions);
                         terminal.sync(window, cx);
 
                         if window.modifiers().secondary()

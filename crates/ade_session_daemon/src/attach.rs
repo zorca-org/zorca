@@ -12,7 +12,7 @@
 //! difference — the frames, the pumps and the tty handling are identical, and
 //! the connect is the one place that knows.
 //!
-//! Three rules shape it:
+//! Four rules shape it:
 //!
 //! - **It never starts a daemon.** Start-if-absent is [`crate::proxy`]'s one
 //!   piece of policy, and it exists because a proxy has a client behind it that
@@ -25,6 +25,12 @@
 //!   having no way to kill anything.
 //! - **The terminal is restored however it ends.** `RawMode` restores what it
 //!   saved from `Drop`, which covers the error paths and a panic alike.
+//! - **It owns the session's size.** The terminal this client runs in is the
+//!   terminal the session is drawn on, so its size is the pty's size, the way
+//!   an ssh or tmux client's is: reported before the attach so the replay is
+//!   painted at it, re-read after, and then on every change. Nothing else
+//!   reports a size, and no daemon needs to be told — `resize` is a
+//!   generation-one frame.
 //!
 //! One connection, one writer: input, focus and resize frames are queued on a
 //! channel and written by a single task, because two tasks writing one stream
@@ -87,16 +93,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
 /// A replay describes a fresh terminal, so re-establish that baseline first.
 const RESET_TERMINAL: &[u8] = b"\x1bc";
-
-fn reports_terminal_size(zed_term: bool) -> bool {
-    !zed_term
-}
-
-fn initial_terminal_size() -> Option<(u16, u16)> {
-    reports_terminal_size(std::env::var_os("ZED_TERM").is_some())
-        .then(terminal_size)
-        .flatten()
-}
 
 fn attach_hello(view_id: Option<&str>) -> Hello {
     match view_id {
@@ -456,7 +452,7 @@ where
     F: Future<Output = Result<(R, W)>>,
 {
     let mut stdout = Unblock::new(std::io::stdout());
-    let (mut daemon, mut writer) = connect_and_attach(&config, &connect, &mut stdout, false)
+    let (mut daemon, mut writer, size) = connect_and_attach(&config, &connect, &mut stdout, false)
         .await
         .map_err(|error| error.into_initial_error(&config.session_id))?;
 
@@ -464,9 +460,13 @@ where
     let raw = RawMode::enable();
     let (outbound, queued) = smol::channel::bounded::<QueuedFrame>(OUTBOUND_QUEUE_FRAMES);
     let input = smol::spawn(pump_input(outbound.clone(), config.session_id.clone()));
-    let resize = raw
-        .is_some()
-        .then(|| smol::spawn(pump_resize(outbound.clone(), config.session_id.clone())));
+    let resize = raw.is_some().then(|| {
+        smol::spawn(pump_resize(
+            outbound.clone(),
+            config.session_id.clone(),
+            size,
+        ))
+    });
 
     let mut generation = 0;
     let mut pending = None;
@@ -492,7 +492,7 @@ where
                 loop {
                     match connect_and_attach(&config, &connect, &mut stdout, true).await {
                         Ok(connection) => {
-                            (daemon, writer) = connection;
+                            (daemon, writer, _) = connection;
                             break;
                         }
                         Err(AttachFailure::Transport(error)) => {
@@ -527,12 +527,17 @@ where
 }
 
 /// Open one transport, attach, and paint the daemon's current screen.
+///
+/// `Resize` goes first, so the replay is painted at this terminal's size; the
+/// size sent is returned so the resize pump only reports changes to it. Only
+/// the attach is owed a reply, and its request id is what lets
+/// [`await_replay`] tell a refused attach from a refused resize.
 async fn connect_and_attach<R, W, C, F>(
     config: &AttachConfig,
     connect: &C,
     stdout: &mut Unblock<std::io::Stdout>,
     reconnecting: bool,
-) -> std::result::Result<(Connection<R>, Connection<W>), AttachFailure>
+) -> std::result::Result<(Connection<R>, Connection<W>, Option<(u16, u16)>), AttachFailure>
 where
     R: AsyncRead + AsyncWrite + Unpin,
     W: AsyncRead + AsyncWrite + Unpin,
@@ -542,7 +547,8 @@ where
     let (reader, writer, generation) = handshaken(config, connect, !reconnecting).await?;
     let mut daemon = Connection::new(reader);
     let mut writer = Connection::new(writer);
-    if let Some((cols, rows)) = initial_terminal_size() {
+    let size = terminal_size();
+    if let Some((cols, rows)) = size {
         writer
             .send(&Frame::Resize {
                 session_id: config.session_id.clone(),
@@ -576,7 +582,7 @@ where
         reconnecting,
     )
     .await?;
-    Ok((daemon, writer))
+    Ok((daemon, writer, size))
 }
 
 /// Wait for the attach to be answered, writing the replayed scrollback out.
@@ -824,17 +830,23 @@ async fn pump_input(outbound: Sender<QueuedFrame>, session_id: SessionId) {
     }
 }
 
-/// SIGWINCH → [`Frame::Resize`]. Re-send the mounted size after Attach so a
-/// layout completed between process spawn and this pump cannot be missed.
+/// SIGWINCH → [`Frame::Resize`]. `last` is the size sent ahead of the attach;
+/// the pump re-reads once after the handler is in, so neither a SIGWINCH that
+/// fired before there was a handler nor a layout that finished between spawn
+/// and attach is lost.
 #[cfg(unix)]
-async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
-    let Some(signals) = tty::winch_signals() else {
-        return;
-    };
-    let mut last = terminal_size();
-    if !send_size(&outbound, &session_id).await {
+async fn pump_resize(
+    outbound: Sender<QueuedFrame>,
+    session_id: SessionId,
+    mut last: Option<(u16, u16)>,
+) {
+    let signals = tty::winch_signals();
+    if !send_if_changed(&outbound, &session_id, &mut last).await {
         return;
     }
+    let Some(signals) = signals else {
+        return;
+    };
     let mut signals = Unblock::new(signals);
     let mut buffer = [0u8; 64];
     loop {
@@ -842,55 +854,45 @@ async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let size = terminal_size();
-        if size == last {
-            continue;
-        }
-        last = size;
-        if !send_size(&outbound, &session_id).await {
+        if !send_if_changed(&outbound, &session_id, &mut last).await {
             break;
         }
     }
 }
 
-/// A changed console size → [`Frame::Resize`]. Windows has no SIGWINCH, so the
-/// size is polled instead. Re-send the mounted size after Attach too.
-///
-/// Only *changes* are sent. A `Resize` costs the daemon a `TIOCSWINSZ` and the
-/// session a SIGWINCH, so resending the same size five times a second would
-/// have every attached agent redraw for nothing.
+/// The same pump, polled: Windows has no signal to be woken by.
 ///
 /// The sleep rides smol's blocking pool rather than a detached thread, for the
 /// same reason the pump is a task: dropping the task has to end the polling.
 /// (`smol::Timer` is disallowed workspace-wide, hence the blocking sleep.)
 #[cfg(windows)]
-async fn pump_resize(outbound: Sender<QueuedFrame>, session_id: SessionId) {
-    let mut last = terminal_size();
-    if !send_size(&outbound, &session_id).await {
-        return;
-    }
+async fn pump_resize(
+    outbound: Sender<QueuedFrame>,
+    session_id: SessionId,
+    mut last: Option<(u16, u16)>,
+) {
     loop {
-        smol::unblock(|| std::thread::sleep(RESIZE_POLL)).await;
-        let size = terminal_size();
-        if size == last {
-            continue;
-        }
-        last = size;
-        if !send_size(&outbound, &session_id).await {
+        if !send_if_changed(&outbound, &session_id, &mut last).await {
             break;
         }
+        smol::unblock(|| std::thread::sleep(RESIZE_POLL)).await;
     }
 }
 
-/// Queue the terminal's current size. `false` means the queue is closed and the
-/// caller should stop.
-async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bool {
-    let Some((cols, rows)) = terminal_size() else {
+/// Queue the terminal's size if it is not the one in `last`. `false` means the
+/// queue is closed and the caller should stop.
+///
+/// Only *changes* are sent: a `Resize` costs the daemon a `TIOCSWINSZ`, a
+/// repaint of every viewer and the session a SIGWINCH, so resending the same
+/// size would have every attached agent redraw for nothing.
+async fn send_if_changed(
+    outbound: &Sender<QueuedFrame>,
+    session_id: &SessionId,
+    last: &mut Option<(u16, u16)>,
+) -> bool {
+    let Some((cols, rows)) = size_change(last, terminal_size()) else {
         return true;
     };
-    if !reports_terminal_size(std::env::var_os("ZED_TERM").is_some()) {
-        return true;
-    }
     outbound
         .send(QueuedFrame::Persistent(Frame::Resize {
             session_id: session_id.clone(),
@@ -899,6 +901,13 @@ async fn send_size(outbound: &Sender<QueuedFrame>, session_id: &SessionId) -> bo
         }))
         .await
         .is_ok()
+}
+
+/// `size` if it is known and differs from `last`, which then becomes it.
+fn size_change(last: &mut Option<(u16, u16)>, size: Option<(u16, u16)>) -> Option<(u16, u16)> {
+    let changed = size.filter(|_| size != *last)?;
+    *last = size;
+    Some(changed)
 }
 
 async fn write_out<W: std::io::Write + Send + 'static>(
@@ -1329,9 +1338,15 @@ mod handshake_tests {
     use super::*;
 
     #[test]
-    fn zed_leaves_terminal_sizing_to_the_host_ui() {
-        assert!(!reports_terminal_size(true));
-        assert!(reports_terminal_size(false));
+    fn a_size_is_reported_once_and_again_only_when_it_changes() {
+        let mut last = Some((80, 24));
+        assert_eq!(size_change(&mut last, Some((80, 24))), None);
+        assert_eq!(size_change(&mut last, None), None);
+        assert_eq!(size_change(&mut last, Some((100, 40))), Some((100, 40)));
+        assert_eq!(last, Some((100, 40)));
+        assert_eq!(size_change(&mut last, Some((100, 40))), None);
+        let mut unknown = None;
+        assert_eq!(size_change(&mut unknown, Some((80, 24))), Some((80, 24)));
     }
 
     #[test]
