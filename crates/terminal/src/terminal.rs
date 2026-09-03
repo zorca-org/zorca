@@ -997,7 +997,6 @@ impl TerminalBuilder {
                 terminal_bounds,
                 ..Default::default()
             },
-            view_bounds: Some(terminal_bounds),
             last_mouse: None,
             mouse_down_position: None,
             matches: Vec::new(),
@@ -1268,7 +1267,6 @@ impl TerminalBuilder {
                 title_override: terminal_title_override,
                 events: VecDeque::with_capacity(10), //Should never get this high.
                 last_content: Default::default(),
-                view_bounds: None,
                 last_mouse: None,
                 mouse_down_position: None,
                 matches: Vec::new(),
@@ -1477,7 +1475,6 @@ pub struct Terminal {
     mouse_down_position: Option<GpuiPoint<Pixels>>,
     pub matches: Vec<Range>,
     pub last_content: Content,
-    view_bounds: Option<TerminalBounds>,
     pub selection_head: Option<Point>,
 
     pub breadcrumb_text: String,
@@ -2024,25 +2021,6 @@ impl Terminal {
             Some(InternalEvent::Resize(pending_bounds)) => *pending_bounds = new_bounds,
             _ => self.events.push_back(InternalEvent::Resize(new_bounds)),
         }
-    }
-
-    /// Keep a daemon-owned session at its last active size while its view is unfocused.
-    /// The first measured size must still replace the debug-size PTY that a
-    /// restored terminal starts with before its pane can receive focus.
-    pub fn set_view_size(&mut self, new_bounds: TerminalBounds, view_is_focused: bool) {
-        self.view_bounds = Some(normalize_terminal_bounds(new_bounds));
-        if !view_is_focused
-            && self.is_ade_session()
-            && self.last_content.terminal_bounds != TerminalBounds::default()
-        {
-            return;
-        }
-        self.set_size(new_bounds);
-    }
-
-    pub fn view_size(&self) -> Option<(u16, u16)> {
-        self.view_bounds
-            .map(|bounds| (bounds.num_columns() as u16, bounds.num_lines() as u16))
     }
 
     /// Write the Input payload to the PTY, if applicable.
@@ -4334,47 +4312,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_ade_session_accepts_its_initial_unfocused_view_size(cx: &mut TestAppContext) {
-        let builder = cx.update(|cx| {
-            TerminalBuilder::new_display_only(
-                SettingsCursorShape::Block,
-                AlternateScroll::On,
-                None,
-                0,
-                cx.background_executor(),
-                PathStyle::local(),
-            )
-        });
-        let mut terminal = builder.terminal;
-        let (_, completion_rx) = async_channel::unbounded();
-        terminal.task = Some(TaskState {
-            status: TaskStatus::Running,
-            completion_rx,
-            spawned_task: SpawnInTerminal {
-                id: TaskId(format!("{ADE_SESSION_TASK_PREFIX}test")),
-                ..Default::default()
-            },
-        });
-
-        let initial_bounds = TerminalBounds {
-            cell_width: Pixels::from(10.),
-            line_height: Pixels::from(10.),
-            bounds: bounds(
-                GpuiPoint::default(),
-                size(Pixels::from(800.), Pixels::from(600.)),
-            ),
-        };
-        terminal.set_view_size(initial_bounds, false);
-
-        assert_eq!(terminal.last_content.terminal_bounds, initial_bounds);
-        assert!(matches!(
-            terminal.events.back(),
-            Some(InternalEvent::Resize(bounds)) if *bounds == initial_bounds
-        ));
-    }
-
-    #[gpui::test]
-    async fn test_ade_session_ignores_unfocused_view_changes(cx: &mut TestAppContext) {
+    async fn test_ade_session_suppresses_focus_sequences(cx: &mut TestAppContext) {
         let builder = cx.update(|cx| {
             TerminalBuilder::new_display_only(
                 SettingsCursorShape::Block,
@@ -4397,36 +4335,10 @@ mod tests {
         });
         terminal.last_content.mode = Modes::FOCUS_IN_OUT;
 
-        let base_bounds = TerminalBounds {
-            cell_width: Pixels::from(10.),
-            line_height: Pixels::from(10.),
-            bounds: bounds(
-                GpuiPoint::default(),
-                size(Pixels::from(100.), Pixels::from(100.)),
-            ),
-        };
-        terminal.set_view_size(base_bounds, true);
-        terminal.events.clear();
-
-        let mut background_bounds = base_bounds;
-        background_bounds.bounds.size.width = Pixels::from(80.);
-        terminal.set_view_size(background_bounds, false);
-        assert!(terminal.events.is_empty());
-        assert_eq!(terminal.last_content.terminal_bounds, base_bounds);
-        assert_eq!(terminal.view_size(), Some((8, 10)));
-
         terminal.focus_out();
         terminal.focus_in();
-
         assert!(terminal.take_pty_write_log().is_empty());
 
-        terminal.set_view_size(background_bounds, true);
-        assert!(matches!(
-            terminal.events.back(),
-            Some(InternalEvent::Resize(bounds)) if *bounds == background_bounds
-        ));
-
-        terminal.events.clear();
         let (_, completion_rx) = async_channel::unbounded();
         terminal.task = Some(TaskState {
             status: TaskStatus::Running,
@@ -4436,14 +4348,8 @@ mod tests {
                 ..Default::default()
             },
         });
-        terminal.set_view_size(base_bounds, false);
         terminal.focus_out();
         terminal.focus_in();
-
-        assert!(matches!(
-            terminal.events.back(),
-            Some(InternalEvent::Resize(bounds)) if *bounds == base_bounds
-        ));
         assert_eq!(
             terminal.take_pty_write_log(),
             vec![b"\x1b[O".to_vec(), b"\x1b[I".to_vec()]

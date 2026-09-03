@@ -27,10 +27,9 @@ use crate::{
 };
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, Context, Entity, Focusable, Global, Task, WeakEntity,
-    Window,
+    AppContext as _, AsyncWindowContext, Context, Entity, Global, Task, WeakEntity, Window,
 };
-use std::{collections::HashMap, path::PathBuf, rc::Rc};
+use std::{collections::HashMap, path::PathBuf};
 use task::SpawnInTerminal;
 use terminal_view::TerminalView;
 use workspace::{Pane, Workspace};
@@ -92,14 +91,12 @@ pub fn open_workspace_terminal(
         )));
     }
 
-    let session_id = attached.session_id.clone();
     let spawn_task = match attach_spawn_task(ade_workspace, attached) {
         Ok(spawn_task) => spawn_task,
         Err(error) => return Task::ready(Err(error)),
     };
     let id = ade_workspace.id.clone();
     let title = ade_workspace.name.clone();
-    let ade_workspace = ade_workspace.clone();
     let project = zed_workspace.project().downgrade();
 
     cx.spawn_in(window, async move |zed_workspace, cx| {
@@ -128,7 +125,6 @@ pub fn open_workspace_terminal(
             AdeWorkspaceStore::global(cx).update(cx, |store, cx| {
                 store.follow_session_title(id.clone(), &terminal_view, cx);
             });
-            request_active_resize(&terminal_view, &session_id, &ade_workspace, window, cx);
 
             let focus_item = !zed_workspace.has_active_modal(window, cx);
             zed_workspace.add_item_to_active_pane(
@@ -262,48 +258,10 @@ pub(crate) async fn create_session_terminal(
         AdeWorkspaceStore::global(cx).update(cx, |store, cx| {
             store.follow_session_title(workspace_id, &terminal_view, cx);
         });
-        request_active_resize(&terminal_view, session_id, ade_workspace, window, cx);
         terminal_view
     })?;
 
     Ok(terminal_view)
-}
-
-fn request_active_resize(
-    terminal_view: &Entity<TerminalView>,
-    session_id: &str,
-    ade_workspace: &AdeWorkspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let focus_handle = terminal_view.focus_handle(cx);
-    let resize = {
-        let ade_workspace = ade_workspace.clone();
-        let session_id = session_id.to_owned();
-        Rc::new(move |size: Option<(u16, u16)>, cx: &mut App| {
-            let Some((cols, rows)) = size else {
-                return Task::ready(());
-            };
-            let lifecycle = crate::lifecycle_service(cx);
-            let ade_workspace = ade_workspace.clone();
-            let session_id = session_id.clone();
-            cx.background_spawn(async move {
-                if let Err(error) =
-                    lifecycle.resize_session(&ade_workspace, &session_id, cols, rows)
-                {
-                    log::warn!("session {session_id} could not follow the active size: {error:#}");
-                }
-            })
-        })
-    };
-    terminal_view.update(cx, |terminal_view, cx| {
-        let event_resize = resize.clone();
-        terminal_view.set_resize_callback(move |size, cx| event_resize(size, cx));
-        cx.on_focus(&focus_handle, window, move |terminal_view, _, cx| {
-            terminal_view.request_resize(true, cx)
-        })
-        .detach();
-    });
 }
 
 /// The spawn description for one session attach — and, through

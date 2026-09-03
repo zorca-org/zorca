@@ -521,31 +521,6 @@ impl DaemonBackend {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn notify(&self, expected_daemon_id: Option<&str>, frame: Frame) -> Result<()> {
-        let mut slot = self.connection.lock().unwrap_or_else(|e| e.into_inner());
-        let outcome = smol::block_on(async {
-            if slot.as_ref().is_some_and(|control| {
-                !identity_admits(expected_daemon_id, control.instance_id.as_deref())
-            }) {
-                *slot = None;
-                self.endpoint.on_connection_lost();
-            }
-            let control = match slot.as_mut() {
-                Some(control) => control,
-                None => slot.insert(self.endpoint.connect().await?),
-            };
-            if !identity_admits(expected_daemon_id, control.instance_id.as_deref()) {
-                bail!("the terminal view belongs to another daemon");
-            }
-            control.connection.send(&frame).await
-        });
-        if outcome.is_err() {
-            *slot = None;
-            self.endpoint.on_connection_lost();
-        }
-        outcome
-    }
-
     /// Replace this host's daemon binary now, because a human asked for it.
     ///
     /// This is the only path that compares, replaces, or builds a daemon that
@@ -979,24 +954,6 @@ impl SessionBackend for DaemonBackend {
         expected_daemon_id: Option<&str>,
     ) -> Result<Vec<String>> {
         Ok(self.session_argv(&proto::SessionId::new(session_id), expected_daemon_id))
-    }
-
-    fn resize_session(
-        &self,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-        expected_daemon_id: Option<&str>,
-    ) -> Result<()> {
-        self.notify(
-            expected_daemon_id,
-            Frame::Resize {
-                session_id: proto::SessionId::new(session_id),
-                cols,
-                rows,
-            },
-        )
-        .with_context(|| format!("resizing daemon session {session_id} to {cols}x{rows}"))
     }
 
     fn open_workspace(
@@ -4280,23 +4237,6 @@ mod control_connection {
     fn instance_id_is_none_before_any_handshake() {
         let backend = scripted_daemon(Vec::new());
         assert_eq!(backend.instance_id(), None);
-    }
-
-    #[test]
-    fn active_resize_is_sent_on_generation_two() {
-        let (seen, frames) = std::sync::mpsc::channel();
-        let backend = scripted_daemon(vec![Script::Watched(None, seen)]);
-        backend
-            .resize_session("session-1", 120, 42, None)
-            .expect("sending resize");
-        assert!(matches!(
-            frames.recv_timeout(Duration::from_secs(1)).expect("resize frame"),
-            Frame::Resize {
-                session_id,
-                cols: 120,
-                rows: 42,
-            } if session_id == proto::SessionId::new("session-1")
-        ));
     }
 
     #[test]
