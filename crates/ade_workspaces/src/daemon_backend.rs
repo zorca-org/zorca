@@ -1960,7 +1960,7 @@ impl Endpoint {
         // Shared for observation only; requests use `Control::instance_id`.
         *self.identity.lock().unwrap_or_else(|e| e.into_inner()) = ack.instance_id.clone();
         if let Some((link, ensure_line)) = freshness_probe {
-            link.note_prebuilt_freshness(&ensure_line);
+            link.note_freshness(&ensure_line);
         }
         Ok(Control {
             connection,
@@ -2319,6 +2319,8 @@ fn daemon_hash(line: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The daemon's own platform from an `--ensure` line. Absent from daemons
+/// that predate the token; strict otherwise, never a guess.
 fn daemon_platform(line: &str) -> Option<ade_session::HostPlatform> {
     line.split_whitespace()
         .find_map(|token| {
@@ -2329,11 +2331,31 @@ fn daemon_platform(line: &str) -> Option<ade_session::HostPlatform> {
         .and_then(ade_session::HostPlatform::from_target_triple)
 }
 
-fn prebuilt_freshness(ensure_line: &str, binary: &[u8]) -> Option<bool> {
-    let remote_hash = daemon_hash(ensure_line)?;
-    let platform = daemon_platform(ensure_line)?;
-    ade_session::daemon_binary_matches_platform(binary, &platform)
-        .then(|| ade_session::sha256_hex(binary) != remote_hash)
+/// The host's platform: from the ensure line when the daemon reports it,
+/// else one ssh round trip.
+fn host_platform(
+    host: &ade_session::SshHost,
+    ensure_line: &str,
+) -> Result<ade_session::HostPlatform> {
+    match daemon_platform(ensure_line) {
+        Some(platform) => Ok(platform),
+        None => ade_session::HostPlatform::probe(host)
+            .with_context(|| format!("asking {} what platform it is", host.destination)),
+    }
+}
+
+/// This client's own daemon binary for `platform`, with its hash: a cargo
+/// build that is a no-op unless the daemon's sources changed. Never on the
+/// main thread.
+fn local_binary(platform: &ade_session::HostPlatform) -> Result<(Vec<u8>, String)> {
+    let binary = ade_session::daemon_binary(platform).with_context(|| {
+        format!(
+            "getting an ade-daemon binary for {}",
+            platform.target_triple()
+        )
+    })?;
+    let hash = ade_session::sha256_hex(&binary);
+    Ok((binary, hash))
 }
 
 /// One remote host's single ssh connection, and everything needed to bring it
@@ -2346,12 +2368,12 @@ struct HostLink {
     local: LocalEndpoint,
     state: Mutex<HostLinkState>,
     /// Whether the host's daemon is behind this client's:
-    /// `FRESHNESS_UNKNOWN` until a hash comparison says otherwise, and still
-    /// that for a daemon too old to report a hash at all.
+    /// `FRESHNESS_UNKNOWN` until a comparison says otherwise. A daemon too old
+    /// to report a hash is behind without one.
     ///
-    /// Written only by [`HostLink::note_hash_verdict`], after comparing a
-    /// configured prebuilt binary or completing the operator's own upgrade.
-    /// Read by the sidebar, to decide whether to offer that upgrade.
+    /// Written only by [`HostLink::note_hash_verdict`], from a probe
+    /// ([`HostLink::note_freshness`]) at connect or from the operator's own
+    /// upgrade. Read by the sidebar, to decide whether to offer that upgrade.
     ///
     /// **Deliberately not in [`HostLinkState`], and deliberately lock-free.**
     /// That mutex is held across `--ensure`, ssh round trips and a possible
@@ -2362,6 +2384,13 @@ struct HostLink {
     /// Who to tell when [`Self::daemon_freshness`] changes, so the sidebar
     /// redraws on the probe rather than on the user's next unrelated click.
     freshness_observers: FreshnessObservers,
+    /// Bumped by every new comparison. A probe thread reports only while it
+    /// is the newest: a slow build started by an earlier connect must not
+    /// overwrite what a later connect, or the operator's upgrade, found.
+    freshness_generation: AtomicU64,
+    /// The remote hash the held verdict was compared against, so a reconnect
+    /// to the same daemon reuses the verdict instead of building again.
+    compared_hash: Mutex<Option<String>>,
 }
 
 /// No probe has said anything yet, which is not the same as "up to date" but
@@ -2428,6 +2457,8 @@ impl HostLink {
             state: Mutex::new(HostLinkState::default()),
             daemon_freshness: AtomicU8::new(FRESHNESS_UNKNOWN),
             freshness_observers: FreshnessObservers::default(),
+            freshness_generation: AtomicU64::new(0),
+            compared_hash: Mutex::new(None),
         }
     }
 
@@ -2446,6 +2477,8 @@ impl HostLink {
             }),
             daemon_freshness: AtomicU8::new(FRESHNESS_UNKNOWN),
             freshness_observers: FreshnessObservers::default(),
+            freshness_generation: AtomicU64::new(0),
+            compared_hash: Mutex::new(None),
         }
     }
 
@@ -2532,7 +2565,9 @@ impl HostLink {
         if self.daemon_freshness.swap(value, Ordering::Relaxed) == value {
             return;
         }
-        log::debug!(
+        // `info`: this client logs nothing below it, and one line per host per
+        // change is the whole record of why the arrow is or is not drawn.
+        log::info!(
             "{}: daemon is {}",
             self.host.destination,
             if stale { "behind" } else { "current" }
@@ -2540,15 +2575,35 @@ impl HostLink {
         self.freshness_observers.announce();
     }
 
-    fn forget_hash_verdict(&self) {
-        if self
-            .daemon_freshness
-            .swap(FRESHNESS_UNKNOWN, Ordering::Relaxed)
-            == FRESHNESS_UNKNOWN
-        {
+    /// [`Self::note_hash_verdict`] for a comparison against `remote_hash`,
+    /// remembered so the same daemon is not compared twice. Answers whether
+    /// the daemon is behind.
+    fn note_comparison(&self, local_hash: &str, remote_hash: &str) -> bool {
+        let stale = local_hash != remote_hash;
+        *self
+            .compared_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(remote_hash.to_owned());
+        self.note_hash_verdict(stale);
+        stale
+    }
+
+    /// What a probe thread found, kept only while it is the newest probe. A
+    /// comparison that fails leaves the last verdict standing rather than
+    /// clearing it.
+    fn note_probe(&self, generation: u64, remote_hash: &str, local_hash: Result<String>) {
+        if self.freshness_generation.load(Ordering::Relaxed) != generation {
             return;
         }
-        self.freshness_observers.announce();
+        match local_hash {
+            Ok(local_hash) => {
+                self.note_comparison(&local_hash, remote_hash);
+            }
+            Err(error) => log::warn!(
+                "{}: cannot tell whether the daemon is behind: {error:#}",
+                self.host.destination
+            ),
+        }
     }
 
     /// Whether this host's daemon is known to be behind the client. `false`
@@ -2563,28 +2618,49 @@ impl HostLink {
         self.freshness_observers.add(observer);
     }
 
-    /// Compare only a caller-supplied binary that matches this host.
-    fn note_prebuilt_freshness(&self, ensure_line: &str) {
-        let Some(path) = std::env::var_os(ade_session::DAEMON_BINARY_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-        else {
-            self.forget_hash_verdict();
+    /// Record whether the daemon behind `ensure_line` is behind this client,
+    /// so the sidebar can offer the upgrade.
+    ///
+    /// A daemon too old to report a hash is older than every client that reads
+    /// one: that verdict is immediate. A daemon already compared is not
+    /// compared again. Otherwise the answer is the binary this client would
+    /// deploy ([`local_binary`], a cargo build that is a no-op once warm),
+    /// compared on a thread of its own — the connect never waits for it, and
+    /// the sidebar redraws through the freshness observers when the verdict
+    /// lands. The thread holds the link weakly, so it never delays the ssh
+    /// teardown at quit.
+    // ponytail: the remembered verdict outlives a daemon rebuild during this
+    // process; the operator's upgrade click always compares afresh.
+    fn note_freshness(self: &Arc<Self>, ensure_line: &str) {
+        let Some(remote_hash) = daemon_hash(ensure_line) else {
+            self.note_hash_verdict(true);
             return;
         };
-        match std::fs::read(&path) {
-            Ok(binary) => match prebuilt_freshness(ensure_line, &binary) {
-                Some(stale) => self.note_hash_verdict(stale),
-                None => self.forget_hash_verdict(),
-            },
-            Err(error) => {
-                self.forget_hash_verdict();
-                log::warn!(
-                    "{}: cannot read the configured daemon binary at {}: {error}",
-                    self.host.destination,
-                    path.display()
-                );
-            }
+        if self
+            .compared_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_deref()
+            == Some(remote_hash.as_str())
+        {
+            return;
+        }
+        let generation = self.freshness_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let host = self.host.clone();
+        let ensure_line = ensure_line.to_owned();
+        let link = Arc::downgrade(self);
+        let spawned = std::thread::Builder::new()
+            .name(format!("ade-daemon-freshness-{}", host.destination))
+            .spawn(move || {
+                let local_hash = host_platform(&host, &ensure_line)
+                    .and_then(|platform| local_binary(&platform))
+                    .map(|(_, hash)| hash);
+                if let Some(link) = link.upgrade() {
+                    link.note_probe(generation, &remote_hash, local_hash);
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("cannot spawn the daemon freshness thread: {error}");
         }
     }
 
@@ -2661,29 +2737,14 @@ impl HostLink {
                 self.host.destination
             );
         };
-        let outcome = self.upgrade_to_local_binary(&paths, &remote_hash)?;
+        let platform = host_platform(&self.host, &line)?;
+        // This comparison outranks any probe still building.
+        self.freshness_generation.fetch_add(1, Ordering::Relaxed);
+        let outcome = self.upgrade_to_local_binary(&paths, &remote_hash, &platform)?;
         if outcome == DaemonUpgradeOutcome::Upgraded {
             self.ensure_after_upgrade(&paths)?;
         }
         Ok(outcome)
-    }
-
-    /// This client's own daemon binary for the host's platform, with its hash.
-    ///
-    /// One ssh round trip for the platform and one `daemon_binary`, which is a
-    /// cargo build that is a no-op unless the daemon's sources changed. Never
-    /// on the main thread: every caller already runs off it.
-    fn local_binary(&self) -> Result<(Vec<u8>, String)> {
-        let platform = ade_session::HostPlatform::probe(&self.host)
-            .with_context(|| format!("asking {} what platform it is", self.host.destination))?;
-        let binary = ade_session::daemon_binary(&platform).with_context(|| {
-            format!(
-                "getting an ade-daemon binary for {}",
-                platform.target_triple()
-            )
-        })?;
-        let hash = ade_session::sha256_hex(&binary);
-        Ok((binary, hash))
     }
 
     /// The actual swap: build/obtain our binary, compare hashes, ask the
@@ -2698,10 +2759,10 @@ impl HostLink {
         &self,
         paths: &RemotePaths,
         remote_hash: &str,
+        platform: &ade_session::HostPlatform,
     ) -> Result<DaemonUpgradeOutcome> {
-        let (binary, local_hash) = self.local_binary()?;
-        self.note_hash_verdict(local_hash != remote_hash);
-        if local_hash == remote_hash {
+        let (binary, local_hash) = local_binary(platform)?;
+        if !self.note_comparison(&local_hash, remote_hash) {
             log::debug!(
                 "{}: daemon is exactly this build ({})",
                 self.host.destination,
@@ -2735,7 +2796,7 @@ impl HostLink {
         );
         // These are this client's own bytes, so the question is settled until
         // the next probe asks it again.
-        self.note_hash_verdict(false);
+        self.note_comparison(&local_hash, &local_hash);
         Ok(DaemonUpgradeOutcome::Upgraded)
     }
 
@@ -4749,6 +4810,21 @@ mod control_connection {
 mod daemon_hash_tests {
     use super::{daemon_hash, daemon_platform};
 
+    #[test]
+    fn platform_is_optional_and_strict() {
+        assert_eq!(daemon_platform("ade-daemon 0.1.0"), None);
+        assert_eq!(
+            daemon_platform("ade-daemon 0.1.0 platform=aarch64-unknown-linux-musl")
+                .expect("a supported platform")
+                .target_triple(),
+            "aarch64-unknown-linux-musl"
+        );
+        assert_eq!(
+            daemon_platform("ade-daemon 0.1.0 platform=x86_64-pc-windows-msvc"),
+            None
+        );
+    }
+
     /// A daemon from before binary identity: two tokens, nothing else. The
     /// missing hash is what keeps the upgrade path away from it.
     #[test]
@@ -4777,21 +4853,6 @@ mod daemon_hash_tests {
             None
         );
     }
-
-    #[test]
-    fn platform_is_optional_and_strict() {
-        assert_eq!(daemon_platform("ade-daemon 0.1.0"), None);
-        assert_eq!(
-            daemon_platform("ade-daemon 0.1.0 platform=aarch64-unknown-linux-musl")
-                .expect("a supported platform")
-                .target_triple(),
-            "aarch64-unknown-linux-musl"
-        );
-        assert_eq!(
-            daemon_platform("ade-daemon 0.1.0 platform=x86_64-pc-windows-msvc"),
-            None
-        );
-    }
 }
 
 /// What the sidebar's "upgrade host daemon" arrow is drawn from.
@@ -4804,46 +4865,6 @@ mod daemon_freshness_tests {
             ade_session::SshHost::new("fevm1"),
             LocalEndpoint::Loopback(0),
         )
-    }
-
-    fn elf(machine: u16) -> Vec<u8> {
-        let mut bytes = vec![0; 64 + 56];
-        bytes[..4].copy_from_slice(b"\x7fELF");
-        bytes[4] = 2;
-        bytes[5] = 1;
-        bytes[6] = 1;
-        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
-        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
-        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
-        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
-        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
-        bytes
-    }
-
-    #[test]
-    fn prebuilt_freshness_requires_a_matching_reported_platform() {
-        let x86 = elf(62);
-        let hash = ade_session::sha256_hex(&x86);
-        assert_eq!(
-            prebuilt_freshness(
-                &format!("ade-daemon 0.1.0 hash={hash} platform=x86_64-unknown-linux-musl"),
-                &x86
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            prebuilt_freshness(
-                &format!("ade-daemon 0.1.0 hash={hash} platform=aarch64-unknown-linux-musl"),
-                &x86
-            ),
-            None
-        );
-        assert_eq!(
-            prebuilt_freshness(&format!("ade-daemon 0.1.0 hash={hash}"), &x86),
-            None
-        );
     }
 
     /// The three states the arrow is drawn from, in the order a host moves
@@ -4884,10 +4905,59 @@ mod daemon_freshness_tests {
         assert_eq!(announced(), 1, "a probe that confirms it is not");
         link.note_hash_verdict(false);
         assert_eq!(announced(), 2, "and the upgrade is news again");
-        link.forget_hash_verdict();
-        assert_eq!(announced(), 3, "losing the comparison is news");
-        link.forget_hash_verdict();
-        assert_eq!(announced(), 3, "remaining unknown is not");
+    }
+
+    /// A daemon that cannot say which build it is predates binary identity,
+    /// so it is behind every client that asks — no comparison needed, and no
+    /// thread: the verdict is readable before the connect goes on.
+    #[test]
+    fn a_daemon_without_a_hash_is_behind_by_definition() {
+        let link = Arc::new(link());
+        link.note_freshness("ade-daemon 0.1.0");
+        assert!(link.daemon_stale());
+    }
+
+    /// The compare itself, fed what the probe thread would have built: a
+    /// different hash is behind, the same hash is current, and a build that
+    /// failed says nothing.
+    #[test]
+    fn a_probe_compares_hashes_and_a_failed_one_keeps_the_verdict() {
+        let link = link();
+        let generation = link.freshness_generation.load(Ordering::Relaxed);
+        link.note_probe(generation, "b", Ok("a".to_owned()));
+        assert!(link.daemon_stale());
+        link.note_probe(generation, "b", Err(anyhow::anyhow!("cargo is on strike")));
+        assert!(link.daemon_stale(), "a failed compare changes nothing");
+        link.note_probe(generation, "b", Ok("b".to_owned()));
+        assert!(!link.daemon_stale());
+    }
+
+    /// A probe from an earlier connect that finishes after a later one must
+    /// not overwrite the newer verdict: the sidebar would show an update the
+    /// operator just installed.
+    #[test]
+    fn only_the_newest_probe_is_heard() {
+        let link = link();
+        let old = link.freshness_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let new = link.freshness_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        link.note_probe(new, "b", Ok("b".to_owned()));
+        link.note_probe(old, "b", Ok("a".to_owned()));
+        assert!(!link.daemon_stale(), "the straggler is dropped");
+    }
+
+    /// Reconnecting to the daemon already compared spawns no build: the
+    /// generation does not move, so no probe was started.
+    #[test]
+    fn a_daemon_already_compared_is_not_compared_again() {
+        let link = Arc::new(link());
+        assert!(link.note_comparison("a", "b"));
+        let generation = link.freshness_generation.load(Ordering::Relaxed);
+        link.note_freshness("ade-daemon 0.1.0 hash=b");
+        assert_eq!(
+            link.freshness_generation.load(Ordering::Relaxed),
+            generation
+        );
+        assert!(link.daemon_stale(), "and the verdict stands");
     }
 
     /// The verdict is already recorded when the observer runs, because the
