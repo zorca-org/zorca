@@ -167,13 +167,17 @@ pub fn open_connection_workspace(
     // the window already shows: a restored layout gives the user something to
     // look at while a slow host connects; an empty window owes them a shell
     // fast, and a connection opened with no folder at all never grows a
-    // worktree, which the short deadline turns into the plain terminal.
+    // worktree, which the short deadline turns into the plain terminal. The
+    // short deadline covers only the worktree's absence: a large remote tree
+    // reports its identity seconds after its root, and giving up then leaves
+    // the window on a plain shell with nothing set to retry (seen on
+    // prime-form, 2026-09-14).
     let restored = workspace
         .panes()
         .iter()
         .any(|pane| pane.read(cx).items_len() > 0);
     let root_deadline = if restored {
-        std::time::Duration::from_secs(120)
+        IDENTITY_DEADLINE
     } else {
         std::time::Duration::from_secs(3)
     };
@@ -424,9 +428,15 @@ async fn offer_incompatible_daemon_upgrade(
     Ok(true)
 }
 
+/// How long a worktree may take to report its identity once it exists. A
+/// remote worktree sends its git root and completed scan only with the last
+/// scan update, which for a large tree is many seconds behind the first entry.
+const IDENTITY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The first visible worktree's root, awaited because a restored window loads
 /// its worktrees after the workspace exists. `None` means the deadline passed
-/// with the project still rootless.
+/// with the project still rootless — `deadline` bounds only the wait for a
+/// worktree to appear; once one exists, its identity gets [`IDENTITY_DEADLINE`].
 struct ProjectScope {
     repository_path: std::path::PathBuf,
     project_id: String,
@@ -440,33 +450,43 @@ async fn wait_for_project_root(
 ) -> Option<ProjectScope> {
     let poll = std::time::Duration::from_millis(250);
     let mut waited = std::time::Duration::ZERO;
+    let mut deadline = deadline;
     loop {
-        let scope = this
+        let (has_worktree, scope) = this
             .update(cx, |workspace, cx| {
                 let project = workspace.project().read(cx);
-                let repository_path = project
+                let Some(repository_path) = project
                     .visible_worktrees(cx)
                     .next()
-                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())?;
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                else {
+                    return (false, None);
+                };
                 if !workspace.project_group_identity_is_known(cx) {
-                    return None;
+                    return (true, None);
                 }
                 let project_group_key = project.project_group_key(cx);
                 let project_identity = project_group_key.path_list().serialize().paths;
                 if project_identity.is_empty() {
-                    return None;
+                    return (true, None);
                 }
-                Some(ProjectScope {
-                    repository_path,
-                    project_id: project_group_key
-                        .display_name(&Default::default())
-                        .to_string(),
-                    project_identity,
-                })
+                (
+                    true,
+                    Some(ProjectScope {
+                        repository_path,
+                        project_id: project_group_key
+                            .display_name(&Default::default())
+                            .to_string(),
+                        project_identity,
+                    }),
+                )
             })
             .ok()?;
         if let Some(scope) = scope {
             return Some(scope);
+        }
+        if has_worktree {
+            deadline = deadline.max(IDENTITY_DEADLINE);
         }
         if waited >= deadline {
             return None;
