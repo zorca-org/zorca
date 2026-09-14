@@ -168,10 +168,9 @@ pub fn open_connection_workspace(
     // look at while a slow host connects; an empty window owes them a shell
     // fast, and a connection opened with no folder at all never grows a
     // worktree, which the short deadline turns into the plain terminal. The
-    // short deadline covers only the worktree's absence: a large remote tree
-    // reports its identity seconds after its root, and giving up then leaves
-    // the window on a plain shell with nothing set to retry (seen on
-    // prime-form, 2026-09-14).
+    // deadline covers only the worktree's absence: its identity comes from
+    // the daemon when a previous connect stored one, and otherwise from the
+    // scan, which for a large remote tree lands seconds after the root.
     let restored = workspace
         .panes()
         .iter()
@@ -184,7 +183,7 @@ pub fn open_connection_workspace(
 
     let lifecycle = crate::lifecycle_service(cx);
     cx.spawn_in(window, async move |this, cx| {
-        let Some(project_scope) = wait_for_project_root(&this, root_deadline, cx).await else {
+        let Some(repository_path) = wait_for_worktree_root(&this, root_deadline, cx).await else {
             log::info!(
                 "ADE waited {root_deadline:?} for {label}'s project root; \
                  releasing the claim so a later caller can try again"
@@ -192,9 +191,6 @@ pub fn open_connection_workspace(
             give_up_on_window(window_id, &this, cx);
             return;
         };
-        let repository_path = project_scope.repository_path;
-        let project_id = project_scope.project_id;
-        let project_identity = project_scope.project_identity;
         // Connecting with nothing but `~` filled in is how the remote picker
         // behaves before a folder is chosen; a workspace rooted at the whole
         // account is not a project (operator ruling, 2026-08-05). The same
@@ -291,6 +287,26 @@ pub fn open_connection_workspace(
             }
         };
 
+        // The identity a previous connection wrote for this root is good
+        // enough to open on; the scan that recomputes it can take a large
+        // remote tree many seconds, and a known project must not wait for it.
+        // The scan's answer still lands, after the open, below.
+        let known_scope = known_project_scope(ssh.as_ref(), &workspaces, &repository_path);
+        let (project_id, project_identity) = match known_scope.clone() {
+            Some(scope) => scope,
+            None => match wait_for_project_identity(&this, cx).await {
+                Some(scope) => scope,
+                None => {
+                    log::info!(
+                        "ADE waited {IDENTITY_DEADLINE:?} for {label}'s project identity; \
+                         releasing the claim so a later caller can try again"
+                    );
+                    give_up_on_window(window_id, &this, cx);
+                    return;
+                }
+            },
+        };
+
         // Give every candidate the connection's canonical project identity
         // before the resolver re-lists and chooses one under the daemon lock.
         let persisted_ids = workspaces
@@ -376,6 +392,7 @@ pub fn open_connection_workspace(
                 }
             })
             .await;
+        let opened_id = resolved.as_ref().ok().map(|(workspace, _)| workspace.id.clone());
         let opened = match resolved {
             Ok((created, true)) => open_in_window(&this, created.id, cx).await,
             Ok((existing, false)) => open_or_recreate(&this, &lifecycle, existing, cx).await,
@@ -390,6 +407,36 @@ pub fn open_connection_workspace(
         }
         cx.update(|_, cx| complete_window_claim(window_id, &claim, cx))
             .log_err();
+
+        // A repo that moved since the daemon last saw it: the scan is the
+        // authority, the daemon's copy was only a head start.
+        let (Some(id), Some(known)) = (opened_id, known_scope) else {
+            return;
+        };
+        let Some(scanned) = wait_for_project_identity(&this, cx).await else {
+            return;
+        };
+        if scanned == known {
+            return;
+        }
+        log::info!("ADE corrects {label}'s stored project identity from the scan");
+        let corrected = cx
+            .background_spawn(async move {
+                lifecycle
+                    .update_workspace_project_scope(&id, &scanned.0, &scanned.1)
+                    .await
+            })
+            .await;
+        if let Err(error) = corrected {
+            log::warn!("correcting ADE project identity for {label} failed: {error:#}");
+            return;
+        }
+        cx.update(|_, cx| {
+            if let Some(store) = AdeWorkspaceStore::try_global(cx) {
+                store.update(cx, |store, cx| store.refresh(cx));
+            }
+        })
+        .ok();
     })
     .detach();
     true
@@ -433,67 +480,116 @@ async fn offer_incompatible_daemon_upgrade(
 /// scan update, which for a large tree is many seconds behind the first entry.
 const IDENTITY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
+const ROOT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The first visible worktree's root, awaited because a restored window loads
 /// its worktrees after the workspace exists. `None` means the deadline passed
-/// with the project still rootless — `deadline` bounds only the wait for a
-/// worktree to appear; once one exists, its identity gets [`IDENTITY_DEADLINE`].
-struct ProjectScope {
-    repository_path: std::path::PathBuf,
-    project_id: String,
-    project_identity: String,
-}
-
-async fn wait_for_project_root(
+/// with the project still rootless.
+async fn wait_for_worktree_root(
     this: &WeakEntity<Workspace>,
     deadline: std::time::Duration,
     cx: &mut AsyncWindowContext,
-) -> Option<ProjectScope> {
-    let poll = std::time::Duration::from_millis(250);
+) -> Option<std::path::PathBuf> {
     let mut waited = std::time::Duration::ZERO;
-    let mut deadline = deadline;
     loop {
-        let (has_worktree, scope) = this
+        let root = this
             .update(cx, |workspace, cx| {
-                let project = workspace.project().read(cx);
-                let Some(repository_path) = project
+                workspace
+                    .project()
+                    .read(cx)
                     .visible_worktrees(cx)
                     .next()
                     .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                else {
-                    return (false, None);
-                };
-                if !workspace.project_group_identity_is_known(cx) {
-                    return (true, None);
-                }
-                let project_group_key = project.project_group_key(cx);
-                let project_identity = project_group_key.path_list().serialize().paths;
-                if project_identity.is_empty() {
-                    return (true, None);
-                }
-                (
-                    true,
-                    Some(ProjectScope {
-                        repository_path,
-                        project_id: project_group_key
-                            .display_name(&Default::default())
-                            .to_string(),
-                        project_identity,
-                    }),
-                )
             })
             .ok()?;
-        if let Some(scope) = scope {
-            return Some(scope);
-        }
-        if has_worktree {
-            deadline = deadline.max(IDENTITY_DEADLINE);
+        if let Some(root) = root {
+            return Some(root);
         }
         if waited >= deadline {
             return None;
         }
-        cx.background_executor().timer(poll).await;
-        waited += poll;
+        cx.background_executor().timer(ROOT_POLL).await;
+        waited += ROOT_POLL;
     }
+}
+
+/// The project's `(project_id, project_identity)` as the scan derives it —
+/// `None` past [`IDENTITY_DEADLINE`].
+async fn wait_for_project_identity(
+    this: &WeakEntity<Workspace>,
+    cx: &mut AsyncWindowContext,
+) -> Option<(String, String)> {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let scope = this
+            .update(cx, |workspace, cx| {
+                if !workspace.project_group_identity_is_known(cx) {
+                    return None;
+                }
+                let project_group_key = workspace.project().read(cx).project_group_key(cx);
+                let project_identity = project_group_key.path_list().serialize().paths;
+                if project_identity.is_empty() {
+                    return None;
+                }
+                Some((
+                    project_group_key
+                        .display_name(&Default::default())
+                        .to_string(),
+                    project_identity,
+                ))
+            })
+            .ok()?;
+        if scope.is_some() {
+            return scope;
+        }
+        if waited >= IDENTITY_DEADLINE {
+            return None;
+        }
+        cx.background_executor().timer(ROOT_POLL).await;
+        waited += ROOT_POLL;
+    }
+}
+
+/// The `(project_id, project_identity)` a listing already holds for `root` on
+/// this connection — written by an earlier connect's scan. A persisted row
+/// beats a discovery, and an entry with no identity yet contributes nothing.
+fn known_project_scope(
+    ssh: Option<&SshConnectionOptions>,
+    workspaces: &[WorkspaceEntry],
+    root: &Path,
+) -> Option<(String, String)> {
+    let persisted = workspaces
+        .iter()
+        .filter_map(WorkspaceEntry::persisted)
+        .map(|(workspace, _)| workspace)
+        .filter(|workspace| {
+            persisted_workspace_matches_connection(ssh, workspace)
+                && workspace.repository_path == root
+        })
+        .filter_map(|workspace| {
+            Some((
+                workspace.project_id.clone(),
+                workspace.project_identity.clone()?,
+            ))
+        });
+    let discovered = workspaces.iter().filter_map(|entry| match entry {
+        WorkspaceEntry::Discovered {
+            remote_host,
+            workspace,
+            ..
+        } if workspace_matches_connection(ssh, remote_host.as_deref())
+            && Path::new(&workspace.project_root) == root =>
+        {
+            Some((
+                workspace.project_id.clone()?,
+                workspace.project_identity.clone()?,
+            ))
+        }
+        _ => None,
+    });
+    persisted
+        .chain(discovered)
+        .find(|(id, identity)| !id.is_empty() && !identity.is_empty())
 }
 
 /// Opens workspace `id` in this window through the one entry point every
@@ -1125,18 +1221,95 @@ mod tests {
         });
 
         let workspace = workspace.downgrade();
-        let scope = window
+        let (root, scope) = window
             .update(|window, cx| {
                 window.spawn(cx, async move |cx| {
-                    wait_for_project_root(&workspace, std::time::Duration::ZERO, cx).await
+                    let root =
+                        wait_for_worktree_root(&workspace, std::time::Duration::ZERO, cx).await;
+                    (root, wait_for_project_identity(&workspace, cx).await)
                 })
             })
-            .await
-            .expect("the scanned project has a canonical scope");
+            .await;
+        let scope = scope.expect("the scanned project has a canonical scope");
 
-        assert_eq!(scope.repository_path, Path::new("/repo"));
-        assert_eq!(scope.project_id, "repo");
-        assert_eq!(scope.project_identity, "/repo");
+        assert_eq!(root.as_deref(), Some(Path::new("/repo")));
+        assert_eq!(scope.0, "repo");
+        assert_eq!(scope.1, "/repo");
+    }
+
+    #[test]
+    fn test_a_known_identity_comes_from_the_listing_before_the_scan() {
+        let host = Some("kingii@prime-form".to_owned());
+        let mut scoped = AdeWorkspace::new("main", "commerce", "/home/kingii/commerce");
+        scoped.remote_host = host.clone();
+        scoped.project_identity = Some("/home/kingii/commerce".to_owned());
+        let mut unscoped = AdeWorkspace::new("main", "commerce", "/home/kingii/commerce");
+        unscoped.remote_host = host.clone();
+        let mut elsewhere = AdeWorkspace::new("main", "other", "/home/kingii/other");
+        elsewhere.remote_host = host.clone();
+        elsewhere.project_identity = Some("/home/kingii/other".to_owned());
+        let discovered =
+            |project_id: Option<&str>, identity: Option<&str>| WorkspaceEntry::Discovered {
+                remote_host: host.clone(),
+                workspace: crate::session_backend::BackendWorkspace {
+                    id: "w1".to_owned(),
+                    name: "main".to_owned(),
+                    project_id: project_id.map(str::to_owned),
+                    project_identity: identity.map(str::to_owned),
+                    project_root: "/home/kingii/commerce".to_owned(),
+                    project_scope_rev: 0,
+                    created_at: 0,
+                },
+                state: SessionState::Unknown,
+            };
+        let prime_form = ssh("prime-form", Some("kingii"), None);
+        let root = Path::new("/home/kingii/commerce");
+        let persisted =
+            |row: &AdeWorkspace| WorkspaceEntry::Persisted(row.clone(), SessionState::Unknown);
+
+        // Nothing at this root carries an identity: wait for the scan.
+        assert_eq!(
+            known_project_scope(
+                Some(&prime_form),
+                &[
+                    persisted(&unscoped),
+                    persisted(&elsewhere),
+                    discovered(Some("commerce"), None)
+                ],
+                root
+            ),
+            None
+        );
+        // A discovery with both halves is enough.
+        assert_eq!(
+            known_project_scope(
+                Some(&prime_form),
+                &[discovered(Some("commerce"), Some("/home/kingii/commerce"))],
+                root
+            ),
+            Some(("commerce".to_owned(), "/home/kingii/commerce".to_owned()))
+        );
+        // A row on another connection is not this project.
+        assert_eq!(
+            known_project_scope(
+                Some(&ssh("elsewhere", None, None)),
+                &[persisted(&scoped)],
+                root
+            ),
+            None
+        );
+        // A persisted row wins over a discovery.
+        assert_eq!(
+            known_project_scope(
+                Some(&prime_form),
+                &[
+                    discovered(Some("stale"), Some("/stale")),
+                    persisted(&scoped)
+                ],
+                root
+            ),
+            Some(("commerce".to_owned(), "/home/kingii/commerce".to_owned()))
+        );
     }
 
     #[gpui::test]
