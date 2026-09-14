@@ -1356,14 +1356,43 @@ async fn restore_or_create_workspace_for_session(
                     );
                     let state = multi_workspace.state.clone();
                     async {
-                        let window = open_remote_project(
+                        // The stored project list shows before the host answers.
+                        let window = recent_projects::open_empty_multi_workspace_window(
                             connection_options.clone(),
-                            paths,
-                            app_state.clone(),
-                            workspace::OpenOptions::default(),
+                            &paths,
+                            &app_state,
                             cx,
                         )
                         .await?;
+                        workspace::preview_restored_multiworkspace_state(
+                            window,
+                            &state,
+                            &active_project_group,
+                            app_state.fs.clone(),
+                            cx,
+                        )
+                        .await;
+                        let opened = open_remote_project(
+                            connection_options.clone(),
+                            paths,
+                            app_state.clone(),
+                            workspace::OpenOptions {
+                                requesting_window: Some(window),
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                        .await;
+                        window
+                            .update(cx, |multi_workspace, _, cx| {
+                                multi_workspace.set_project_group_connecting(
+                                    &active_project_group,
+                                    false,
+                                    cx,
+                                )
+                            })
+                            .ok();
+                        let window = opened?;
                         let opened_host = window.update(cx, |multi_workspace, _, cx| {
                             multi_workspace
                                 .workspace()

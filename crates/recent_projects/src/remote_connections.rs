@@ -128,6 +128,47 @@ impl Settings for RemoteSettings {
     }
 }
 
+/// Opens the window a remote project lands in, at its stored position, with
+/// an empty local workspace until the connection replaces it.
+pub async fn open_empty_multi_workspace_window(
+    connection_options: RemoteConnectionOptions,
+    paths: &[PathBuf],
+    app_state: &Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<WindowHandle<MultiWorkspace>> {
+    let workspace_position = cx
+        .update(|cx| workspace::remote_workspace_position_from_db(connection_options, paths, cx))
+        .await
+        .context("fetching remote workspace position from db")?;
+
+    let mut options =
+        cx.update(|cx| (app_state.build_window_options)(workspace_position.display, cx));
+    options.window_bounds = workspace_position.window_bounds;
+
+    let app_state = app_state.clone();
+    cx.open_window(options, |window, cx| {
+        let project = project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        );
+        let workspace = cx.new(|cx| {
+            let mut workspace = Workspace::new(None, project, app_state.clone(), window, cx);
+            workspace.centered_layout = workspace_position.centered_layout;
+            workspace
+        });
+        cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+    })
+}
+
 pub async fn open_remote_project(
     connection_options: RemoteConnectionOptions,
     paths: Vec<PathBuf>,
@@ -206,49 +247,16 @@ pub async fn open_remote_project(
 
     app_state.node_runtime.wait_for_shell_environment().await;
 
-    let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
-        let workspace = window.update(cx, |multi_workspace, _, _| {
-            multi_workspace.workspace().clone()
-        })?;
-        (window, workspace)
-    } else {
-        let workspace_position = cx
-            .update(|cx| {
-                workspace::remote_workspace_position_from_db(connection_options.clone(), &paths, cx)
-            })
-            .await
-            .context("fetching remote workspace position from db")?;
-
-        let mut options =
-            cx.update(|cx| (app_state.build_window_options)(workspace_position.display, cx));
-        options.window_bounds = workspace_position.window_bounds;
-
-        let window = cx.open_window(options, |window, cx| {
-            let project = project::Project::local(
-                app_state.client.clone(),
-                app_state.node_runtime.clone(),
-                app_state.user_store.clone(),
-                app_state.languages.clone(),
-                app_state.fs.clone(),
-                None,
-                project::LocalProjectFlags {
-                    init_worktree_trust: false,
-                    ..Default::default()
-                },
-                cx,
-            );
-            let workspace = cx.new(|cx| {
-                let mut workspace = Workspace::new(None, project, app_state.clone(), window, cx);
-                workspace.centered_layout = workspace_position.centered_layout;
-                workspace
-            });
-            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
-        })?;
-        let workspace = window.update(cx, |multi_workspace, _, _cx| {
-            multi_workspace.workspace().clone()
-        })?;
-        (window, workspace)
+    let window = match open_options.requesting_window {
+        Some(window) => window,
+        None => {
+            open_empty_multi_workspace_window(connection_options.clone(), &paths, &app_state, cx)
+                .await?
+        }
     };
+    let initial_workspace = window.update(cx, |multi_workspace, _, _| {
+        multi_workspace.workspace().clone()
+    })?;
 
     loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();

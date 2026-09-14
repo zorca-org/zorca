@@ -1242,7 +1242,7 @@ impl Sidebar {
             .map(|workspace| workspace.read(cx).project_group_key(cx))
             .collect();
         for key in closed_project_groups(&open_keys, group_keys) {
-            if key.host().is_some() {
+            if key.host().is_some() && !multi_workspace.read(cx).project_group_is_connecting(&key) {
                 self.open_workspace_for_group(&key, OpenMode::Add, window, cx);
             }
         }
