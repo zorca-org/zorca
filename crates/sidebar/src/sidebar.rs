@@ -505,8 +505,8 @@ fn workspace_has_terminal_metadata_except(
         .any(|terminal| except_terminal_id != Some(terminal.terminal_id))
 }
 
-/// Shows a [`RemoteConnectionModal`] on the given workspace and establishes
-/// an SSH connection. Suitable for passing to
+/// Establishes an SSH connection; a modal appears on the given workspace
+/// only if ssh asks a question. Suitable for passing to
 /// [`MultiWorkspace::find_or_create_workspace`] as the `connect_remote`
 /// argument.
 fn connect_remote(
