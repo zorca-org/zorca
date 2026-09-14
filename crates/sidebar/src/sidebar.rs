@@ -541,6 +541,8 @@ pub struct Sidebar {
     /// Set when the user asks to add a project, so the workspace that add
     /// produces opens a terminal while restored ones do not.
     open_terminal_for_next_workspace: bool,
+    /// Set once the startup pass reopened the closed remote groups.
+    startup_reconnect_done: bool,
     /// User-created groups, in display order.
     workspace_groups: Vec<SerializedWorkspaceGroup>,
     /// Roots of the worktrees the user pinned, in pin order.
@@ -771,10 +773,11 @@ impl Sidebar {
         // reattach pass the event path runs; the flow claims each window once,
         // so a workspace seen both ways still runs once.
         let workspace = multi_workspace.read(cx).workspace().clone();
-        cx.defer_in(window, move |_, window, cx| {
+        cx.defer_in(window, move |this, window, cx| {
             workspace.update(cx, |workspace, cx| {
                 ade_workspaces::open_connection_workspace(workspace, window, cx);
             });
+            this.reconnect_closed_remote_groups(window, cx);
         });
 
         cx.subscribe(
@@ -854,6 +857,7 @@ impl Sidebar {
             pending_worktree_deletions: HashSet::default(),
             pending_worktree_renames: HashSet::default(),
             open_terminal_for_next_workspace: false,
+            startup_reconnect_done: false,
             workspace_groups: Vec::new(),
             pinned_worktrees: Vec::new(),
             unread_worktrees: Vec::new(),
@@ -1215,10 +1219,40 @@ impl Sidebar {
         }
     }
 
+    /// Reopens every remote group that shows as "Not connected", once per
+    /// window. A restored window reopens only its active workspace, so the
+    /// other hosts stay disconnected until this runs. Two call sites cover
+    /// both orders of sidebar creation and group restore; the flag makes the
+    /// second one a no-op, and a pass that saw no groups leaves it unset.
+    fn reconnect_closed_remote_groups(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.startup_reconnect_done {
+            return;
+        }
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+        let group_keys = multi_workspace.read(cx).project_group_keys();
+        if group_keys.is_empty() {
+            return;
+        }
+        self.startup_reconnect_done = true;
+        let open_keys: Vec<ProjectGroupKey> = multi_workspace
+            .read(cx)
+            .workspaces()
+            .map(|workspace| workspace.read(cx).project_group_key(cx))
+            .collect();
+        for key in closed_project_groups(&open_keys, group_keys) {
+            if key.host().is_some() {
+                self.open_workspace_for_group(&key, OpenMode::Add, window, cx);
+            }
+        }
+    }
+
     /// Opens a new workspace for a group that has no open workspaces.
     fn open_workspace_for_group(
         &mut self,
         project_group_key: &ProjectGroupKey,
+        open_mode: OpenMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1239,7 +1273,7 @@ impl Sidebar {
                 |options, window, cx| connect_remote(active_workspace, options, window, cx),
                 &[],
                 None,
-                OpenMode::Activate,
+                open_mode,
                 window,
                 cx,
             )
@@ -3408,7 +3442,7 @@ impl Sidebar {
                 multi_workspace.retain_active_workspace(cx);
             });
         } else {
-            self.open_workspace_for_group(&key, window, cx);
+            self.open_workspace_for_group(&key, OpenMode::Activate, window, cx);
         }
     }
 
@@ -3580,9 +3614,10 @@ impl WorkspaceSidebar for Sidebar {
     fn restore_serialized_state(
         &mut self,
         state: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reconnect_closed_remote_groups(window, cx);
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
