@@ -253,28 +253,24 @@ pub async fn open_remote_project(
     loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let delegate = window.update(cx, {
-            let paths = paths.clone();
             let connection_options = connection_options.clone();
             let initial_workspace = initial_workspace.clone();
             move |_multi_workspace: &mut MultiWorkspace, window, cx| {
                 window.activate_window();
                 initial_workspace.update(cx, |workspace, cx| {
                     workspace.hide_modal(window, cx);
-                    workspace.toggle_modal(window, cx, |window, cx| {
-                        RemoteConnectionModal::new(&connection_options, paths, window, cx)
-                    });
-
-                    let ui = workspace
-                        .active_modal::<RemoteConnectionModal>(cx)?
-                        .read(cx)
-                        .prompt
-                        .clone();
+                    let ui = RemoteConnectionPrompt::headless(
+                        &connection_options,
+                        &cx.entity(),
+                        window,
+                        cx,
+                    );
 
                     ui.update(cx, |ui, _cx| {
                         ui.set_cancellation_tx(cancel_tx);
                     });
 
-                    Some(Arc::new(RemoteClientDelegate::new(
+                    let delegate = Arc::new(RemoteClientDelegate::new(
                         window.window_handle(),
                         ui.downgrade(),
                         if let RemoteConnectionOptions::Ssh(options) = &connection_options {
@@ -285,12 +281,15 @@ pub async fn open_remote_project(
                         } else {
                             None
                         },
-                    )))
+                    ));
+                    (delegate, ui)
                 })
             }
         })?;
 
-        let Some(delegate) = delegate else { break };
+        // The prompt cancels the connection when dropped, so it lives for
+        // the whole attempt.
+        let (delegate, _ui) = delegate;
 
         let connection = remote::connect(connection_options.clone(), delegate.clone(), cx);
         let connection = select! {

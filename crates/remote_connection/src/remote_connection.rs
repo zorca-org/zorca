@@ -81,6 +81,22 @@ impl RemoteConnectionPrompt {
         }
     }
 
+    /// A prompt with no modal. Status lines go nowhere; the first ssh
+    /// question opens a [`RemoteConnectionModal`] on `workspace`. Dropping
+    /// the entity cancels the connection, so hold it while connecting.
+    pub fn headless(
+        connection_options: &RemoteConnectionOptions,
+        workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        let prompt = Self::for_connection(connection_options, window, cx);
+        prompt.update(cx, |prompt, _| {
+            prompt.modal_host = Some(workspace.downgrade())
+        });
+        prompt
+    }
+
     fn for_connection(
         connection_options: &RemoteConnectionOptions,
         window: &mut Window,
@@ -600,10 +616,7 @@ pub fn connect_with_modal(
         });
     }
 
-    let prompt = RemoteConnectionPrompt::for_connection(&connection_options, window, cx);
-    prompt.update(cx, |prompt, _| {
-        prompt.modal_host = Some(workspace.downgrade())
-    });
+    let prompt = RemoteConnectionPrompt::headless(&connection_options, workspace, window, cx);
     let task = connect(
         ConnectionIdentifier::setup(),
         connection_options,
