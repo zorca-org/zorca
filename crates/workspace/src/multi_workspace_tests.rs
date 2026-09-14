@@ -123,6 +123,49 @@ async fn test_restored_remote_groups_ignore_runtime_connection_fields(cx: &mut T
 }
 
 #[gpui::test]
+async fn test_project_group_connecting_flag_and_empty_group_removal(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+    let key = ProjectGroupKey::new(
+        Some(RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "example.test".into(),
+            ..Default::default()
+        })),
+        PathList::new(&[PathBuf::from("/remote/repo")]),
+    );
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.add_project_group(key.clone(), cx);
+        multi_workspace.set_project_group_connecting(&key, true, cx);
+        assert!(multi_workspace.project_group_is_connecting(&key));
+        // Setting twice does not need clearing twice.
+        multi_workspace.set_project_group_connecting(&key, true, cx);
+        multi_workspace.set_project_group_connecting(&key, false, cx);
+        assert!(!multi_workspace.project_group_is_connecting(&key));
+        multi_workspace.set_project_group_connecting(&key, false, cx);
+        assert!(!multi_workspace.project_group_is_connecting(&key));
+
+        assert!(
+            multi_workspace
+                .project_group_keys()
+                .iter()
+                .any(|k| k.matches(&key))
+        );
+        multi_workspace.remove_project_group_if_empty(&key, cx);
+        assert!(
+            !multi_workspace
+                .project_group_keys()
+                .iter()
+                .any(|k| k.matches(&key)),
+            "a group whose connect failed has no workspace and is removed"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_restored_active_workspace_uses_persisted_project_identity_before_discovery(
     cx: &mut TestAppContext,
 ) {

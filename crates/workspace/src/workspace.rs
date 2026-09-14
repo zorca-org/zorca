@@ -10055,20 +10055,46 @@ pub async fn restore_multiworkspace(
     Ok(window_handle)
 }
 
-pub async fn apply_restored_multiworkspace_state(
+/// Shows the stored project list on a fresh window before its active
+/// workspace's host has answered: the groups, the sidebar, and the active
+/// group marked as connecting so the sidebar's startup pass leaves it to the
+/// caller. [`apply_restored_multiworkspace_state`] still runs afterwards.
+pub async fn preview_restored_multiworkspace_state(
     window_handle: WindowHandle<MultiWorkspace>,
     state: &MultiWorkspaceState,
-    active_project_group: ProjectGroupKey,
+    active_project_group: &ProjectGroupKey,
     fs: Arc<dyn fs::Fs>,
     cx: &mut AsyncApp,
 ) {
-    let MultiWorkspaceState {
-        sidebar_open,
-        project_groups,
-        sidebar_state,
-        ..
-    } = state;
+    let resolved_groups = resolve_restored_project_groups(&state.project_groups, fs).await;
+    window_handle
+        .update(cx, |multi_workspace, window, cx| {
+            multi_workspace.restore_project_groups(
+                resolved_groups
+                    .into_iter()
+                    .map(|(group, _)| group)
+                    .collect(),
+                cx,
+            );
+            multi_workspace.add_project_group(active_project_group.clone(), cx);
+            multi_workspace.set_project_group_connecting(active_project_group, true, cx);
+            if state.sidebar_open {
+                multi_workspace.restore_open_sidebar(cx);
+            }
+            if let Some((sidebar, sidebar_state)) = multi_workspace
+                .sidebar()
+                .zip(state.sidebar_state.as_deref())
+            {
+                sidebar.restore_serialized_state(sidebar_state, window, cx);
+            }
+        })
+        .log_err();
+}
 
+async fn resolve_restored_project_groups(
+    project_groups: &[SerializedProjectGroup],
+    fs: Arc<dyn fs::Fs>,
+) -> Vec<(SerializedProjectGroupState, bool)> {
     let mut resolved_groups: Vec<(SerializedProjectGroupState, bool)> = Vec::new();
     if !project_groups.is_empty() {
         for serialized in project_groups.iter().cloned() {
@@ -10114,6 +10140,23 @@ pub async fn apply_restored_multiworkspace_state(
             }
         }
     }
+    resolved_groups
+}
+
+pub async fn apply_restored_multiworkspace_state(
+    window_handle: WindowHandle<MultiWorkspace>,
+    state: &MultiWorkspaceState,
+    active_project_group: ProjectGroupKey,
+    fs: Arc<dyn fs::Fs>,
+    cx: &mut AsyncApp,
+) {
+    let MultiWorkspaceState {
+        sidebar_open,
+        project_groups,
+        sidebar_state,
+        ..
+    } = state;
+    let resolved_groups = resolve_restored_project_groups(project_groups, fs).await;
 
     window_handle
         .update(cx, |multi_workspace, _window, cx| {

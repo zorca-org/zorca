@@ -311,6 +311,8 @@ pub struct MultiWorkspace {
     window_id: WindowId,
     retained_workspaces: Vec<Entity<Workspace>>,
     project_groups: Vec<ProjectGroupState>,
+    /// Groups whose host is being connected, for the sidebar to show progress.
+    connecting_project_groups: Vec<ProjectGroupKey>,
     active_workspace: Entity<Workspace>,
     /// Source of truth for which workspace is presented in this window, shared
     /// with each member `Workspace` so they can tell whether they own the
@@ -375,6 +377,7 @@ impl MultiWorkspace {
             window_id: window.window_handle().window_id(),
             retained_workspaces: Vec::new(),
             project_groups: Vec::new(),
+            connecting_project_groups: Vec::new(),
             active_workspace: workspace,
             active_workspace_id,
             sidebar: None,
@@ -934,6 +937,45 @@ impl MultiWorkspace {
         self.project_groups = restored;
     }
 
+    /// Registers a group before its workspace exists, so the sidebar shows
+    /// the project while its host connects.
+    pub fn add_project_group(&mut self, key: ProjectGroupKey, cx: &mut Context<Self>) {
+        let previous_len = self.project_groups.len();
+        self.ensure_project_group_state(key);
+        if self.project_groups.len() != previous_len {
+            cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            self.serialize(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn set_project_group_connecting(
+        &mut self,
+        key: &ProjectGroupKey,
+        connecting: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self
+            .connecting_project_groups
+            .iter()
+            .position(|group| group.matches(key));
+        match (index, connecting) {
+            (None, true) => self.connecting_project_groups.push(key.clone()),
+            (Some(index), false) => {
+                self.connecting_project_groups.remove(index);
+            }
+            _ => return,
+        }
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        cx.notify();
+    }
+
+    pub fn project_group_is_connecting(&self, key: &ProjectGroupKey) -> bool {
+        self.connecting_project_groups
+            .iter()
+            .any(|group| group.matches(key))
+    }
+
     pub fn project_group_keys(&self) -> Vec<ProjectGroupKey> {
         self.project_groups
             .iter()
@@ -1447,11 +1489,15 @@ impl MultiWorkspace {
 
         let app_state = self.workspace().read(cx).app_state().clone();
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+        let connecting_key = provisional_project_group_key.clone().unwrap_or_else(|| {
+            ProjectGroupKey::new(Some(connection_options.clone()), paths.clone())
+        });
+        self.set_project_group_connecting(&connecting_key, true, cx);
         let connect_task = connect_remote(connection_options.clone(), window, cx);
         let paths_vec = paths.paths().to_vec();
         let excluding = excluding.to_vec();
 
-        cx.spawn(async move |_this, cx| {
+        let open_task = cx.spawn(async move |_this, cx| {
             let session = connect_task
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
@@ -1567,6 +1613,14 @@ impl MultiWorkspace {
             )
             .await?;
             Ok(workspace)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = open_task.await;
+            this.update(cx, |this, cx| {
+                this.set_project_group_connecting(&connecting_key, false, cx)
+            })
+            .ok();
+            result
         })
     }
 

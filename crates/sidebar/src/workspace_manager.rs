@@ -126,6 +126,8 @@ pub enum WorktreeStatus {
     Active,
     /// The remote project has no connected workspace to inspect.
     Disconnected,
+    /// The remote project's host is being connected.
+    Connecting,
     /// Nothing is running here.
     #[default]
     Inactive,
@@ -880,6 +882,45 @@ pub fn filter_tree(tree: &mut WorkspaceTree, query: &str) {
     });
 }
 
+/// Shows progress on the closed rows of each group being connected. The
+/// "Not connected" placeholder is renamed; a row listed from the host's
+/// worktree cache keeps its name and, carrying the repository's key, matches
+/// on its own folder root.
+pub(crate) fn apply_connecting(tree: &mut WorkspaceTree, connecting: &[ProjectGroupKey]) {
+    if connecting.is_empty() {
+        return;
+    }
+    for worktree in tree
+        .groups
+        .iter_mut()
+        .flat_map(|group| group.projects.iter_mut())
+        .flat_map(|project| project.worktrees.iter_mut())
+    {
+        let Some(group_key) = worktree.group_key.as_ref() else {
+            continue;
+        };
+        if worktree.workspace.is_some() {
+            continue;
+        }
+        let folder_key = worktree.folder_root.as_ref().map(|root| {
+            ProjectGroupKey::new(group_key.host(), PathList::new(std::slice::from_ref(root)))
+        });
+        let matches = connecting.iter().any(|key| {
+            group_key.matches(key)
+                || folder_key
+                    .as_ref()
+                    .is_some_and(|folder| folder.matches(key))
+        });
+        if !matches {
+            continue;
+        }
+        if worktree.status == WorktreeStatus::Disconnected {
+            worktree.name = "Connecting…".into();
+        }
+        worktree.status = WorktreeStatus::Connecting;
+    }
+}
+
 /// Marks the worktrees the user has not caught up with.
 pub(crate) fn apply_unread(tree: &mut WorkspaceTree, unread_roots: &[ScopedPath]) {
     if unread_roots.is_empty() {
@@ -1039,6 +1080,7 @@ impl WorktreeStatus {
             Self::Inactive => Color::Muted,
             Self::Active => Color::Success,
             Self::Disconnected => Color::Warning,
+            Self::Connecting => Color::Accent,
         }
     }
 }
@@ -1139,9 +1181,16 @@ pub fn render_row(
             .size(IconSize::Small)
             .color(Color::Muted)
             .into_any_element(),
-        RowKind::Worktree(_) if is_loading => SpinnerLabel::new()
-            .size(LabelSize::Small)
-            .into_any_element(),
+        RowKind::Worktree(id)
+            if is_loading
+                || tree
+                    .worktree(*id)
+                    .is_some_and(|worktree| worktree.status == WorktreeStatus::Connecting) =>
+        {
+            SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element()
+        }
         RowKind::Worktree(id) => {
             let worktree = tree.worktree(*id);
             let color = match worktree {
@@ -1275,6 +1324,51 @@ mod tests {
             .into_iter()
             .map(|row| (row.depth, row.kind))
             .collect()
+    }
+
+    #[test]
+    fn test_apply_connecting_renames_placeholder_and_keeps_cached_row() {
+        let key = remote_key(1, "/src/repo/.worktrees/feature");
+        let mut tree = tree();
+        {
+            let placeholder = &mut tree.groups[0].projects[0].worktrees[0];
+            placeholder.name = "Not connected".into();
+            placeholder.status = WorktreeStatus::Disconnected;
+            placeholder.group_key = Some(key.clone());
+            placeholder.folder_root = Some(PathBuf::from("/src/repo/.worktrees/feature"));
+            // Listed from the worktree cache: the repository's key, its own root.
+            let cached = &mut tree.groups[0].projects[1].worktrees[0];
+            cached.name = "feature".into();
+            cached.group_key = Some(remote_key(1, "/src/repo"));
+            cached.folder_root = Some(PathBuf::from("/src/repo/.worktrees/feature"));
+        }
+
+        apply_connecting(&mut tree, std::slice::from_ref(&key));
+
+        let placeholder = &tree.groups[0].projects[0].worktrees[0];
+        assert_eq!(placeholder.status, WorktreeStatus::Connecting);
+        assert_eq!(placeholder.name.as_ref(), "Connecting…");
+        let cached = &tree.groups[0].projects[1].worktrees[0];
+        assert_eq!(cached.status, WorktreeStatus::Connecting);
+        assert_eq!(cached.name.as_ref(), "feature");
+    }
+
+    #[test]
+    fn test_apply_connecting_ignores_other_hosts_paths_and_open_rows() {
+        let mut tree = tree();
+        {
+            let closed = &mut tree.groups[0].projects[0].worktrees[0];
+            closed.status = WorktreeStatus::Disconnected;
+            closed.group_key = Some(remote_key(1, "/a"));
+            closed.folder_root = Some(PathBuf::from("/a"));
+        }
+
+        apply_connecting(&mut tree, &[remote_key(2, "/a"), remote_key(1, "/b")]);
+
+        assert_eq!(
+            tree.groups[0].projects[0].worktrees[0].status,
+            WorktreeStatus::Disconnected
+        );
     }
 
     #[test]
