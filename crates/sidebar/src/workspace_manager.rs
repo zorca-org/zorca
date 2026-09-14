@@ -126,6 +126,8 @@ pub enum WorktreeStatus {
     Active,
     /// The remote project has no connected workspace to inspect.
     Disconnected,
+    /// The remote project's host is being connected.
+    Connecting,
     /// Nothing is running here.
     #[default]
     Inactive,
@@ -880,6 +882,29 @@ pub fn filter_tree(tree: &mut WorkspaceTree, query: &str) {
     });
 }
 
+/// Turns the "Not connected" row of each group being connected into progress.
+pub(crate) fn apply_connecting(tree: &mut WorkspaceTree, connecting: &[ProjectGroupKey]) {
+    if connecting.is_empty() {
+        return;
+    }
+    for worktree in tree
+        .groups
+        .iter_mut()
+        .flat_map(|group| group.projects.iter_mut())
+        .flat_map(|project| project.worktrees.iter_mut())
+    {
+        if worktree.status == WorktreeStatus::Disconnected
+            && worktree
+                .group_key
+                .as_ref()
+                .is_some_and(|key| connecting.iter().any(|other| other.matches(key)))
+        {
+            worktree.status = WorktreeStatus::Connecting;
+            worktree.name = "Connecting…".into();
+        }
+    }
+}
+
 /// Marks the worktrees the user has not caught up with.
 pub(crate) fn apply_unread(tree: &mut WorkspaceTree, unread_roots: &[ScopedPath]) {
     if unread_roots.is_empty() {
@@ -1039,6 +1064,7 @@ impl WorktreeStatus {
             Self::Inactive => Color::Muted,
             Self::Active => Color::Success,
             Self::Disconnected => Color::Warning,
+            Self::Connecting => Color::Accent,
         }
     }
 }
@@ -1139,9 +1165,16 @@ pub fn render_row(
             .size(IconSize::Small)
             .color(Color::Muted)
             .into_any_element(),
-        RowKind::Worktree(_) if is_loading => SpinnerLabel::new()
-            .size(LabelSize::Small)
-            .into_any_element(),
+        RowKind::Worktree(id)
+            if is_loading
+                || tree
+                    .worktree(*id)
+                    .is_some_and(|worktree| worktree.status == WorktreeStatus::Connecting) =>
+        {
+            SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element()
+        }
         RowKind::Worktree(id) => {
             let worktree = tree.worktree(*id);
             let color = match worktree {

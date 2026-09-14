@@ -311,6 +311,8 @@ pub struct MultiWorkspace {
     window_id: WindowId,
     retained_workspaces: Vec<Entity<Workspace>>,
     project_groups: Vec<ProjectGroupState>,
+    /// Groups whose host is being connected, for the sidebar to show progress.
+    connecting_project_groups: Vec<ProjectGroupKey>,
     active_workspace: Entity<Workspace>,
     /// Source of truth for which workspace is presented in this window, shared
     /// with each member `Workspace` so they can tell whether they own the
@@ -375,6 +377,7 @@ impl MultiWorkspace {
             window_id: window.window_handle().window_id(),
             retained_workspaces: Vec::new(),
             project_groups: Vec::new(),
+            connecting_project_groups: Vec::new(),
             active_workspace: workspace,
             active_workspace_id,
             sidebar: None,
@@ -944,6 +947,33 @@ impl MultiWorkspace {
             self.serialize(cx);
             cx.notify();
         }
+    }
+
+    pub fn set_project_group_connecting(
+        &mut self,
+        key: &ProjectGroupKey,
+        connecting: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self
+            .connecting_project_groups
+            .iter()
+            .position(|group| group.matches(key));
+        match (index, connecting) {
+            (None, true) => self.connecting_project_groups.push(key.clone()),
+            (Some(index), false) => {
+                self.connecting_project_groups.remove(index);
+            }
+            _ => return,
+        }
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        cx.notify();
+    }
+
+    pub fn project_group_is_connecting(&self, key: &ProjectGroupKey) -> bool {
+        self.connecting_project_groups
+            .iter()
+            .any(|group| group.matches(key))
     }
 
     pub fn project_group_keys(&self) -> Vec<ProjectGroupKey> {

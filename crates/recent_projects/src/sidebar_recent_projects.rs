@@ -269,13 +269,42 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                             Some(connection.clone()),
                             recent_workspace.paths.clone(),
                         );
+                        let connecting_key = key.clone();
                         cx.defer(move |cx| {
                             handle
                                 .update(cx, |multi_workspace, _, cx| {
-                                    multi_workspace.add_project_group(key, cx)
+                                    multi_workspace.add_project_group(key.clone(), cx);
+                                    multi_workspace.set_project_group_connecting(&key, true, cx);
                                 })
                                 .log_err();
                         });
+                        cx.spawn_in(window, async move |_, cx| {
+                            let result = open_remote_project(
+                                connection.clone(),
+                                paths,
+                                app_state,
+                                open_options,
+                                cx,
+                            )
+                            .await;
+                            handle
+                                .update(cx, |multi_workspace, _, cx| {
+                                    multi_workspace.set_project_group_connecting(
+                                        &connecting_key,
+                                        false,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                            result
+                        })
+                        .detach_and_prompt_err(
+                            "Failed to open project",
+                            window,
+                            cx,
+                            |_, _, _| None,
+                        );
+                        return;
                     }
                     cx.spawn_in(window, async move |_, cx| {
                         open_remote_project(connection.clone(), paths, app_state, open_options, cx)
