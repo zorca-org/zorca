@@ -3617,7 +3617,11 @@ impl WorkspaceSidebar for Sidebar {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.reconnect_closed_remote_groups(window, cx);
+        // Called inside the MultiWorkspace update that restores the window;
+        // reading it here is a double lease.
+        cx.defer_in(window, |this, window, cx| {
+            this.reconnect_closed_remote_groups(window, cx)
+        });
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
