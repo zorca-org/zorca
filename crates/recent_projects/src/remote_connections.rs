@@ -261,6 +261,7 @@ pub async fn open_remote_project(
     loop {
         let (cancel_tx, mut cancel_rx) = oneshot::channel();
         let delegate = window.update(cx, {
+            let paths = paths.clone();
             let connection_options = connection_options.clone();
             let initial_workspace = initial_workspace.clone();
             move |_multi_workspace: &mut MultiWorkspace, window, cx| {
@@ -270,6 +271,7 @@ pub async fn open_remote_project(
                     let ui = RemoteConnectionPrompt::headless(
                         &connection_options,
                         &cx.entity(),
+                        paths,
                         window,
                         cx,
                     );

@@ -63,8 +63,8 @@ use theme_settings::load_user_theme;
 use util::ResultExt;
 use uuid::Uuid;
 use workspace::{
-    AppState, MultiWorkspace, ProjectGroupKey, SerializedWorkspaceLocation, SessionWorkspace,
-    Toast, WorkspaceSettings, WorkspaceStore, notifications::NotificationId,
+    AppState, MultiWorkspace, MultiWorkspaceState, ProjectGroupKey, SerializedWorkspaceLocation,
+    SessionWorkspace, Toast, WorkspaceSettings, WorkspaceStore, notifications::NotificationId,
     restore_multiworkspace,
 };
 use zed::{
@@ -1392,7 +1392,15 @@ async fn restore_or_create_workspace_for_session(
                                 )
                             })
                             .ok();
+                        let preview = window;
                         let window = opened?;
+                        // The connect lands in an earlier window when one
+                        // already shows this project.
+                        if window.window_id() != preview.window_id() {
+                            preview
+                                .update(cx, |_, window, _| window.remove_window())
+                                .ok();
+                        }
                         let opened_host = window.update(cx, |multi_workspace, _, cx| {
                             multi_workspace
                                 .workspace()
@@ -1407,6 +1415,12 @@ async fn restore_or_create_workspace_for_session(
                         ) {
                             anyhow::bail!("remote workspace restore was canceled");
                         }
+                        // The preview applied the sidebar state; applying it
+                        // again would undo changes made during the connect.
+                        let state = MultiWorkspaceState {
+                            sidebar_state: None,
+                            ..state
+                        };
                         workspace::apply_restored_multiworkspace_state(
                             window,
                             &state,

@@ -1489,11 +1489,15 @@ impl MultiWorkspace {
 
         let app_state = self.workspace().read(cx).app_state().clone();
         let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+        let connecting_key = provisional_project_group_key.clone().unwrap_or_else(|| {
+            ProjectGroupKey::new(Some(connection_options.clone()), paths.clone())
+        });
+        self.set_project_group_connecting(&connecting_key, true, cx);
         let connect_task = connect_remote(connection_options.clone(), window, cx);
         let paths_vec = paths.paths().to_vec();
         let excluding = excluding.to_vec();
 
-        cx.spawn(async move |_this, cx| {
+        let open_task = cx.spawn(async move |_this, cx| {
             let session = connect_task
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("Remote connection was cancelled"))?;
@@ -1609,6 +1613,14 @@ impl MultiWorkspace {
             )
             .await?;
             Ok(workspace)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = open_task.await;
+            this.update(cx, |this, cx| {
+                this.set_project_group_connecting(&connecting_key, false, cx)
+            })
+            .ok();
+            result
         })
     }
 

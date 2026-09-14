@@ -1264,12 +1264,8 @@ impl Sidebar {
         let provisional_key = Some(project_group_key.clone());
         let active_workspace = multi_workspace.read(cx).workspace().clone();
         let modal_workspace = active_workspace.clone();
-        let connecting_key = host.is_some().then(|| project_group_key.clone());
 
         let task = multi_workspace.update(cx, |this, cx| {
-            if let Some(key) = &connecting_key {
-                this.set_project_group_connecting(key, true, cx);
-            }
             this.find_or_create_workspace(
                 path_list,
                 host,
@@ -1286,11 +1282,6 @@ impl Sidebar {
         cx.spawn_in(window, async move |_this, cx| {
             let result = task.await;
             remote_connection::dismiss_connection_modal(&modal_workspace, cx);
-            if let Some(key) = connecting_key {
-                multi_workspace.update(cx, |this, cx| {
-                    this.set_project_group_connecting(&key, false, cx)
-                });
-            }
             result?;
             anyhow::Ok(())
         })

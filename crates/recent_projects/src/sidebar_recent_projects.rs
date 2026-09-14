@@ -293,7 +293,10 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                                         &connecting_key,
                                         false,
                                         cx,
-                                    )
+                                    );
+                                    // A cancelled connect also returns Ok.
+                                    multi_workspace
+                                        .remove_project_group_if_empty(&connecting_key, cx);
                                 })
                                 .ok();
                             result

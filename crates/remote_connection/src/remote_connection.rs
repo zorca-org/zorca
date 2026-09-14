@@ -32,9 +32,10 @@ pub struct RemoteConnectionPrompt {
     editor: Arc<dyn ErasedEditor>,
     is_password_prompt: bool,
     is_masked: bool,
-    /// Set for a headless prompt: the workspace that gets a modal the first
-    /// time ssh asks a question. Status-only connections never show one.
-    modal_host: Option<WeakEntity<Workspace>>,
+    /// Set for a headless prompt: the workspace that gets a modal, with the
+    /// paths its header names, the first time ssh asks a question.
+    /// Status-only connections never show one.
+    modal_host: Option<(WeakEntity<Workspace>, Vec<PathBuf>)>,
 }
 
 impl Drop for RemoteConnectionPrompt {
@@ -87,12 +88,13 @@ impl RemoteConnectionPrompt {
     pub fn headless(
         connection_options: &RemoteConnectionOptions,
         workspace: &Entity<Workspace>,
+        paths: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
         let prompt = Self::for_connection(connection_options, window, cx);
         prompt.update(cx, |prompt, _| {
-            prompt.modal_host = Some(workspace.downgrade())
+            prompt.modal_host = Some((workspace.downgrade(), paths))
         });
         prompt
     }
@@ -149,15 +151,27 @@ impl RemoteConnectionPrompt {
         let markdown = cx.new(|cx| Markdown::new_text(prompt.into(), cx));
         self.prompt = Some((markdown, tx));
         self.status_message.take();
-        if let Some(workspace) = self.modal_host.take().and_then(|host| host.upgrade()) {
+        if let Some((host, paths)) = self.modal_host.take() {
             let prompt = cx.entity();
-            workspace.update(cx, |workspace, cx| {
-                workspace.toggle_modal(window, cx, |_, _| RemoteConnectionModal {
-                    prompt,
-                    paths: Vec::new(),
-                    finished: false,
+            let modal_paths = paths.clone();
+            let shown = host.upgrade().is_some_and(|workspace| {
+                workspace.update(cx, |workspace, cx| {
+                    let modal_prompt = prompt.clone();
+                    workspace.toggle_modal(window, cx, |_, _| RemoteConnectionModal {
+                        prompt: modal_prompt,
+                        paths: modal_paths,
+                        finished: false,
+                    });
+                    workspace
+                        .active_modal::<RemoteConnectionModal>(cx)
+                        .is_some_and(|modal| modal.read(cx).prompt == prompt)
                 })
             });
+            // `toggle_modal` shows nothing while another modal refuses to
+            // close; the next question tries again.
+            if !shown {
+                self.modal_host = Some((host, paths));
+            }
         }
         window.focus(&self.editor.focus_handle(cx), cx);
         cx.notify();
@@ -616,7 +630,8 @@ pub fn connect_with_modal(
         });
     }
 
-    let prompt = RemoteConnectionPrompt::headless(&connection_options, workspace, window, cx);
+    let prompt =
+        RemoteConnectionPrompt::headless(&connection_options, workspace, Vec::new(), window, cx);
     let task = connect(
         ConnectionIdentifier::setup(),
         connection_options,
