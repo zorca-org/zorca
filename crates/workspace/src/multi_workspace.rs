@@ -934,6 +934,18 @@ impl MultiWorkspace {
         self.project_groups = restored;
     }
 
+    /// Registers a group before its workspace exists, so the sidebar shows
+    /// the project while its host connects.
+    pub fn add_project_group(&mut self, key: ProjectGroupKey, cx: &mut Context<Self>) {
+        let previous_len = self.project_groups.len();
+        self.ensure_project_group_state(key);
+        if self.project_groups.len() != previous_len {
+            cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            self.serialize(cx);
+            cx.notify();
+        }
+    }
+
     pub fn project_group_keys(&self) -> Vec<ProjectGroupKey> {
         self.project_groups
             .iter()

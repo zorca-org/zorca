@@ -263,6 +263,20 @@ impl PickerDelegate for SidebarRecentProjectsDelegate {
                             .fill_connection_options_from_settings(connection);
                     };
                     let paths = recent_workspace.paths.paths().to_vec();
+                    // The row appears at the click, not when the host answers.
+                    if let Some(handle) = replace_window {
+                        let key = ProjectGroupKey::new(
+                            Some(connection.clone()),
+                            recent_workspace.paths.clone(),
+                        );
+                        cx.defer(move |cx| {
+                            handle
+                                .update(cx, |multi_workspace, _, cx| {
+                                    multi_workspace.add_project_group(key, cx)
+                                })
+                                .log_err();
+                        });
+                    }
                     cx.spawn_in(window, async move |_, cx| {
                         open_remote_project(connection.clone(), paths, app_state, open_options, cx)
                             .await
