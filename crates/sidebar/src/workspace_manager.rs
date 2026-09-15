@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use git::repository::Worktree as GitWorktree;
-use gpui::{AnyElement, App, ClickEvent, Entity, SharedString, WeakEntity, px};
+use gpui::{AnyElement, App, ClickEvent, Entity, SharedString, WeakEntity, px, relative};
 use project::{ProjectGroupKey, worktree_display_name};
 use serde::{Deserialize, Serialize};
 use ui::{Indicator, ListItem, SpinnerLabel, Tooltip, prelude::*};
@@ -147,6 +147,8 @@ pub struct Worktree {
     /// pinned row, which is lifted out of its project, keeps the association.
     pub project_key: Arc<Path>,
     pub status: WorktreeStatus,
+    /// The connect's latest status line while `status` is `Connecting`.
+    pub connect_status: Option<SharedString>,
     /// Output arrived while the user was not engaged with this worktree.
     /// Orca keeps the dot until the worktree is activated or its pane touched.
     pub is_unread: bool,
@@ -762,6 +764,7 @@ pub fn build_tree(
                             folder_root: row.folder_root,
                             project_key: project_key.clone(),
                             status: row.status,
+                            connect_status: None,
                             is_unread: false,
                             is_primary: row.is_primary,
                             workspace: row.workspace,
@@ -886,7 +889,10 @@ pub fn filter_tree(tree: &mut WorkspaceTree, query: &str) {
 /// "Not connected" placeholder is renamed; a row listed from the host's
 /// worktree cache keeps its name and, carrying the repository's key, matches
 /// on its own folder root.
-pub(crate) fn apply_connecting(tree: &mut WorkspaceTree, connecting: &[ProjectGroupKey]) {
+pub(crate) fn apply_connecting(
+    tree: &mut WorkspaceTree,
+    connecting: &[(ProjectGroupKey, Option<SharedString>)],
+) {
     if connecting.is_empty() {
         return;
     }
@@ -905,19 +911,22 @@ pub(crate) fn apply_connecting(tree: &mut WorkspaceTree, connecting: &[ProjectGr
         let folder_key = worktree.folder_root.as_ref().map(|root| {
             ProjectGroupKey::new(group_key.host(), PathList::new(std::slice::from_ref(root)))
         });
-        let matches = connecting.iter().any(|key| {
+        let Some((_, status)) = connecting.iter().find(|(key, _)| {
             group_key.matches(key)
                 || folder_key
                     .as_ref()
                     .is_some_and(|folder| folder.matches(key))
-        });
-        if !matches {
+        }) else {
             continue;
-        }
+        };
         if worktree.status == WorktreeStatus::Disconnected {
-            worktree.name = "Connecting…".into();
+            worktree.name = match status {
+                Some(status) => format!("{status}…").into(),
+                None => "Connecting…".into(),
+            };
         }
         worktree.status = WorktreeStatus::Connecting;
+        worktree.connect_status = status.clone();
     }
 }
 
@@ -1161,6 +1170,7 @@ pub fn render_row(
     hover_actions: Option<AnyElement>,
     // `label` replaces the row's own label, for a row being renamed in place.
     label: Option<AnyElement>,
+    cx: &App,
 ) -> AnyElement {
     let collapsed = tree.is_collapsed(&row.kind);
     let project_info = remote_project_info(tree, &row.kind);
@@ -1214,6 +1224,13 @@ pub fn render_row(
             .is_some_and(|worktree| worktree.is_primary),
         _ => false,
     };
+    let connect_progress = match &row.kind {
+        RowKind::Worktree(id) => tree
+            .worktree(*id)
+            .filter(|worktree| worktree.status == WorktreeStatus::Connecting)
+            .map(|worktree| connect_progress(worktree.connect_status.as_deref())),
+        _ => None,
+    };
 
     ListItem::new(ix)
         .indent_level(row.depth)
@@ -1225,7 +1242,7 @@ pub fn render_row(
         })
         .start_slot(start_slot)
         .child(label.unwrap_or_else(|| {
-            h_flex()
+            let label = h_flex()
                 .w_full()
                 .min_w_0()
                 .gap_1p5()
@@ -1237,7 +1254,15 @@ pub fn render_row(
                             .color(Color::Muted)
                             .truncate(),
                     )
-                })
+                });
+            let Some(progress) = connect_progress else {
+                return label.into_any_element();
+            };
+            v_flex()
+                .w_full()
+                .min_w_0()
+                .child(label)
+                .child(connecting_bar(progress, cx))
                 .into_any_element()
         }))
         .when_some(project_info_tooltip, |this, info| {
@@ -1255,6 +1280,57 @@ pub fn render_row(
         .when_some(end_slot, ListItem::end_slot)
         .when_some(hover_actions, ListItem::end_slot_on_hover)
         .on_click(on_click)
+        .into_any_element()
+}
+
+/// Where a connect's status line sits in the connect, as a fraction. The
+/// stages are the `set_status` calls in `remote::transport` and
+/// `auto_update`, in the order they run; a long step is re-sent as
+/// "Running (<elapsed>): <stage>". An unknown line keeps the bar at the
+/// "Connecting" stage rather than hiding it.
+fn connect_progress(status: Option<&str>) -> f32 {
+    let Some(mut status) = status else {
+        return 0.05;
+    };
+    if let Some((_, stage)) = status
+        .strip_prefix("Running (")
+        .and_then(|rest| rest.split_once("): "))
+    {
+        status = stage;
+    }
+    [
+        ("Waiting", 0.05),
+        ("Connecting", 0.15),
+        ("Detecting", 0.15),
+        ("Adding", 0.2),
+        ("Installing", 0.2),
+        ("Building", 0.25),
+        ("Fetching", 0.25),
+        ("Downloading", 0.35),
+        ("Compressing", 0.4),
+        ("Uploading", 0.5),
+        ("Extracting", 0.65),
+        ("Starting proxy", 0.85),
+    ]
+    .iter()
+    .find(|(prefix, _)| status.starts_with(prefix))
+    .map_or(0.15, |(_, progress)| *progress)
+}
+
+fn connecting_bar(progress: f32, cx: &App) -> AnyElement {
+    let colors = cx.theme().colors();
+    div()
+        .w_full()
+        .h(px(2.))
+        .rounded_full()
+        .bg(colors.border)
+        .child(
+            div()
+                .h_full()
+                .w(relative(progress))
+                .rounded_full()
+                .bg(colors.text_accent),
+        )
         .into_any_element()
 }
 
@@ -1279,6 +1355,7 @@ mod tests {
             folder_root: None,
             project_key: Path::new("/src/first-project/.git").into(),
             status: WorktreeStatus::Inactive,
+            connect_status: None,
             is_unread: false,
             is_primary: false,
             workspace: None,
@@ -1343,7 +1420,7 @@ mod tests {
             cached.folder_root = Some(PathBuf::from("/src/repo/.worktrees/feature"));
         }
 
-        apply_connecting(&mut tree, std::slice::from_ref(&key));
+        apply_connecting(&mut tree, &[(key.clone(), None)]);
 
         let placeholder = &tree.groups[0].projects[0].worktrees[0];
         assert_eq!(placeholder.status, WorktreeStatus::Connecting);
@@ -1351,6 +1428,46 @@ mod tests {
         let cached = &tree.groups[0].projects[1].worktrees[0];
         assert_eq!(cached.status, WorktreeStatus::Connecting);
         assert_eq!(cached.name.as_ref(), "feature");
+
+        // A status line names the placeholder and rides on both rows.
+        tree.groups[0].projects[0].worktrees[0].status = WorktreeStatus::Disconnected;
+        apply_connecting(&mut tree, &[(key, Some("Starting proxy".into()))]);
+        let placeholder = &tree.groups[0].projects[0].worktrees[0];
+        assert_eq!(placeholder.name.as_ref(), "Starting proxy…");
+        assert_eq!(
+            placeholder.connect_status.as_deref(),
+            Some("Starting proxy")
+        );
+        let cached = &tree.groups[0].projects[1].worktrees[0];
+        assert_eq!(cached.name.as_ref(), "feature");
+        assert_eq!(cached.connect_status.as_deref(), Some("Starting proxy"));
+    }
+
+    #[test]
+    fn test_connect_progress_orders_the_stages() {
+        let stages = [
+            None,
+            Some("Waiting for existing connection attempt"),
+            Some("Connecting (reusing session)"),
+            Some("Adding rustup target for cross-compilation"),
+            Some("Building remote binary from source for x86_64-unknown-linux-musl with Zig"),
+            Some("Running (2m 5s elapsed): Building remote binary from source"),
+            Some("Compressing binary"),
+            Some("Uploading remote development server (47 MiB, 3s)"),
+            Some("Extracting remote server"),
+            Some("Starting proxy"),
+        ];
+        let progress: Vec<f32> = stages.iter().map(|s| connect_progress(*s)).collect();
+        assert!(progress.windows(2).all(|w| w[0] <= w[1]), "{progress:?}");
+        assert!(
+            progress.iter().all(|p| (0.0..1.0).contains(p)),
+            "{progress:?}"
+        );
+        assert_eq!(connect_progress(Some("Something new")), 0.15);
+        assert_eq!(
+            connect_progress(Some("Running (12s elapsed): Starting proxy")),
+            connect_progress(Some("Starting proxy"))
+        );
     }
 
     #[test]
@@ -1363,7 +1480,10 @@ mod tests {
             closed.folder_root = Some(PathBuf::from("/a"));
         }
 
-        apply_connecting(&mut tree, &[remote_key(2, "/a"), remote_key(1, "/b")]);
+        apply_connecting(
+            &mut tree,
+            &[(remote_key(2, "/a"), None), (remote_key(1, "/b"), None)],
+        );
 
         assert_eq!(
             tree.groups[0].projects[0].worktrees[0].status,

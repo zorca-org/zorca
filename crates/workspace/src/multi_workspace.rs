@@ -312,7 +312,9 @@ pub struct MultiWorkspace {
     retained_workspaces: Vec<Entity<Workspace>>,
     project_groups: Vec<ProjectGroupState>,
     /// Groups whose host is being connected, for the sidebar to show progress.
-    connecting_project_groups: Vec<ProjectGroupKey>,
+    /// Groups whose host is connecting, each with the connect's latest
+    /// status line (`None` until the first one arrives).
+    connecting_project_groups: Vec<(ProjectGroupKey, Option<SharedString>)>,
     active_workspace: Entity<Workspace>,
     /// Source of truth for which workspace is presented in this window, shared
     /// with each member `Workspace` so they can tell whether they own the
@@ -958,9 +960,9 @@ impl MultiWorkspace {
         let index = self
             .connecting_project_groups
             .iter()
-            .position(|group| group.matches(key));
+            .position(|(group, _)| group.matches(key));
         match (index, connecting) {
-            (None, true) => self.connecting_project_groups.push(key.clone()),
+            (None, true) => self.connecting_project_groups.push((key.clone(), None)),
             (Some(index), false) => {
                 self.connecting_project_groups.remove(index);
             }
@@ -970,10 +972,46 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    /// Records the connect's latest status line for the connecting groups
+    /// `key` names; ignored when none is connecting. A key without paths
+    /// (`connect_with_modal` connects a host, not a project) names every
+    /// connecting group on that host: they share the one pooled connection.
+    pub fn set_project_group_connect_status(
+        &mut self,
+        key: &ProjectGroupKey,
+        status: Option<SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let host_only = key.path_list().is_empty();
+        let mut changed = false;
+        for (group, slot) in &mut self.connecting_project_groups {
+            let hit = if host_only {
+                same_remote_connection_identity(group.host().as_ref(), key.host().as_ref())
+            } else {
+                group.matches(key)
+            };
+            if hit && *slot != status {
+                *slot = status.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+            cx.notify();
+        }
+    }
+
     pub fn project_group_is_connecting(&self, key: &ProjectGroupKey) -> bool {
         self.connecting_project_groups
             .iter()
-            .any(|group| group.matches(key))
+            .any(|(group, _)| group.matches(key))
+    }
+
+    pub fn project_group_connect_status(&self, key: &ProjectGroupKey) -> Option<SharedString> {
+        self.connecting_project_groups
+            .iter()
+            .find(|(group, _)| group.matches(key))
+            .and_then(|(_, status)| status.clone())
     }
 
     pub fn project_group_keys(&self) -> Vec<ProjectGroupKey> {
