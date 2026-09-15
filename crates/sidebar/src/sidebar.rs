@@ -4219,10 +4219,13 @@ impl Sidebar {
         workspace_manager::apply_groups(&mut tree, &self.workspace_group_assignments());
         workspace_manager::apply_pins(&mut tree, &self.pinned_worktrees);
         workspace_manager::apply_unread(&mut tree, &self.unread_worktrees);
-        let connecting: Vec<ProjectGroupKey> = closed_groups
+        let connecting: Vec<(ProjectGroupKey, Option<SharedString>)> = closed_groups
             .iter()
             .filter(|key| multi_workspace.read(cx).project_group_is_connecting(key))
-            .cloned()
+            .map(|key| {
+                let status = multi_workspace.read(cx).project_group_connect_status(key);
+                (key.clone(), status)
+            })
             .collect();
         workspace_manager::apply_connecting(&mut tree, &connecting);
         workspace_manager::apply_hidden_worktrees(
@@ -5531,6 +5534,7 @@ impl Sidebar {
                     daemon_upgrade_action,
                     hover_actions,
                     rename_editor,
+                    cx,
                 );
 
                 right_click_menu(SharedString::from(format!("workspace-manager-row-{ix}")))

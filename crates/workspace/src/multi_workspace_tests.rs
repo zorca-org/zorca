@@ -141,10 +141,32 @@ async fn test_project_group_connecting_flag_and_empty_group_removal(cx: &mut Tes
         multi_workspace.add_project_group(key.clone(), cx);
         multi_workspace.set_project_group_connecting(&key, true, cx);
         assert!(multi_workspace.project_group_is_connecting(&key));
+        // A status line lands by exact key, and by host alone when the key
+        // carries no paths; clearing the flag drops it.
+        multi_workspace.set_project_group_connect_status(&key, Some("Connecting".into()), cx);
+        assert_eq!(
+            multi_workspace
+                .project_group_connect_status(&key)
+                .as_deref(),
+            Some("Connecting")
+        );
+        let host_only = ProjectGroupKey::new(key.host(), PathList::default());
+        multi_workspace.set_project_group_connect_status(
+            &host_only,
+            Some("Starting proxy".into()),
+            cx,
+        );
+        assert_eq!(
+            multi_workspace
+                .project_group_connect_status(&key)
+                .as_deref(),
+            Some("Starting proxy")
+        );
         // Setting twice does not need clearing twice.
         multi_workspace.set_project_group_connecting(&key, true, cx);
         multi_workspace.set_project_group_connecting(&key, false, cx);
         assert!(!multi_workspace.project_group_is_connecting(&key));
+        assert_eq!(multi_workspace.project_group_connect_status(&key), None);
         multi_workspace.set_project_group_connecting(&key, false, cx);
         assert!(!multi_workspace.project_group_is_connecting(&key));
 

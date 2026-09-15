@@ -19,7 +19,8 @@ use ui::{
     prelude::*,
 };
 use ui_input::{ERASED_EDITOR_FACTORY, ErasedEditor};
-use workspace::{DismissDecision, ModalView, Workspace};
+use util::path_list::PathList;
+use workspace::{DismissDecision, ModalView, MultiWorkspace, ProjectGroupKey, Workspace};
 
 pub struct RemoteConnectionPrompt {
     connection_string: SharedString,
@@ -36,6 +37,9 @@ pub struct RemoteConnectionPrompt {
     /// paths its header names, the first time ssh asks a question.
     /// Status-only connections never show one.
     modal_host: Option<(WeakEntity<Workspace>, Vec<PathBuf>)>,
+    /// Set for a headless prompt: where status lines go, so the sidebar can
+    /// show the connect's progress on the group's row.
+    status_target: Option<(WeakEntity<MultiWorkspace>, ProjectGroupKey)>,
 }
 
 impl Drop for RemoteConnectionPrompt {
@@ -79,6 +83,7 @@ impl RemoteConnectionPrompt {
             is_password_prompt: false,
             is_masked: true,
             modal_host: None,
+            status_target: None,
         }
     }
 
@@ -93,8 +98,15 @@ impl RemoteConnectionPrompt {
         cx: &mut App,
     ) -> Entity<Self> {
         let prompt = Self::for_connection(connection_options, window, cx);
+        // The window root, not `workspace.read`: callers hold the workspace
+        // under `update` at this point.
+        let status_target = window.root::<MultiWorkspace>().flatten().map(|handle| {
+            let key = ProjectGroupKey::new(Some(connection_options.clone()), PathList::new(&paths));
+            (handle.downgrade(), key)
+        });
         prompt.update(cx, |prompt, _| {
-            prompt.modal_host = Some((workspace.downgrade(), paths))
+            prompt.modal_host = Some((workspace.downgrade(), paths));
+            prompt.status_target = status_target;
         });
         prompt
     }
@@ -179,6 +191,18 @@ impl RemoteConnectionPrompt {
 
     pub fn set_status(&mut self, status: Option<String>, cx: &mut Context<Self>) {
         self.status_message = status.map(|s| s.into());
+        if let Some((multi_workspace, key)) = self.status_target.clone() {
+            let status = self.status_message.clone();
+            // Deferred: the first status line can arrive while the
+            // multi workspace is itself under `update`.
+            cx.defer(move |cx| {
+                multi_workspace
+                    .update(cx, |multi_workspace, cx| {
+                        multi_workspace.set_project_group_connect_status(&key, status, cx)
+                    })
+                    .ok();
+            });
+        }
         cx.notify();
     }
 
